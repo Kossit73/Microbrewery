@@ -15,6 +15,8 @@ from typing import Tuple
 import pandas as pd
 import streamlit as st
 
+st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
+
 from brewery_financial_model_all_in_one import (
     CapexItem,
     DebtFacility,
