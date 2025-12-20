@@ -18,8 +18,15 @@ This repository contains an all-in-one Python financial model for a microbrewery
    source .venv/bin/activate
    ```
 2. Install dependencies:
+ ```bash
+  pip install -r requirements.txt
+  ```
+
+3. To pre-download wheels (for offline or proxied installs), run:
    ```bash
-   pip install -r requirements.txt
+   python download_dependencies.py --dest ./vendor
+   # later install locally
+   pip install --no-index --find-links=./vendor -r requirements.txt
    ```
 
 ### Troubleshooting dependency installs (numpy/streamlit/pandas)
@@ -34,6 +41,10 @@ This repository contains an all-in-one Python financial model for a microbrewery
   or download wheel files on a machine with internet access and install them locally:
   ```bash
   pip install --no-index --find-links=/path/to/wheels -r requirements.txt
+  ```
+- You can automate wheel downloads with the helper script (supports `--proxy`, `--index-url`, and `--extra-index-url`):
+  ```bash
+  python download_dependencies.py --dest ./vendor
   ```
 - Always confirm your virtual environment is active before installing (`source .venv/bin/activate`).
 
