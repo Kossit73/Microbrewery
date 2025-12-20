@@ -196,14 +196,31 @@ def main() -> None:
         "assumptions, and download the resulting statements."
     )
 
-    st.sidebar.header("Assumptions")
-    months = st.sidebar.slider("Months in projection", min_value=36, max_value=180, value=120, step=12)
-    wacc = st.sidebar.slider("WACC (annual)", min_value=0.05, max_value=0.20, value=0.122, step=0.005)
-    exit_multiple = st.sidebar.slider("Exit EV/EBITDA multiple", min_value=4.0, max_value=12.0, value=8.0, step=0.5)
-    price_inflation = st.sidebar.slider("Price inflation (annual)", min_value=0.0, max_value=0.05, value=0.015, step=0.0025)
-    cost_inflation = st.sidebar.slider("Cost inflation (annual)", min_value=0.0, max_value=0.05, value=0.015, step=0.0025)
-    dividend_start = st.sidebar.number_input("Dividend start month", min_value=0, max_value=months - 1, value=60)
-    min_cash = st.sidebar.number_input("Minimum cash for sweep", min_value=0.0, value=1_500_000.0, step=100_000.0, format="%f")
+    tab_assumptions, tab_results, tab_details = st.tabs([
+        "Assumptions",
+        "Results",
+        "Assumption tables",
+    ])
+
+    with tab_assumptions:
+        st.subheader("Core assumptions")
+        months = st.slider("Months in projection", min_value=36, max_value=180, value=120, step=12)
+        wacc = st.slider("WACC (annual)", min_value=0.05, max_value=0.20, value=0.122, step=0.005)
+        exit_multiple = st.slider(
+            "Exit EV/EBITDA multiple", min_value=4.0, max_value=12.0, value=8.0, step=0.5
+        )
+        price_inflation = st.slider(
+            "Price inflation (annual)", min_value=0.0, max_value=0.05, value=0.015, step=0.0025
+        )
+        cost_inflation = st.slider(
+            "Cost inflation (annual)", min_value=0.0, max_value=0.05, value=0.015, step=0.0025
+        )
+        dividend_start = st.number_input(
+            "Dividend start month", min_value=0, max_value=months - 1, value=60
+        )
+        min_cash = st.number_input(
+            "Minimum cash for sweep", min_value=0.0, value=1_500_000.0, step=100_000.0, format="%f"
+        )
 
     cfg = ModelConfig(
         start_date="2025-01-01",
@@ -228,11 +245,18 @@ def main() -> None:
     inputs, model = _run_model(cfg, div)
     result = model.run()
 
-    _valuation_section(result)
-    _statement_section(result)
-    _download_section(result)
+    with tab_results:
+        _valuation_section(result)
+        _statement_section(result)
+        _download_section(result)
 
-    with st.expander("Show assumptions"):
+        st.caption(
+            "The sample assumptions mirror the CLI example in "
+            "`brewery_financial_model_all_in_one.py`. Adjust the sliders to "
+            "explore scenarios."
+        )
+
+    with tab_details:
         st.markdown("### SKUs")
         st.dataframe(inputs.skus)
 
@@ -269,12 +293,6 @@ def main() -> None:
             ]
         )
         st.dataframe(debt_df)
-
-    st.caption(
-        "The sample assumptions mirror the CLI example in "
-        "`brewery_financial_model_all_in_one.py`. Adjust the sliders to explore "
-        "scenarios."
-    )
 
 
 if __name__ == "__main__":
