@@ -93,3 +93,7 @@ Use the horizontal tab bar to adjust key assumptions (WACC, exit multiple, infla
 ## Valuation Toolkit
 
 This repository now includes the `finmodel` package that implements a modular valuation toolkit (DCF/rNPV, scenarios, forecasts, Monte Carlo, and ML multiples). See `docs/ARCHITECTURE.md` for class-level details.
+
+## Making the brewery model more detailed
+
+For a prioritized checklist of granular features to add (e.g., seasonality, SKU-level BOMs, payroll plans, covenants, and sensitivity dashboards), see `docs/MODEL_ENHANCEMENTS.md`.
