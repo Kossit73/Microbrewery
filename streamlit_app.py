@@ -146,7 +146,7 @@ def _valuation_section(result) -> None:
 
 def _statement_section(result) -> None:
     st.subheader("Statements")
-    st.markdown("**Annual summary**")
+    st.markdown("**Annual summary (all rows)**")
     annual_cols = [
         "total_revenue",
         "direct_costs",
@@ -154,22 +154,57 @@ def _statement_section(result) -> None:
         "opex",
         "ebitda",
         "net_income",
+        "fcff",
     ]
-    st.dataframe(result.annual.loc[:, annual_cols].head(10))
+    st.dataframe(result.annual.loc[:, annual_cols])
 
     st.markdown("**Latest 12 months (monthly)**")
-    st.dataframe(result.monthly.tail(12)[
-        [
-            "total_revenue",
-            "direct_costs",
-            "gross_profit",
-            "opex",
-            "ebitda",
-            "net_income",
-            "cash",
-            "debt_ending_balance",
+    st.dataframe(
+        result.monthly.tail(12)[
+            [
+                "total_revenue",
+                "direct_costs",
+                "gross_profit",
+                "opex",
+                "ebitda",
+                "net_income",
+                "cash",
+                "debt_ending_balance",
+            ]
         ]
-    ])
+    )
+
+    with st.expander("Full monthly statements (all columns)"):
+        st.dataframe(result.monthly)
+
+
+def _charts_section(result) -> None:
+    st.subheader("Graphs & plots")
+    monthly = result.monthly.copy()
+
+    st.markdown("**Revenue, EBITDA, and Net Income**")
+    st.line_chart(
+        monthly[
+            [
+                "total_revenue",
+                "ebitda",
+                "net_income",
+            ]
+        ]
+    )
+
+    st.markdown("**Cash vs. Debt Ending Balance**")
+    st.line_chart(monthly[["cash", "debt_ending_balance"]])
+
+    st.markdown("**Operating Cash Flow vs. FCFF**")
+    st.line_chart(
+        monthly[
+            [
+                "cash_flow_from_operations",
+                "fcff",
+            ]
+        ]
+    )
 
 
 def _download_section(result) -> None:
@@ -186,6 +221,47 @@ def _download_section(result) -> None:
         data=buffer,
         file_name="brewery_model_output.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+def _schedules_section(result) -> None:
+    st.subheader("Detailed schedules and tables")
+
+    st.markdown("**Debt schedules (facility-level)**")
+    for name, df in result.debt_schedules.items():
+        with st.expander(f"Debt schedule – {name}"):
+            st.dataframe(df)
+
+    st.markdown("**Pricing matrix (all SKUs x channels)**")
+    with st.expander("Show price table"):
+        st.dataframe(result.prices)
+
+    st.markdown("**Working capital components**")
+    wc_cols = [
+        "receivables",
+        "inventory",
+        "other_current_assets",
+        "payables",
+        "other_current_liabilities",
+        "net_working_capital",
+        "change_in_nwc",
+    ]
+    st.dataframe(result.monthly[wc_cols])
+
+    st.markdown("**CAPEX, depreciation, and net fixed assets**")
+    st.dataframe(result.monthly[["capex", "depreciation", "net_fixed_assets"]])
+
+    st.markdown("**Financing and equity flows**")
+    st.dataframe(
+        result.monthly[
+            [
+                "debt_draw",
+                "debt_principal_payment",
+                "equity_injection",
+                "dividends",
+                "cash",
+            ]
+        ]
     )
 
 
@@ -248,6 +324,8 @@ def main() -> None:
     with tab_results:
         _valuation_section(result)
         _statement_section(result)
+        _charts_section(result)
+        _schedules_section(result)
         _download_section(result)
 
         st.caption(
