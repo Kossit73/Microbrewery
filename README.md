@@ -22,12 +22,20 @@ This repository contains an all-in-one Python financial model for a microbrewery
    pip install -r requirements.txt
    ```
 
-### Troubleshooting: installing numpy
-If you encounter a `ModuleNotFoundError: No module named 'numpy'`, install it directly:
-```bash
-pip install numpy
-```
-If you are using a virtual environment, ensure it is activated before running the install command.
+### Troubleshooting dependency installs (numpy/streamlit/pandas)
+- If you see `ModuleNotFoundError` for numpy, pandas, or streamlit, install directly:
+  ```bash
+  pip install numpy pandas streamlit openpyxl
+  ```
+- If you are behind a proxy or in a restricted network (e.g., receiving `Tunnel connection failed: 403 Forbidden`), try:
+  ```bash
+  pip install --proxy=http://<proxy_host>:<proxy_port> -r requirements.txt
+  ```
+  or download wheel files on a machine with internet access and install them locally:
+  ```bash
+  pip install --no-index --find-links=/path/to/wheels -r requirements.txt
+  ```
+- Always confirm your virtual environment is active before installing (`source .venv/bin/activate`).
 
 ## Usage
 ### Command-line example
@@ -43,4 +51,4 @@ Launch the interactive dashboard to explore scenarios and download outputs:
 ```bash
 streamlit run streamlit_app.py
 ```
-Use the sidebar to adjust key assumptions (WACC, exit multiple, inflation, dividend timing) and download a fully formatted Excel workbook of the results.
+Use the horizontal tab bar to adjust key assumptions (WACC, exit multiple, inflation, dividend timing) and to download a fully formatted Excel workbook of the results.
