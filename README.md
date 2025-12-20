@@ -52,6 +52,28 @@ This repository contains an all-in-one Python financial model for a microbrewery
   ```
 - Always confirm your virtual environment is active before installing (`source .venv/bin/activate`).
 
+### Quick start: getting pandas (and other deps) working
+If you only need pandas (and friends) to run the model or the Streamlit app, use this minimal recipe:
+```bash
+# 1) Create/activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate
+
+# 2) Install pandas plus the other core packages
+pip install pandas numpy streamlit openpyxl
+
+# 3) Verify pandas is ready
+python - <<'PY'
+import pandas as pd
+print("pandas version:", pd.__version__)
+PY
+
+# 4) Run the example (pandas is required here)
+python brewery_financial_model_all_in_one.py
+# or launch the dashboard
+streamlit run streamlit_app.py
+```
+
 ## Usage
 ### Command-line example
 Run the example model and (optionally) export an Excel workbook:
