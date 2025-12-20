@@ -147,7 +147,15 @@ def _valuation_section(result) -> None:
 def _statement_section(result) -> None:
     st.subheader("Statements")
     st.markdown("**Annual summary**")
-    st.dataframe(result.annual["total_revenue":"net_income"].head(10))
+    annual_cols = [
+        "total_revenue",
+        "direct_costs",
+        "gross_profit",
+        "opex",
+        "ebitda",
+        "net_income",
+    ]
+    st.dataframe(result.annual.loc[:, annual_cols].head(10))
 
     st.markdown("**Latest 12 months (monthly)**")
     st.dataframe(result.monthly.tail(12)[
