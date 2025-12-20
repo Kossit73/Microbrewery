@@ -30,9 +30,17 @@ pip install numpy
 If you are using a virtual environment, ensure it is activated before running the install command.
 
 ## Usage
+### Command-line example
 Run the example model and (optionally) export an Excel workbook:
 ```bash
 python brewery_financial_model_all_in_one.py
 ```
 
 Replace the sample assumptions in `brewery_financial_model_all_in_one.py` with your own inputs to generate custom projections.
+
+### Streamlit app
+Launch the interactive dashboard to explore scenarios and download outputs:
+```bash
+streamlit run streamlit_app.py
+```
+Use the sidebar to adjust key assumptions (WACC, exit multiple, inflation, dividend timing) and download a fully formatted Excel workbook of the results.
