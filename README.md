@@ -89,3 +89,7 @@ Launch the interactive dashboard to explore scenarios and download outputs:
 streamlit run streamlit_app.py
 ```
 Use the horizontal tab bar to adjust key assumptions (WACC, exit multiple, inflation, dividend timing) and to download a fully formatted Excel workbook of the results.
+
+## Valuation Toolkit
+
+This repository now includes the `finmodel` package that implements a modular valuation toolkit (DCF/rNPV, scenarios, forecasts, Monte Carlo, and ML multiples). See `docs/ARCHITECTURE.md` for class-level details.
