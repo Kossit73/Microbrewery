@@ -22,6 +22,13 @@ This repository contains an all-in-one Python financial model for a microbrewery
    pip install -r requirements.txt
    ```
 
+### Troubleshooting: installing numpy
+If you encounter a `ModuleNotFoundError: No module named 'numpy'`, install it directly:
+```bash
+pip install numpy
+```
+If you are using a virtual environment, ensure it is activated before running the install command.
+
 ## Usage
 Run the example model and (optionally) export an Excel workbook:
 ```bash
