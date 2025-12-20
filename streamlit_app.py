@@ -182,28 +182,31 @@ def _charts_section(result) -> None:
     st.subheader("Graphs & plots")
     monthly = result.monthly.copy()
 
+    def _plot_if_available(label: str, cols: list[str]) -> None:
+        existing = [c for c in cols if c in monthly.columns]
+        missing = sorted(set(cols) - set(existing))
+        if not existing:
+            st.warning(f"Skipped '{label}' chart because columns are missing: {', '.join(cols)}")
+            return
+        if missing:
+            st.info(
+                f"Showing '{label}' with available series only; missing columns: {', '.join(missing)}"
+            )
+        st.line_chart(monthly[existing])
+
     st.markdown("**Revenue, EBITDA, and Net Income**")
-    st.line_chart(
-        monthly[
-            [
-                "total_revenue",
-                "ebitda",
-                "net_income",
-            ]
-        ]
+    _plot_if_available(
+        "Revenue, EBITDA, and Net Income",
+        ["total_revenue", "ebitda", "net_income"],
     )
 
     st.markdown("**Cash vs. Debt Ending Balance**")
-    st.line_chart(monthly[["cash", "debt_ending_balance"]])
+    _plot_if_available("Cash vs. Debt Ending Balance", ["cash", "debt_ending_balance"])
 
     st.markdown("**Operating Cash Flow vs. FCFF**")
-    st.line_chart(
-        monthly[
-            [
-                "cash_flow_from_operations",
-                "fcff",
-            ]
-        ]
+    _plot_if_available(
+        "Operating Cash Flow vs. FCFF",
+        ["cash_flow_from_operations", "fcff"],
     )
 
 
