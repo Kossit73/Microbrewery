@@ -13,6 +13,7 @@ from dataclasses import replace
 import io
 from typing import Tuple
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -424,6 +425,129 @@ def _schedules_section(result) -> None:
     )
 
 
+def _key_analytics_section(result, inputs: ModelInputs) -> None:
+    st.subheader("Key Analytics")
+    annual = result.annual.copy()
+    monthly = result.monthly.copy()
+
+    # Sensitivity Analysis
+    st.markdown("### Sensitivity Analysis")
+    base_revenue = float(annual["total_revenue"].iloc[0]) if "total_revenue" in annual.columns else 0.0
+    base_ebitda = float(annual["ebitda"].iloc[0]) if "ebitda" in annual.columns else 0.0
+    sens_df = pd.DataFrame(
+        [
+            {"case": "Price -10%", "revenue": base_revenue * 0.90, "ebitda": base_ebitda * 0.75},
+            {"case": "Base", "revenue": base_revenue, "ebitda": base_ebitda},
+            {"case": "Price +10%", "revenue": base_revenue * 1.10, "ebitda": base_ebitda * 1.25},
+            {"case": "Volume -10%", "revenue": base_revenue * 0.90, "ebitda": base_ebitda * 0.80},
+            {"case": "Volume +10%", "revenue": base_revenue * 1.10, "ebitda": base_ebitda * 1.20},
+        ]
+    )
+    st.dataframe(sens_df)
+
+    # Monte Carlo simulation
+    st.markdown("### Monte Carlo simulation")
+    sims = st.slider("Simulations", 100, 2000, 500, step=100, key="mc_sims")
+    if base_ebitda > 0:
+        draws = np.random.normal(loc=base_ebitda, scale=base_ebitda * 0.20, size=sims)
+        mc_df = pd.DataFrame({"ebitda_sim": draws})
+        st.line_chart(mc_df.sort_values("ebitda_sim").reset_index(drop=True))
+        st.write(
+            {
+                "mean": float(mc_df["ebitda_sim"].mean()),
+                "p05": float(mc_df["ebitda_sim"].quantile(0.05)),
+                "p50": float(mc_df["ebitda_sim"].quantile(0.50)),
+                "p95": float(mc_df["ebitda_sim"].quantile(0.95)),
+            }
+        )
+
+    # What-ifs analysis
+    st.markdown("### What ifs analysis")
+    what_if_price = st.slider("What-if price change %", -30, 30, 0, step=1, key="whatif_price")
+    what_if_volume = st.slider("What-if volume change %", -30, 30, 0, step=1, key="whatif_volume")
+    what_if_cost = st.slider("What-if direct cost change %", -30, 30, 0, step=1, key="whatif_cost")
+    what_if_revenue = base_revenue * (1 + what_if_price / 100.0) * (1 + what_if_volume / 100.0)
+    base_direct = float(annual["direct_costs"].iloc[0]) if "direct_costs" in annual.columns else 0.0
+    what_if_direct = base_direct * (1 + what_if_cost / 100.0)
+    what_if_ebitda = what_if_revenue - what_if_direct - float(annual["opex"].iloc[0])
+    st.write({"revenue": what_if_revenue, "direct_costs": what_if_direct, "ebitda": what_if_ebitda})
+
+    # Break-even analysis by product
+    st.markdown("### Break-even analysis by product")
+    prices = result.prices
+    channel_weights = {"Wholesale": 0.40, "Retail": 0.30, "E-Commerce": 0.15, "On-Premise": 0.10, "Export": 0.05}
+    be_rows = []
+    fixed_pool = float(annual["opex"].iloc[0]) if "opex" in annual.columns else 0.0
+    for _, sku in inputs.skus.iterrows():
+        sid = sku["sku_id"]
+        weighted_price = 0.0
+        for ch, w in channel_weights.items():
+            if (sid, ch) in prices.columns:
+                weighted_price += float(prices[(sid, ch)].iloc[0]) * w
+        unit_margin = max(weighted_price - float(sku["direct_cost_per_unit"]), 1e-6)
+        be_rows.append(
+            {"sku_id": sid, "name": sku["name"], "unit_margin": unit_margin, "break_even_units": fixed_pool / unit_margin}
+        )
+    st.dataframe(pd.DataFrame(be_rows))
+
+    # Scenario planning
+    st.markdown("### Scenario planning")
+    scen_df = pd.DataFrame(
+        [
+            {"scenario": "Downside", "revenue": base_revenue * 0.85, "ebitda": base_ebitda * 0.70},
+            {"scenario": "Base", "revenue": base_revenue, "ebitda": base_ebitda},
+            {"scenario": "Upside", "revenue": base_revenue * 1.15, "ebitda": base_ebitda * 1.30},
+        ]
+    )
+    st.dataframe(scen_df)
+
+    # Goal seek
+    st.markdown("### Goal seek")
+    target_ebitda = st.number_input("Target EBITDA (Year 1)", min_value=0.0, value=max(base_ebitda, 1.0), key="goal_ebitda")
+    margin_rate = max((base_ebitda / base_revenue) if base_revenue else 0.0, 1e-6)
+    required_revenue = target_ebitda / margin_rate
+    st.write({"required_revenue": required_revenue, "implied_revenue_uplift_pct": (required_revenue / base_revenue - 1) * 100 if base_revenue else 0.0})
+
+    # Debt service coverage ratio
+    st.markdown("### Debt service coverage ratio")
+    if {"debt_principal_payment", "interest_expense", "ebitda"}.issubset(monthly.columns):
+        ds = monthly["debt_principal_payment"] + monthly["interest_expense"]
+        dscr = np.where(ds > 0, monthly["ebitda"] / ds, np.nan)
+        st.line_chart(pd.DataFrame({"DSCR": dscr}, index=monthly.index))
+    else:
+        st.info("DSCR uses monthly debt principal, interest, and EBITDA columns when available.")
+
+    # Predictive analytics
+    st.markdown("### Predictive analytics")
+    if "total_revenue" in annual.columns and len(annual) >= 3:
+        y = annual["total_revenue"].values.astype(float)
+        x = np.arange(len(y))
+        coeff = np.polyfit(x, y, 1)
+        pred = coeff[0] * (x + 1) + coeff[1]
+        st.dataframe(pd.DataFrame({"actual_revenue": y, "next_step_prediction": pred}, index=annual.index))
+    else:
+        st.info("Need at least 3 annual revenue points for trend-based prediction.")
+
+    # Return diagnostics
+    st.markdown("### Return diagnostics")
+    val = result.valuation
+    keys = ["enterprise_value", "equity_value", "investor_irr_annual", "investor_moic"]
+    st.write({k: val.get(k, None) for k in keys})
+
+    # Coverage & resilience
+    st.markdown("### Coverage & resilience")
+    cov = {}
+    if {"cash", "debt_ending_balance"}.issubset(monthly.columns):
+        cov["cash_to_debt_ratio_last_month"] = float(
+            monthly["cash"].iloc[-1] / max(monthly["debt_ending_balance"].iloc[-1], 1e-6)
+        )
+    if {"cash", "opex"}.issubset(monthly.columns):
+        cov["months_of_opex_covered_last_month"] = float(
+            monthly["cash"].iloc[-1] / max(monthly["opex"].iloc[-1], 1e-6)
+        )
+    st.write(cov if cov else {"note": "Coverage metrics require cash/debt/opex monthly columns."})
+
+
 def main() -> None:
     st.title("Microbrewery Financial Model")
     st.write(
@@ -431,10 +555,11 @@ def main() -> None:
         "assumptions, and download the resulting statements."
     )
 
-    tab_assumptions, tab_results, tab_details = st.tabs([
+    tab_assumptions, tab_results, tab_details, tab_key_analytics = st.tabs([
         "Assumptions",
         "Results",
         "Assumption tables",
+        "Key Analytics",
     ])
 
     with tab_assumptions:
@@ -519,6 +644,9 @@ def main() -> None:
             "`brewery_financial_model_all_in_one.py`. Adjust the sliders to "
             "explore scenarios."
         )
+
+    with tab_key_analytics:
+        _key_analytics_section(result, inputs)
 
     with tab_details:
         capex_df = pd.DataFrame(
