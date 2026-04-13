@@ -430,10 +430,55 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
     annual = result.annual.copy()
     monthly = result.monthly.copy()
 
+    st.markdown("### Editable analytics controls")
+    if "ka_edit_mode" not in st.session_state:
+        st.session_state["ka_edit_mode"] = False
+    if "ka_variables" not in st.session_state:
+        st.session_state["ka_variables"] = pd.DataFrame(
+            [
+                {"variable": "price_uplift_pct", "value": 0.0, "apply_to": "revenue"},
+                {"variable": "volume_uplift_pct", "value": 0.0, "apply_to": "revenue"},
+                {"variable": "cost_uplift_pct", "value": 0.0, "apply_to": "direct_costs"},
+                {"variable": "risk_sigma_pct", "value": 20.0, "apply_to": "monte_carlo"},
+            ]
+        )
+
+    c1, c2, c3 = st.columns([1, 1, 2])
+    if c1.button("Edit", key="ka_edit_button"):
+        st.session_state["ka_edit_mode"] = not st.session_state["ka_edit_mode"]
+    if c2.button("Add variable", key="ka_add_variable"):
+        st.session_state["ka_variables"] = pd.concat(
+            [
+                st.session_state["ka_variables"],
+                pd.DataFrame([{"variable": "new_variable", "value": 0.0, "apply_to": "revenue"}]),
+            ],
+            ignore_index=True,
+        )
+    c3.caption("Tip: Edit variable names/values to instantly manipulate analytics outputs.")
+
+    if st.session_state["ka_edit_mode"]:
+        st.session_state["ka_variables"] = st.data_editor(
+            st.session_state["ka_variables"], num_rows="dynamic", use_container_width=True
+        )
+    else:
+        st.dataframe(st.session_state["ka_variables"], use_container_width=True)
+
+    var_df = st.session_state["ka_variables"].copy()
+    var_lookup = {
+        str(r["variable"]): float(r["value"])
+        for _, r in var_df.iterrows()
+        if pd.notna(r.get("variable")) and pd.notna(r.get("value"))
+    }
+
     # Sensitivity Analysis
     st.markdown("### Sensitivity Analysis")
-    base_revenue = float(annual["total_revenue"].iloc[0]) if "total_revenue" in annual.columns else 0.0
-    base_ebitda = float(annual["ebitda"].iloc[0]) if "ebitda" in annual.columns else 0.0
+    base_revenue_raw = float(annual["total_revenue"].iloc[0]) if "total_revenue" in annual.columns else 0.0
+    base_ebitda_raw = float(annual["ebitda"].iloc[0]) if "ebitda" in annual.columns else 0.0
+    price_uplift = var_lookup.get("price_uplift_pct", 0.0) / 100.0
+    volume_uplift = var_lookup.get("volume_uplift_pct", 0.0) / 100.0
+    cost_uplift = var_lookup.get("cost_uplift_pct", 0.0) / 100.0
+    base_revenue = base_revenue_raw * (1 + price_uplift) * (1 + volume_uplift)
+    base_ebitda = base_ebitda_raw
     sens_df = pd.DataFrame(
         [
             {"case": "Price -10%", "revenue": base_revenue * 0.90, "ebitda": base_ebitda * 0.75},
@@ -449,8 +494,9 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
     # Monte Carlo simulation
     st.markdown("### Monte Carlo simulation")
     sims = st.slider("Simulations", 100, 2000, 500, step=100, key="mc_sims")
+    sigma_pct = max(var_lookup.get("risk_sigma_pct", 20.0), 0.0) / 100.0
     if base_ebitda > 0:
-        draws = np.random.normal(loc=base_ebitda, scale=base_ebitda * 0.20, size=sims)
+        draws = np.random.normal(loc=base_ebitda, scale=base_ebitda * sigma_pct, size=sims)
         mc_df = pd.DataFrame({"ebitda_sim": draws})
         st.line_chart(mc_df.sort_values("ebitda_sim").reset_index(drop=True))
         st.write(
@@ -468,7 +514,7 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
     what_if_volume = st.slider("What-if volume change %", -30, 30, 0, step=1, key="whatif_volume")
     what_if_cost = st.slider("What-if direct cost change %", -30, 30, 0, step=1, key="whatif_cost")
     what_if_revenue = base_revenue * (1 + what_if_price / 100.0) * (1 + what_if_volume / 100.0)
-    base_direct = float(annual["direct_costs"].iloc[0]) if "direct_costs" in annual.columns else 0.0
+    base_direct = (float(annual["direct_costs"].iloc[0]) if "direct_costs" in annual.columns else 0.0) * (1 + cost_uplift)
     what_if_direct = base_direct * (1 + what_if_cost / 100.0)
     what_if_ebitda = what_if_revenue - what_if_direct - float(annual["opex"].iloc[0])
     st.write({"revenue": what_if_revenue, "direct_costs": what_if_direct, "ebitda": what_if_ebitda})
@@ -504,13 +550,22 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
 
     # Scenario planning
     st.markdown("### Scenario planning")
-    scen_df = pd.DataFrame(
-        [
-            {"scenario": "Downside", "revenue": base_revenue * 0.85, "ebitda": base_ebitda * 0.70},
-            {"scenario": "Base", "revenue": base_revenue, "ebitda": base_ebitda},
-            {"scenario": "Upside", "revenue": base_revenue * 1.15, "ebitda": base_ebitda * 1.30},
-        ]
-    )
+    if "ka_scenarios" not in st.session_state:
+        st.session_state["ka_scenarios"] = pd.DataFrame(
+            [
+                {"scenario": "Downside", "revenue_multiplier": 0.85, "ebitda_multiplier": 0.70},
+                {"scenario": "Base", "revenue_multiplier": 1.00, "ebitda_multiplier": 1.00},
+                {"scenario": "Upside", "revenue_multiplier": 1.15, "ebitda_multiplier": 1.30},
+            ]
+        )
+    scen_edit = st.toggle("Edit scenarios", key="ka_edit_scenarios")
+    if scen_edit:
+        st.session_state["ka_scenarios"] = st.data_editor(
+            st.session_state["ka_scenarios"], num_rows="dynamic", use_container_width=True
+        )
+    scen_df = st.session_state["ka_scenarios"].copy()
+    scen_df["revenue"] = base_revenue * pd.to_numeric(scen_df["revenue_multiplier"], errors="coerce").fillna(1.0)
+    scen_df["ebitda"] = base_ebitda * pd.to_numeric(scen_df["ebitda_multiplier"], errors="coerce").fillna(1.0)
     st.dataframe(scen_df)
     st.line_chart(scen_df.set_index("scenario")[["revenue", "ebitda"]])
 
