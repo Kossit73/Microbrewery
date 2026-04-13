@@ -9,6 +9,7 @@ full outputs.
 
 from __future__ import annotations
 
+from dataclasses import replace
 import io
 from typing import Tuple
 
@@ -196,6 +197,80 @@ def _assumption_editor(title: str, key: str, df: pd.DataFrame) -> pd.DataFrame:
     return st.session_state[data_key]
 
 
+def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
+    skus = st.session_state.get("assump_data_skus", base_inputs.skus).copy()
+    channels = st.session_state.get("assump_data_channels", base_inputs.channels).copy()
+    sales_plan = st.session_state.get("assump_data_sales_plan", base_inputs.sales_plan).copy()
+
+    opex_src = st.session_state.get("assump_data_opex_fixed")
+    if isinstance(opex_src, pd.DataFrame) and not opex_src.empty and "date" in opex_src.columns:
+        if len(opex_src) == 1 and str(opex_src.iloc[0]["date"]) == "all_months":
+            opex_fixed_monthly = float(opex_src.iloc[0]["opex_fixed_monthly"])
+        else:
+            s = pd.Series(opex_src["opex_fixed_monthly"].values, index=pd.to_datetime(opex_src["date"]))
+            opex_fixed_monthly = s
+    else:
+        opex_fixed_monthly = base_inputs.opex_fixed_monthly
+
+    oi_src = st.session_state.get("assump_data_other_income")
+    if isinstance(oi_src, pd.DataFrame) and not oi_src.empty and "date" in oi_src.columns:
+        if len(oi_src) == 1 and str(oi_src.iloc[0]["date"]) == "all_months":
+            other_income_monthly = float(oi_src.iloc[0]["other_income_monthly"])
+        else:
+            s = pd.Series(oi_src["other_income_monthly"].values, index=pd.to_datetime(oi_src["date"]))
+            other_income_monthly = s
+    else:
+        other_income_monthly = base_inputs.other_income_monthly
+
+    capex_src = st.session_state.get("assump_data_capex")
+    if isinstance(capex_src, pd.DataFrame):
+        capex_items = [
+            CapexItem(
+                name=str(r["name"]),
+                amount=float(r["amount"]),
+                capex_month=int(r["capex_month"]),
+                depreciation_years=float(r["depreciation_years"]),
+            )
+            for _, r in capex_src.iterrows()
+        ]
+    else:
+        capex_items = base_inputs.capex_items
+
+    debt_src = st.session_state.get("assump_data_debt")
+    if isinstance(debt_src, pd.DataFrame):
+        debt_facilities = [
+            DebtFacility(
+                name=str(r["name"]),
+                principal=float(r["principal"]),
+                annual_interest_rate=float(r["annual_interest_rate"]),
+                draw_month=int(r["draw_month"]),
+                grace_months=int(r["grace_months"]),
+                term_months=int(r["term_months"]),
+                repayment_type=str(r["repayment_type"]),
+            )
+            for _, r in debt_src.iterrows()
+        ]
+    else:
+        debt_facilities = base_inputs.debt_facilities
+
+    equity_src = st.session_state.get("assump_data_equity")
+    if isinstance(equity_src, pd.DataFrame):
+        equity_injections = {int(r["month"]): float(r["equity_injection"]) for _, r in equity_src.iterrows()}
+    else:
+        equity_injections = base_inputs.equity_injections
+
+    return ModelInputs(
+        skus=skus,
+        channels=channels,
+        sales_plan=sales_plan,
+        opex_fixed_monthly=opex_fixed_monthly,
+        other_income_monthly=other_income_monthly,
+        capex_items=capex_items,
+        debt_facilities=debt_facilities,
+        equity_injections=equity_injections,
+    )
+
+
 def _valuation_section(result) -> None:
     st.subheader("Valuation summary")
     valuation_df = pd.DataFrame(result.valuation, index=["value"]).T
@@ -380,7 +455,34 @@ def main() -> None:
         payout_ratio=0.25,
     )
 
-    inputs, model = _run_model(cfg, div)
+    config_table_state = st.session_state.get("assump_data_config")
+    if isinstance(config_table_state, pd.DataFrame) and not config_table_state.empty:
+        row = config_table_state.iloc[0]
+        cfg = replace(
+            cfg,
+            start_date=str(row.get("start_date", cfg.start_date)),
+            months=int(row.get("months", cfg.months)),
+            price_inflation_annual=float(row.get("price_inflation_annual", cfg.price_inflation_annual)),
+            cost_inflation_annual=float(row.get("cost_inflation_annual", cfg.cost_inflation_annual)),
+            tax_rate=float(row.get("tax_rate", cfg.tax_rate)),
+            wacc_annual=float(row.get("wacc_annual", cfg.wacc_annual)),
+            exit_ev_ebitda_multiple=float(row.get("exit_ev_ebitda_multiple", cfg.exit_ev_ebitda_multiple)),
+        )
+    dividend_table_state = st.session_state.get("assump_data_dividend")
+    if isinstance(dividend_table_state, pd.DataFrame) and not dividend_table_state.empty:
+        row = dividend_table_state.iloc[0]
+        div = replace(
+            div,
+            enabled=bool(row.get("enabled", div.enabled)),
+            model=str(row.get("model", div.model)),
+            start_month=int(row.get("start_month", div.start_month)),
+            minimum_cash_position=float(row.get("minimum_cash_position", div.minimum_cash_position)),
+            payout_ratio=float(row.get("payout_ratio", div.payout_ratio)),
+        )
+
+    base_inputs = _build_sample_assumptions(cfg, div)
+    inputs = _build_inputs_from_state(base_inputs)
+    model = MicrobreweryFinancialModel(cfg, div, inputs)
     result = model.run()
 
     with tab_results:
