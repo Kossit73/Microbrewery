@@ -7,6 +7,26 @@ from .scenarios import Scenario, ScenarioEngine, ForecastScenarioBridge, Scenari
 from .forecast import ForecastEngine
 from .monte_carlo import MonteCarloEngine
 from .analytics import MultiplesModel, AnalyticsEngine
+from .microbrewery_dataclasses import (
+    PackagingSize,
+    ExpansionEvent,
+    GeneralSettings,
+    WorkingCapitalAssumptions,
+    TaxAssumptions,
+    WACCConfig,
+    SKU,
+    MarketVolumeAssumption,
+    DirectCostComponent,
+    StartupExpense,
+    EmployeeRole,
+    OpexLine,
+    CapexItem,
+    DebtFacility,
+    OtherIncomeLine,
+    EventTourLine,
+    InvestorRound,
+    FinancialResults,
+)
 
 __all__ = [
     "ModelConfig",
@@ -30,4 +50,22 @@ __all__ = [
     "MonteCarloEngine",
     "MultiplesModel",
     "AnalyticsEngine",
+    "PackagingSize",
+    "ExpansionEvent",
+    "GeneralSettings",
+    "WorkingCapitalAssumptions",
+    "TaxAssumptions",
+    "WACCConfig",
+    "SKU",
+    "MarketVolumeAssumption",
+    "DirectCostComponent",
+    "StartupExpense",
+    "EmployeeRole",
+    "OpexLine",
+    "CapexItem",
+    "DebtFacility",
+    "OtherIncomeLine",
+    "EventTourLine",
+    "InvestorRound",
+    "FinancialResults",
 ]
