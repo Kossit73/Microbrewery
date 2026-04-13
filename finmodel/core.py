@@ -245,11 +245,54 @@ class MicrobreweryFinancialModel:
             wc[year] = receivables + inventory + other_assets - payables - other_liabilities
         return wc
 
+
+    def free_cash_flow_forecast(self) -> Dict[str, Dict[str, float]]:
+        ismt = self.projected_income_statement()
+        wc = self.working_capital_by_year(ismt)
+        capex = self.capex_by_year()
+        out: Dict[str, Dict[str, float]] = {}
+        prev_wc = 0.0
+        for year in YEAR_LABELS:
+            if year == "Year 0":
+                out[year] = {
+                    "cash_flow_from_operations": 0.0,
+                    "change_in_working_capital": 0.0,
+                    "capex": -capex.get(year, 0.0),
+                    "unlevered_free_cash_flow": -capex.get(year, 0.0),
+                }
+                continue
+            delta_wc = wc[year] - prev_wc
+            prev_wc = wc[year]
+            cfo = ismt[year]["net_income"] + ismt[year]["depreciation"] - delta_wc
+            out[year] = {
+                "cash_flow_from_operations": cfo,
+                "change_in_working_capital": delta_wc,
+                "capex": -capex.get(year, 0.0),
+                "unlevered_free_cash_flow": cfo - capex.get(year, 0.0),
+            }
+        return out
+
+    def valuation(self) -> Dict[str, Dict[str, float]]:
+        ismt = self.projected_income_statement()
+        debt = self.debt_schedule()
+        values: Dict[str, Dict[str, float]] = {}
+        for year in self.forecast_years():
+            ebitda = ismt[year]["ebitda"]
+            enterprise_value = ebitda * self.wacc.exit_ev_ebitda_multiple
+            equity_value = enterprise_value - debt["ending_financial_debt"].get(year, 0.0) + self.minimum_cash_balance
+            values[year] = {
+                "ebitda": ebitda,
+                "enterprise_value": enterprise_value,
+                "equity_value": equity_value,
+            }
+        return values
+
     def run_full_model(self) -> FinancialResults:
         return FinancialResults(
             yearly={
                 "income_statement": self.projected_income_statement(),
-                "working_capital": self.working_capital_by_year(),
+                "free_cash_flow": self.free_cash_flow_forecast(),
+                "valuation": self.valuation(),
             }
         )
 
