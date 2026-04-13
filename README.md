@@ -97,3 +97,5 @@ This repository now includes the `finmodel` package that implements a modular va
 ## Making the brewery model more detailed
 
 For a prioritized checklist of granular features to add (e.g., seasonality, SKU-level BOMs, payroll plans, covenants, and sensitivity dashboards), see `docs/MODEL_ENHANCEMENTS.md`. Start with the **Critical missing schedules and assumptions** section to surface the biggest gaps.
+
+For a schedule-by-schedule build sequence (with phased implementation guidance), see `docs/DETAILED_SCHEDULE_ROADMAP.md`.
