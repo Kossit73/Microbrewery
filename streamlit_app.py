@@ -293,6 +293,69 @@ def _non_empty_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(how="all").copy()
 
 
+def _dynamic_table_editor(title: str, key: str, default_df: pd.DataFrame, label: str = "row") -> pd.DataFrame:
+    data_key = f"dyn_data_{key}"
+    saved_key = f"dyn_saved_{key}"
+    work_key = f"dyn_work_{key}"
+    edit_key = f"dyn_edit_{key}"
+    select_key = f"dyn_select_{key}"
+    if data_key not in st.session_state:
+        st.session_state[data_key] = default_df.copy()
+    if saved_key not in st.session_state:
+        st.session_state[saved_key] = st.session_state[data_key].copy()
+    if work_key not in st.session_state:
+        st.session_state[work_key] = st.session_state[saved_key].copy()
+    if edit_key not in st.session_state:
+        st.session_state[edit_key] = False
+
+    st.markdown(f"#### {title}")
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+    if c1.button("Edit", key=f"dyn_edit_btn_{key}"):
+        st.session_state[edit_key] = not st.session_state[edit_key]
+        if st.session_state[edit_key]:
+            st.session_state[work_key] = st.session_state[saved_key].copy()
+    if c2.button(f"Add {label}", key=f"dyn_add_btn_{key}") and st.session_state[edit_key]:
+        blank = {col: None for col in st.session_state[work_key].columns}
+        st.session_state[work_key] = pd.concat([st.session_state[work_key], pd.DataFrame([blank])], ignore_index=True)
+    if c3.button(f"Delete {label}", key=f"dyn_del_btn_{key}") and st.session_state[edit_key]:
+        wdf = st.session_state[work_key]
+        if not wdf.empty:
+            sel = st.session_state.get(select_key, 0)
+            if sel in wdf.index:
+                st.session_state[work_key] = wdf.drop(index=sel).reset_index(drop=True)
+    if c4.button("Reset changes", key=f"dyn_reset_btn_{key}"):
+        st.session_state[work_key] = st.session_state[saved_key].copy()
+        st.session_state[data_key] = st.session_state[saved_key].copy()
+
+    if st.session_state[edit_key]:
+        wdf = st.session_state[work_key]
+        if not wdf.empty:
+            selected = st.selectbox(f"{label.title()} selection", options=list(wdf.index), key=select_key)
+            updates = {}
+            for col in wdf.columns:
+                v = wdf.loc[selected, col]
+                if pd.api.types.is_numeric_dtype(wdf[col]):
+                    updates[col] = st.number_input(f"{col}", value=0.0 if pd.isna(v) else float(v), key=f"dyn_field_{key}_{selected}_{col}")
+                else:
+                    updates[col] = st.text_input(f"{col}", value="" if pd.isna(v) else str(v), key=f"dyn_field_{key}_{selected}_{col}")
+            b1, b2, b3, b4 = st.columns(4)
+            if b1.button(f"Apply {label} changes", key=f"dyn_apply_btn_{key}"):
+                for col, val in updates.items():
+                    st.session_state[work_key].loc[selected, col] = val
+            if b2.button("Save changes", key=f"dyn_save_btn_{key}"):
+                st.session_state[saved_key] = st.session_state[work_key].copy()
+                st.session_state[data_key] = st.session_state[saved_key].copy()
+            if b3.button("Discard edits", key=f"dyn_discard_btn_{key}"):
+                st.session_state[work_key] = st.session_state[saved_key].copy()
+            if b4.button("Close editor", key=f"dyn_close_btn_{key}"):
+                st.session_state[edit_key] = False
+                st.session_state[data_key] = st.session_state[saved_key].copy()
+        st.dataframe(st.session_state[work_key], use_container_width=True)
+    else:
+        st.dataframe(st.session_state[data_key], use_container_width=True)
+    return st.session_state[data_key]
+
+
 def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
     skus = _non_empty_rows(st.session_state.get("assump_data_skus", base_inputs.skus)).copy()
     channels = _non_empty_rows(st.session_state.get("assump_data_channels", base_inputs.channels)).copy()
@@ -612,22 +675,30 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
     cost_uplift = var_lookup.get("cost_uplift_pct", 0.0) / 100.0
     base_revenue = base_revenue_raw * (1 + price_uplift) * (1 + volume_uplift)
     base_ebitda = base_ebitda_raw
-    sens_df = pd.DataFrame(
+    sens_defaults = pd.DataFrame(
         [
-            {"case": "Price -10%", "revenue": base_revenue * 0.90, "ebitda": base_ebitda * 0.75},
-            {"case": "Base", "revenue": base_revenue, "ebitda": base_ebitda},
-            {"case": "Price +10%", "revenue": base_revenue * 1.10, "ebitda": base_ebitda * 1.25},
-            {"case": "Volume -10%", "revenue": base_revenue * 0.90, "ebitda": base_ebitda * 0.80},
-            {"case": "Volume +10%", "revenue": base_revenue * 1.10, "ebitda": base_ebitda * 1.20},
+            {"case": "Price -10%", "revenue_factor": 0.90, "ebitda_factor": 0.75},
+            {"case": "Base", "revenue_factor": 1.00, "ebitda_factor": 1.00},
+            {"case": "Price +10%", "revenue_factor": 1.10, "ebitda_factor": 1.25},
+            {"case": "Volume -10%", "revenue_factor": 0.90, "ebitda_factor": 0.80},
+            {"case": "Volume +10%", "revenue_factor": 1.10, "ebitda_factor": 1.20},
         ]
     )
+    sens_input = _dynamic_table_editor("Sensitivity variables", "ka_sensitivity", sens_defaults, label="case")
+    sens_df = sens_input.copy()
+    sens_df["revenue"] = base_revenue * pd.to_numeric(sens_df["revenue_factor"], errors="coerce").fillna(1.0)
+    sens_df["ebitda"] = base_ebitda * pd.to_numeric(sens_df["ebitda_factor"], errors="coerce").fillna(1.0)
     st.dataframe(sens_df)
     st.bar_chart(sens_df.set_index("case")[["revenue", "ebitda"]])
 
     # Monte Carlo simulation
     st.markdown("### Monte Carlo simulation")
-    sims = st.slider("Simulations", 100, 2000, 500, step=100, key="mc_sims")
-    sigma_pct = max(var_lookup.get("risk_sigma_pct", 20.0), 0.0) / 100.0
+    mc_defaults = pd.DataFrame([{"simulations": 500, "sigma_pct": max(var_lookup.get("risk_sigma_pct", 20.0), 0.0)}])
+    mc_cfg = _dynamic_table_editor("Monte Carlo variables", "ka_mc", mc_defaults, label="config")
+    sims = int(pd.to_numeric(mc_cfg.iloc[0].get("simulations", 500), errors="coerce")) if not mc_cfg.empty else 500
+    sims = int(np.clip(sims, 100, 5000))
+    sigma_pct = (float(pd.to_numeric(mc_cfg.iloc[0].get("sigma_pct", 20.0), errors="coerce")) / 100.0) if not mc_cfg.empty else 0.2
+    sigma_pct = max(sigma_pct, 0.0)
     if base_ebitda > 0:
         draws = np.random.normal(loc=base_ebitda, scale=base_ebitda * sigma_pct, size=sims)
         mc_df = pd.DataFrame({"ebitda_sim": draws})
@@ -643,9 +714,11 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
 
     # What-ifs analysis
     st.markdown("### What ifs analysis")
-    what_if_price = st.slider("What-if price change %", -30, 30, 0, step=1, key="whatif_price")
-    what_if_volume = st.slider("What-if volume change %", -30, 30, 0, step=1, key="whatif_volume")
-    what_if_cost = st.slider("What-if direct cost change %", -30, 30, 0, step=1, key="whatif_cost")
+    what_if_defaults = pd.DataFrame([{"price_change_pct": 0.0, "volume_change_pct": 0.0, "cost_change_pct": 0.0}])
+    what_if_cfg = _dynamic_table_editor("What-if variables", "ka_whatif", what_if_defaults, label="set")
+    what_if_price = float(pd.to_numeric(what_if_cfg.iloc[0].get("price_change_pct", 0.0), errors="coerce")) if not what_if_cfg.empty else 0.0
+    what_if_volume = float(pd.to_numeric(what_if_cfg.iloc[0].get("volume_change_pct", 0.0), errors="coerce")) if not what_if_cfg.empty else 0.0
+    what_if_cost = float(pd.to_numeric(what_if_cfg.iloc[0].get("cost_change_pct", 0.0), errors="coerce")) if not what_if_cfg.empty else 0.0
     what_if_revenue = base_revenue * (1 + what_if_price / 100.0) * (1 + what_if_volume / 100.0)
     base_direct = (float(annual["direct_costs"].iloc[0]) if "direct_costs" in annual.columns else 0.0) * (1 + cost_uplift)
     what_if_direct = base_direct * (1 + what_if_cost / 100.0)
@@ -664,7 +737,15 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
     # Break-even analysis by product
     st.markdown("### Break-even analysis by product")
     prices = result.prices
-    channel_weights = {"Wholesale": 0.40, "Retail": 0.30, "E-Commerce": 0.15, "On-Premise": 0.10, "Export": 0.05}
+    weight_defaults = pd.DataFrame(
+        [{"channel": "Wholesale", "weight": 0.40}, {"channel": "Retail", "weight": 0.30}, {"channel": "E-Commerce", "weight": 0.15}, {"channel": "On-Premise", "weight": 0.10}, {"channel": "Export", "weight": 0.05}]
+    )
+    weight_df = _dynamic_table_editor("Break-even channel weights", "ka_breakeven_weights", weight_defaults, label="weight row")
+    channel_weights = {
+        str(r["channel"]): float(r["weight"])
+        for _, r in weight_df.iterrows()
+        if pd.notna(r.get("channel")) and pd.notna(r.get("weight"))
+    }
     be_rows = []
     fixed_pool = float(annual["opex"].iloc[0]) if "opex" in annual.columns else 0.0
     for _, sku in inputs.skus.iterrows():
@@ -683,20 +764,14 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
 
     # Scenario planning
     st.markdown("### Scenario planning")
-    if "ka_scenarios" not in st.session_state:
-        st.session_state["ka_scenarios"] = pd.DataFrame(
-            [
-                {"scenario": "Downside", "revenue_multiplier": 0.85, "ebitda_multiplier": 0.70},
-                {"scenario": "Base", "revenue_multiplier": 1.00, "ebitda_multiplier": 1.00},
-                {"scenario": "Upside", "revenue_multiplier": 1.15, "ebitda_multiplier": 1.30},
-            ]
-        )
-    scen_edit = st.toggle("Edit scenarios", key="ka_edit_scenarios")
-    if scen_edit:
-        st.session_state["ka_scenarios"] = st.data_editor(
-            st.session_state["ka_scenarios"], num_rows="dynamic", use_container_width=True
-        )
-    scen_df = st.session_state["ka_scenarios"].copy()
+    scen_defaults = pd.DataFrame(
+        [
+            {"scenario": "Downside", "revenue_multiplier": 0.85, "ebitda_multiplier": 0.70},
+            {"scenario": "Base", "revenue_multiplier": 1.00, "ebitda_multiplier": 1.00},
+            {"scenario": "Upside", "revenue_multiplier": 1.15, "ebitda_multiplier": 1.30},
+        ]
+    )
+    scen_df = _dynamic_table_editor("Scenario planning variables", "ka_scenarios", scen_defaults, label="scenario")
     scen_df["revenue"] = base_revenue * pd.to_numeric(scen_df["revenue_multiplier"], errors="coerce").fillna(1.0)
     scen_df["ebitda"] = base_ebitda * pd.to_numeric(scen_df["ebitda_multiplier"], errors="coerce").fillna(1.0)
     st.dataframe(scen_df)
@@ -704,7 +779,9 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
 
     # Goal seek
     st.markdown("### Goal seek")
-    target_ebitda = st.number_input("Target EBITDA (Year 1)", min_value=0.0, value=max(base_ebitda, 1.0), key="goal_ebitda")
+    goal_defaults = pd.DataFrame([{"target_ebitda": max(base_ebitda, 1.0)}])
+    goal_df = _dynamic_table_editor("Goal-seek variables", "ka_goalseek", goal_defaults, label="target row")
+    target_ebitda = float(pd.to_numeric(goal_df.iloc[0].get("target_ebitda", max(base_ebitda, 1.0)), errors="coerce")) if not goal_df.empty else max(base_ebitda, 1.0)
     margin_rate = max((base_ebitda / base_revenue) if base_revenue else 0.0, 1e-6)
     required_revenue = target_ebitda / margin_rate
     st.write({"required_revenue": required_revenue, "implied_revenue_uplift_pct": (required_revenue / base_revenue - 1) * 100 if base_revenue else 0.0})
@@ -717,21 +794,37 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
 
     # Debt service coverage ratio
     st.markdown("### Debt service coverage ratio")
+    dscr_cfg = _dynamic_table_editor(
+        "DSCR variables",
+        "ka_dscr",
+        pd.DataFrame([{"min_dscr_threshold": 1.20}]),
+        label="threshold row",
+    )
+    min_dscr = float(pd.to_numeric(dscr_cfg.iloc[0].get("min_dscr_threshold", 1.20), errors="coerce")) if not dscr_cfg.empty else 1.2
     if {"debt_principal_payment", "interest_expense", "ebitda"}.issubset(monthly.columns):
         ds = monthly["debt_principal_payment"] + monthly["interest_expense"]
         dscr = np.where(ds > 0, monthly["ebitda"] / ds, np.nan)
-        st.line_chart(pd.DataFrame({"DSCR": dscr}, index=monthly.index))
+        dscr_df = pd.DataFrame({"DSCR": dscr, "min_threshold": min_dscr}, index=monthly.index)
+        st.line_chart(dscr_df)
     else:
         st.info("DSCR uses monthly debt principal, interest, and EBITDA columns when available.")
 
     # Predictive analytics
     st.markdown("### Predictive analytics")
+    pred_cfg = _dynamic_table_editor(
+        "Predictive variables",
+        "ka_predictive",
+        pd.DataFrame([{"forecast_steps": 1}]),
+        label="config row",
+    )
+    forecast_steps = int(pd.to_numeric(pred_cfg.iloc[0].get("forecast_steps", 1), errors="coerce")) if not pred_cfg.empty else 1
+    forecast_steps = max(forecast_steps, 1)
     if "total_revenue" in annual.columns and len(annual) >= 3:
         y = annual["total_revenue"].values.astype(float)
         x = np.arange(len(y))
         coeff = np.polyfit(x, y, 1)
-        pred = coeff[0] * (x + 1) + coeff[1]
-        pred_df = pd.DataFrame({"actual_revenue": y, "next_step_prediction": pred}, index=annual.index)
+        pred = coeff[0] * (x + forecast_steps) + coeff[1]
+        pred_df = pd.DataFrame({"actual_revenue": y, f"prediction_step_{forecast_steps}": pred}, index=annual.index)
         st.dataframe(pred_df)
         st.line_chart(pred_df)
     else:
@@ -739,6 +832,13 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
 
     # Return diagnostics
     st.markdown("### Return diagnostics")
+    ret_cfg = _dynamic_table_editor(
+        "Return diagnostics variables",
+        "ka_returns",
+        pd.DataFrame([{"target_irr_pct": 20.0}]),
+        label="target row",
+    )
+    target_irr = float(pd.to_numeric(ret_cfg.iloc[0].get("target_irr_pct", 20.0), errors="coerce")) / 100.0 if not ret_cfg.empty else 0.2
     val = result.valuation
     keys = ["enterprise_value", "equity_value", "investor_irr_annual", "investor_moic"]
     st.write({k: val.get(k, None) for k in keys})
@@ -748,6 +848,14 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
 
     # Coverage & resilience
     st.markdown("### Coverage & resilience")
+    cov_cfg = _dynamic_table_editor(
+        "Coverage & resilience variables",
+        "ka_coverage",
+        pd.DataFrame([{"min_cash_to_debt": 1.0, "min_months_opex": 3.0}]),
+        label="threshold row",
+    )
+    min_cash_to_debt = float(pd.to_numeric(cov_cfg.iloc[0].get("min_cash_to_debt", 1.0), errors="coerce")) if not cov_cfg.empty else 1.0
+    min_months_opex = float(pd.to_numeric(cov_cfg.iloc[0].get("min_months_opex", 3.0), errors="coerce")) if not cov_cfg.empty else 3.0
     cov = {}
     if {"cash", "debt_ending_balance"}.issubset(monthly.columns):
         cov["cash_to_debt_ratio_last_month"] = float(
@@ -760,6 +868,7 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
     st.write(cov if cov else {"note": "Coverage metrics require cash/debt/opex monthly columns."})
     if cov:
         st.bar_chart(pd.DataFrame({"value": cov}))
+        st.write({"min_cash_to_debt_threshold": min_cash_to_debt, "min_months_opex_threshold": min_months_opex, "target_irr": target_irr})
 
 
 def main() -> None:
