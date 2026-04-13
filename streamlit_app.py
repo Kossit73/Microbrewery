@@ -1112,10 +1112,9 @@ def main() -> None:
         "assumptions, and download the resulting statements."
     )
 
-    tab_assumptions, tab_results, tab_details, tab_key_analytics, tab_ai_decision = st.tabs([
+    tab_assumptions, tab_results, tab_key_analytics, tab_ai_decision = st.tabs([
         "Core Assumptions",
         "Results",
-        "Assumptions",
         "Key Analytics",
         "AI Decision Making",
     ])
@@ -1246,7 +1245,9 @@ def main() -> None:
     with tab_ai_decision:
         _ai_decision_making_page(result, inputs, cfg, div)
 
-    with tab_details:
+    with tab_assumptions:
+        st.divider()
+        st.subheader("Detailed Assumption Tables")
         capex_df = pd.DataFrame(
             [
                 {
