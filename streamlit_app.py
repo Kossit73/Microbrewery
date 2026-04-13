@@ -139,6 +139,63 @@ def _run_model(cfg: ModelConfig, div: DividendPolicy) -> Tuple[ModelInputs, Micr
     return inputs, model
 
 
+def _apply_yearly_increment(df: pd.DataFrame, increment_pct: float) -> pd.DataFrame:
+    out = df.copy()
+    year_cols = []
+    for c in out.columns:
+        if isinstance(c, str) and c.lower().startswith("year "):
+            try:
+                y = int(c.split()[-1])
+                year_cols.append((c, y))
+            except ValueError:
+                continue
+    if year_cols:
+        for c, y in sorted(year_cols, key=lambda x: x[1]):
+            factor = (1.0 + increment_pct) ** max(y - 1, 0)
+            series = pd.to_numeric(out[c], errors="coerce")
+            out[c] = series.where(series.isna(), series * factor)
+    else:
+        numeric_cols = out.select_dtypes(include=["number"]).columns
+        for c in numeric_cols:
+            out[c] = out[c] * (1.0 + increment_pct)
+    return out
+
+
+def _assumption_editor(title: str, key: str, df: pd.DataFrame) -> pd.DataFrame:
+    st.markdown(f"### {title}")
+    data_key = f"assump_data_{key}"
+    edit_key = f"assump_edit_{key}"
+    inc_key = f"assump_inc_{key}"
+    if data_key not in st.session_state:
+        st.session_state[data_key] = df.copy()
+    if edit_key not in st.session_state:
+        st.session_state[edit_key] = False
+    if inc_key not in st.session_state:
+        st.session_state[inc_key] = 0.0
+
+    c1, c2, c3 = st.columns([1, 1, 2])
+    if c1.button("Edit", key=f"btn_edit_{key}"):
+        st.session_state[edit_key] = not st.session_state[edit_key]
+    increment_pct = c2.number_input(
+        "Yearly Increment Percentage",
+        min_value=-1.0,
+        max_value=2.0,
+        value=float(st.session_state[inc_key]),
+        step=0.01,
+        key=f"input_inc_{key}",
+        format="%.4f",
+    )
+    st.session_state[inc_key] = increment_pct
+    if c3.button("Propagate Increment", key=f"btn_prop_{key}"):
+        st.session_state[data_key] = _apply_yearly_increment(st.session_state[data_key], increment_pct)
+
+    if st.session_state[edit_key]:
+        st.session_state[data_key] = st.data_editor(st.session_state[data_key], use_container_width=True)
+    else:
+        st.dataframe(st.session_state[data_key], use_container_width=True)
+    return st.session_state[data_key]
+
+
 def _valuation_section(result) -> None:
     st.subheader("Valuation summary")
     valuation_df = pd.DataFrame(result.valuation, index=["value"]).T
@@ -340,13 +397,6 @@ def main() -> None:
         )
 
     with tab_details:
-        st.markdown("### SKUs")
-        st.dataframe(inputs.skus)
-
-        st.markdown("### Channels")
-        st.dataframe(inputs.channels)
-
-        st.markdown("### CAPEX schedule")
         capex_df = pd.DataFrame(
             [
                 {
@@ -358,9 +408,6 @@ def main() -> None:
                 for item in inputs.capex_items
             ]
         )
-        st.dataframe(capex_df)
-
-        st.markdown("### Debt facilities")
         debt_df = pd.DataFrame(
             [
                 {
@@ -375,7 +422,54 @@ def main() -> None:
                 for fac in inputs.debt_facilities
             ]
         )
-        st.dataframe(debt_df)
+        equity_df = pd.DataFrame(
+            [{"month": k, "equity_injection": v} for k, v in sorted(inputs.equity_injections.items())]
+        )
+        config_df = pd.DataFrame(
+            [
+                {
+                    "start_date": cfg.start_date,
+                    "months": cfg.months,
+                    "price_inflation_annual": cfg.price_inflation_annual,
+                    "cost_inflation_annual": cfg.cost_inflation_annual,
+                    "tax_rate": cfg.tax_rate,
+                    "wacc_annual": cfg.wacc_annual,
+                    "exit_ev_ebitda_multiple": cfg.exit_ev_ebitda_multiple,
+                }
+            ]
+        )
+        dividend_df = pd.DataFrame(
+            [
+                {
+                    "enabled": div.enabled,
+                    "model": div.model,
+                    "start_month": div.start_month,
+                    "minimum_cash_position": div.minimum_cash_position,
+                    "payout_ratio": div.payout_ratio,
+                }
+            ]
+        )
+        opex_df = pd.DataFrame(
+            [{"date": d, "opex_fixed_monthly": v} for d, v in inputs.opex_fixed_monthly.items()]
+            if isinstance(inputs.opex_fixed_monthly, pd.Series)
+            else [{"date": "all_months", "opex_fixed_monthly": float(inputs.opex_fixed_monthly)}]
+        )
+        other_income_df = pd.DataFrame(
+            [{"date": d, "other_income_monthly": v} for d, v in inputs.other_income_monthly.items()]
+            if isinstance(inputs.other_income_monthly, pd.Series)
+            else [{"date": "all_months", "other_income_monthly": float(inputs.other_income_monthly)}]
+        )
+
+        _assumption_editor("Model config assumptions", "config", config_df)
+        _assumption_editor("Dividend assumptions", "dividend", dividend_df)
+        _assumption_editor("SKUs", "skus", inputs.skus)
+        _assumption_editor("Channels", "channels", inputs.channels)
+        _assumption_editor("Sales plan", "sales_plan", inputs.sales_plan)
+        _assumption_editor("OPEX fixed monthly", "opex_fixed", opex_df)
+        _assumption_editor("Other income monthly", "other_income", other_income_df)
+        _assumption_editor("CAPEX schedule", "capex", capex_df)
+        _assumption_editor("Debt facilities", "debt", debt_df)
+        _assumption_editor("Equity injections", "equity", equity_df)
 
 
 if __name__ == "__main__":
