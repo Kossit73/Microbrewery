@@ -1113,9 +1113,9 @@ def main() -> None:
     )
 
     tab_assumptions, tab_results, tab_details, tab_key_analytics, tab_ai_decision = st.tabs([
-        "Assumptions",
+        "Core Assumptions",
         "Results",
-        "Assumption tables",
+        "Assumptions",
         "Key Analytics",
         "AI Decision Making",
     ])
