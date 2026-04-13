@@ -1045,7 +1045,33 @@ def _ai_decision_making_page(result, inputs: ModelInputs, cfg: ModelConfig, div:
     )
 
     st.markdown("### Internal model findings")
-    st.json(internal)
+    mg = internal.get("model_governance", {})
+    dp = mg.get("dividend_policy", {})
+    pr = internal.get("production_and_revenues", {})
+    fs = internal.get("financial_statements", {})
+    va = internal.get("advanced_analytics", {}).get("valuation_summary", {})
+    st.write(
+        f"The internal model is configured with a start date of **{mg.get('start_date')}**, a horizon of "
+        f"**{mg.get('months')} months**, **WACC {mg.get('wacc'):.2%}**, and **tax rate {mg.get('tax_rate'):.2%}**. "
+        f"Dividend policy is **{dp.get('model')}** (enabled: {dp.get('enabled')}), starting at month "
+        f"**{dp.get('start_month')}**, with minimum cash of **{dp.get('minimum_cash_position'):,.0f}** and "
+        f"payout ratio **{dp.get('payout_ratio'):.2%}**."
+    )
+    st.write(
+        f"Operations currently span **{pr.get('sku_count')} SKUs** across **{pr.get('channel_count')} channels**. "
+        f"Latest annual revenue is **{pr.get('latest_total_revenue'):,.2f}** and latest EBITDA is "
+        f"**{pr.get('latest_ebitda'):,.2f}**."
+    )
+    st.write(
+        f"Financial statement outputs show latest net income of **{fs.get('latest_net_income'):,.2f}**, "
+        f"cash of **{fs.get('latest_cash'):,.2f}**, and ending debt of **{fs.get('latest_debt_balance'):,.2f}**."
+    )
+    if va:
+        st.write(
+            f"Valuation analytics indicate terminal value **{va.get('terminal_value', 0):,.2f}**, enterprise value "
+            f"**{va.get('enterprise_value_dcf', 0):,.2f}**, equity value at exit **{va.get('equity_value_exit', 0):,.2f}**, "
+            f"annual IRR **{va.get('equity_irr_annual', 0):.2%}**, and MOIC **{va.get('equity_moic', 0):,.2f}x**."
+        )
 
     st.markdown("### Web-based best-practice comparison")
     st.markdown("**Curated authoritative references**")
