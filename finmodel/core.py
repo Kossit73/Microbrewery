@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import asdict
 from typing import Dict, List, Optional, Tuple
 
 from .constants import DAYS_PER_YEAR, FORECAST_YEARS, WORKSHEETS, YEAR_LABELS
@@ -287,12 +288,62 @@ class MicrobreweryFinancialModel:
             }
         return values
 
+
+    def assumptions_snapshot(self) -> Dict[str, object]:
+        return {
+            "general": asdict(self.general),
+            "working_capital": asdict(self.working_capital),
+            "taxes": asdict(self.taxes),
+            "wacc": asdict(self.wacc),
+            "packaging_sizes": {k: asdict(v) for k, v in self.packaging_sizes.items()},
+            "expansions": [asdict(x) for x in self.expansions],
+            "skus": [asdict(x) for x in self.skus],
+            "market_volume_assumptions": [asdict(x) for x in self.market_volume_assumptions],
+            "startup_expenses": [asdict(x) for x in self.startup_expenses],
+            "employee_roles": [asdict(x) for x in self.employee_roles],
+            "opex_lines": [asdict(x) for x in self.opex_lines],
+            "capex_items": [asdict(x) for x in self.capex_items],
+            "debt_facilities": [asdict(x) for x in self.debt_facilities],
+            "event_lines": [asdict(x) for x in self.event_lines],
+            "other_income_lines": [asdict(x) for x in self.other_income_lines],
+            "investor_rounds": [asdict(x) for x in self.investor_rounds],
+            "policy": {
+                "minimum_cash_balance": self.minimum_cash_balance,
+                "property_lease_value_yearly": self.property_lease_value_yearly,
+                "property_value_without_inflation": self.property_value_without_inflation,
+                "dividend_payout_ratio": self.dividend_payout_ratio,
+                "dividend_start_year": self.dividend_start_year,
+            },
+        }
+
+    def schedules_snapshot(self) -> Dict[str, object]:
+        income_statement = self.projected_income_statement()
+        return {
+            "units_by_year": self.total_units_by_year(),
+            "revenue_by_sku_and_year": self.revenue_by_sku_and_year(),
+            "direct_costs_by_year": self.direct_costs_by_year(),
+            "startup_expenses_by_year": self.startup_expenses_by_year(),
+            "salary_costs_by_year": self.salary_costs_by_year(),
+            "opex_by_year": self.opex_by_year(),
+            "capex_by_year": self.capex_by_year(),
+            "depreciation_by_year": self.depreciation_by_year(),
+            "debt_schedule": self.debt_schedule(),
+            "working_capital_by_year": self.working_capital_by_year(income_statement),
+        }
+
+    def results_snapshot(self) -> Dict[str, object]:
+        return {
+            "income_statement": self.projected_income_statement(),
+            "free_cash_flow": self.free_cash_flow_forecast(),
+            "valuation": self.valuation(),
+        }
+
     def run_full_model(self) -> FinancialResults:
         return FinancialResults(
             yearly={
-                "income_statement": self.projected_income_statement(),
-                "free_cash_flow": self.free_cash_flow_forecast(),
-                "valuation": self.valuation(),
+                "assumptions": self.assumptions_snapshot(),
+                "schedules": self.schedules_snapshot(),
+                "results": self.results_snapshot(),
             }
         )
 
