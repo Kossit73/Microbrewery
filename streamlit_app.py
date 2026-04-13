@@ -197,10 +197,16 @@ def _assumption_editor(title: str, key: str, df: pd.DataFrame) -> pd.DataFrame:
     if inc_key not in st.session_state:
         st.session_state[inc_key] = 0.0
 
-    c1, c2, c3 = st.columns([1, 1, 2])
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
     if c1.button("Edit", key=f"btn_edit_{key}"):
         st.session_state[edit_key] = not st.session_state[edit_key]
-    increment_pct = c2.number_input(
+    if c2.button("Add Row", key=f"btn_addrow_{key}"):
+        blank = {col: None for col in st.session_state[data_key].columns}
+        st.session_state[data_key] = pd.concat(
+            [st.session_state[data_key], pd.DataFrame([blank])],
+            ignore_index=True,
+        )
+    increment_pct = c3.number_input(
         "Yearly Increment Percentage",
         min_value=-1.0,
         max_value=2.0,
@@ -210,20 +216,30 @@ def _assumption_editor(title: str, key: str, df: pd.DataFrame) -> pd.DataFrame:
         format="%.4f",
     )
     st.session_state[inc_key] = increment_pct
-    if c3.button("Propagate Increment", key=f"btn_prop_{key}"):
+    if c4.button("Propagate Increment", key=f"btn_prop_{key}"):
         st.session_state[data_key] = _apply_yearly_increment(st.session_state[data_key], increment_pct)
 
     if st.session_state[edit_key]:
-        st.session_state[data_key] = st.data_editor(st.session_state[data_key], use_container_width=True)
+        st.session_state[data_key] = st.data_editor(
+            st.session_state[data_key],
+            num_rows="dynamic",
+            use_container_width=True,
+        )
     else:
         st.dataframe(st.session_state[data_key], use_container_width=True)
     return st.session_state[data_key]
 
 
+def _non_empty_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    return df.dropna(how="all").copy()
+
+
 def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
-    skus = st.session_state.get("assump_data_skus", base_inputs.skus).copy()
-    channels = st.session_state.get("assump_data_channels", base_inputs.channels).copy()
-    sales_plan = st.session_state.get("assump_data_sales_plan", base_inputs.sales_plan).copy()
+    skus = _non_empty_rows(st.session_state.get("assump_data_skus", base_inputs.skus)).copy()
+    channels = _non_empty_rows(st.session_state.get("assump_data_channels", base_inputs.channels)).copy()
+    sales_plan = _non_empty_rows(st.session_state.get("assump_data_sales_plan", base_inputs.sales_plan)).copy()
 
     opex_src = st.session_state.get("assump_data_opex_fixed")
     if isinstance(opex_src, pd.DataFrame) and not opex_src.empty and "date" in opex_src.columns:
@@ -247,6 +263,7 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
 
     capex_src = st.session_state.get("assump_data_capex")
     if isinstance(capex_src, pd.DataFrame):
+        capex_src = _non_empty_rows(capex_src)
         capex_items = [
             CapexItem(
                 name=str(r["name"]),
@@ -255,12 +272,14 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
                 depreciation_years=float(r["depreciation_years"]),
             )
             for _, r in capex_src.iterrows()
+            if pd.notna(r.get("name")) and pd.notna(r.get("amount")) and pd.notna(r.get("capex_month"))
         ]
     else:
         capex_items = base_inputs.capex_items
 
     debt_src = st.session_state.get("assump_data_debt")
     if isinstance(debt_src, pd.DataFrame):
+        debt_src = _non_empty_rows(debt_src)
         debt_facilities = [
             DebtFacility(
                 name=str(r["name"]),
@@ -272,13 +291,19 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
                 repayment_type=str(r["repayment_type"]),
             )
             for _, r in debt_src.iterrows()
+            if pd.notna(r.get("name")) and pd.notna(r.get("principal"))
         ]
     else:
         debt_facilities = base_inputs.debt_facilities
 
     equity_src = st.session_state.get("assump_data_equity")
     if isinstance(equity_src, pd.DataFrame):
-        equity_injections = {int(r["month"]): float(r["equity_injection"]) for _, r in equity_src.iterrows()}
+        equity_src = _non_empty_rows(equity_src)
+        equity_injections = {
+            int(r["month"]): float(r["equity_injection"])
+            for _, r in equity_src.iterrows()
+            if pd.notna(r.get("month")) and pd.notna(r.get("equity_injection"))
+        }
     else:
         equity_injections = base_inputs.equity_injections
 
