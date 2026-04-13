@@ -188,25 +188,43 @@ def _apply_yearly_increment(df: pd.DataFrame, increment_pct: float) -> pd.DataFr
 def _assumption_editor(title: str, key: str, df: pd.DataFrame) -> pd.DataFrame:
     st.markdown(f"### {title}")
     data_key = f"assump_data_{key}"
+    saved_key = f"assump_saved_{key}"
+    work_key = f"assump_work_{key}"
     edit_key = f"assump_edit_{key}"
     inc_key = f"assump_inc_{key}"
     if data_key not in st.session_state:
         st.session_state[data_key] = df.copy()
+    if saved_key not in st.session_state:
+        st.session_state[saved_key] = st.session_state[data_key].copy()
+    if work_key not in st.session_state:
+        st.session_state[work_key] = st.session_state[saved_key].copy()
     if edit_key not in st.session_state:
         st.session_state[edit_key] = False
     if inc_key not in st.session_state:
         st.session_state[inc_key] = 0.0
 
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
+    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
     if c1.button("Edit", key=f"btn_edit_{key}"):
         st.session_state[edit_key] = not st.session_state[edit_key]
-    if c2.button("Add Row", key=f"btn_addrow_{key}"):
-        blank = {col: None for col in st.session_state[data_key].columns}
-        st.session_state[data_key] = pd.concat(
-            [st.session_state[data_key], pd.DataFrame([blank])],
+        if st.session_state[edit_key]:
+            st.session_state[work_key] = st.session_state[saved_key].copy()
+    if c2.button("Add row", key=f"btn_addrow_{key}") and st.session_state[edit_key]:
+        blank = {col: None for col in st.session_state[work_key].columns}
+        st.session_state[work_key] = pd.concat(
+            [st.session_state[work_key], pd.DataFrame([blank])],
             ignore_index=True,
         )
-    increment_pct = c3.number_input(
+    if c3.button("Delete row", key=f"btn_delrow_{key}") and st.session_state[edit_key]:
+        wdf = st.session_state[work_key]
+        if not wdf.empty:
+            sel = st.session_state.get(f"assump_row_select_{key}", 0)
+            if sel in wdf.index:
+                st.session_state[work_key] = wdf.drop(index=sel).reset_index(drop=True)
+    if c4.button("Reset changes", key=f"btn_reset_{key}"):
+        st.session_state[work_key] = st.session_state[saved_key].copy()
+        st.session_state[data_key] = st.session_state[saved_key].copy()
+    inc_col1, inc_col2 = st.columns([1, 1])
+    increment_pct = inc_col1.number_input(
         "Yearly Increment Percentage",
         min_value=-1.0,
         max_value=2.0,
@@ -216,15 +234,51 @@ def _assumption_editor(title: str, key: str, df: pd.DataFrame) -> pd.DataFrame:
         format="%.4f",
     )
     st.session_state[inc_key] = increment_pct
-    if c4.button("Propagate Increment", key=f"btn_prop_{key}"):
-        st.session_state[data_key] = _apply_yearly_increment(st.session_state[data_key], increment_pct)
+    if inc_col2.button("Propagate Increment", key=f"btn_prop_{key}"):
+        target_key = work_key if st.session_state[edit_key] else data_key
+        st.session_state[target_key] = _apply_yearly_increment(st.session_state[target_key], increment_pct)
 
     if st.session_state[edit_key]:
-        st.session_state[data_key] = st.data_editor(
-            st.session_state[data_key],
-            num_rows="dynamic",
-            use_container_width=True,
-        )
+        wdf = st.session_state[work_key]
+        if not wdf.empty:
+            row_options = list(wdf.index)
+            selected_row = st.selectbox(
+                "Row selection",
+                options=row_options,
+                key=f"assump_row_select_{key}",
+            )
+            st.markdown("**Editable row form fields**")
+            updated_row = {}
+            for col in wdf.columns:
+                val = wdf.loc[selected_row, col]
+                if pd.api.types.is_numeric_dtype(wdf[col]):
+                    default_val = 0.0 if pd.isna(val) else float(val)
+                    updated_row[col] = st.number_input(
+                        f"{col}",
+                        value=default_val,
+                        key=f"field_{key}_{selected_row}_{col}",
+                    )
+                else:
+                    updated_row[col] = st.text_input(
+                        f"{col}",
+                        value="" if pd.isna(val) else str(val),
+                        key=f"field_{key}_{selected_row}_{col}",
+                    )
+
+            b1, b2, b3, b4 = st.columns(4)
+            if b1.button("Apply row changes", key=f"btn_apply_row_{key}"):
+                for col, val in updated_row.items():
+                    st.session_state[work_key].loc[selected_row, col] = val
+            if b2.button("Save changes", key=f"btn_save_{key}"):
+                st.session_state[saved_key] = st.session_state[work_key].copy()
+                st.session_state[data_key] = st.session_state[saved_key].copy()
+            if b3.button("Discard edits", key=f"btn_discard_{key}"):
+                st.session_state[work_key] = st.session_state[saved_key].copy()
+            if b4.button("Close editor", key=f"btn_close_{key}"):
+                st.session_state[edit_key] = False
+                st.session_state[data_key] = st.session_state[saved_key].copy()
+
+        st.dataframe(st.session_state[work_key], use_container_width=True)
     else:
         st.dataframe(st.session_state[data_key], use_container_width=True)
     return st.session_state[data_key]
