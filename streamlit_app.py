@@ -645,22 +645,51 @@ def main() -> None:
 
     with tab_assumptions:
         st.subheader("Core assumptions")
-        months = st.slider("Months in projection", min_value=36, max_value=180, value=120, step=12)
-        wacc = st.slider("WACC (annual)", min_value=0.05, max_value=0.20, value=0.122, step=0.005)
-        exit_multiple = st.slider(
-            "Exit EV/EBITDA multiple", min_value=4.0, max_value=12.0, value=8.0, step=0.5
+        c1, c2 = st.columns(2)
+        months = c1.selectbox(
+            "Months in projection",
+            options=[36, 48, 60, 72, 84, 96, 108, 120, 132, 144, 156, 168, 180],
+            index=7,
         )
-        price_inflation = st.slider(
-            "Price inflation (annual)", min_value=0.0, max_value=0.05, value=0.015, step=0.0025
+        wacc = c2.selectbox(
+            "WACC (annual)",
+            options=[round(x, 3) for x in np.arange(0.050, 0.205, 0.005)],
+            index=14,
+            format_func=lambda x: f"{x:.3f}",
         )
-        cost_inflation = st.slider(
-            "Cost inflation (annual)", min_value=0.0, max_value=0.05, value=0.015, step=0.0025
+
+        c3, c4 = st.columns(2)
+        exit_multiple = c3.selectbox(
+            "Exit EV/EBITDA multiple",
+            options=[round(x, 1) for x in np.arange(4.0, 12.5, 0.5)],
+            index=8,
+            format_func=lambda x: f"{x:.1f}x",
         )
-        dividend_start = st.number_input(
-            "Dividend start month", min_value=0, max_value=months - 1, value=60
+        price_inflation = c4.selectbox(
+            "Price inflation (annual)",
+            options=[round(x, 4) for x in np.arange(0.0, 0.0501, 0.0025)],
+            index=6,
+            format_func=lambda x: f"{x:.2%}",
         )
-        min_cash = st.number_input(
-            "Minimum cash for sweep", min_value=0.0, value=1_500_000.0, step=100_000.0, format="%f"
+
+        c5, c6 = st.columns(2)
+        cost_inflation = c5.selectbox(
+            "Cost inflation (annual)",
+            options=[round(x, 4) for x in np.arange(0.0, 0.0501, 0.0025)],
+            index=6,
+            format_func=lambda x: f"{x:.2%}",
+        )
+        dividend_start = c6.selectbox(
+            "Dividend start month",
+            options=list(range(0, int(months))),
+            index=min(60, int(months) - 1),
+        )
+
+        min_cash = st.selectbox(
+            "Minimum cash for sweep",
+            options=[0.0, 250_000.0, 500_000.0, 1_000_000.0, 1_500_000.0, 2_000_000.0, 2_500_000.0, 3_000_000.0],
+            index=4,
+            format_func=lambda x: f"${x:,.0f}",
         )
 
     cfg = ModelConfig(
