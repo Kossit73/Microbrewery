@@ -723,7 +723,10 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
     base_direct = (float(annual["direct_costs"].iloc[0]) if "direct_costs" in annual.columns else 0.0) * (1 + cost_uplift)
     what_if_direct = base_direct * (1 + what_if_cost / 100.0)
     what_if_ebitda = what_if_revenue - what_if_direct - float(annual["opex"].iloc[0])
-    st.write({"revenue": what_if_revenue, "direct_costs": what_if_direct, "ebitda": what_if_ebitda})
+    m1, m2, m3 = st.columns(3)
+    m1.metric("What-if Revenue", f"{what_if_revenue:,.2f}")
+    m2.metric("What-if Direct Costs", f"{what_if_direct:,.2f}")
+    m3.metric("What-if EBITDA", f"{what_if_ebitda:,.2f}")
     st.bar_chart(
         pd.DataFrame(
             {
