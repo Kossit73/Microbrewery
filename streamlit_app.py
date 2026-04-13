@@ -513,10 +513,13 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
     monthly = result.monthly.copy()
 
     st.markdown("### Editable analytics controls")
-    if "ka_edit_mode" not in st.session_state:
-        st.session_state["ka_edit_mode"] = False
-    if "ka_variables" not in st.session_state:
-        st.session_state["ka_variables"] = pd.DataFrame(
+    var_data_key = "ka_var_data"
+    var_saved_key = "ka_var_saved"
+    var_work_key = "ka_var_work"
+    var_edit_key = "ka_var_edit"
+    var_select_key = "ka_var_select"
+    if var_data_key not in st.session_state:
+        st.session_state[var_data_key] = pd.DataFrame(
             [
                 {"variable": "price_uplift_pct", "value": 0.0, "apply_to": "revenue"},
                 {"variable": "volume_uplift_pct", "value": 0.0, "apply_to": "revenue"},
@@ -524,28 +527,76 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
                 {"variable": "risk_sigma_pct", "value": 20.0, "apply_to": "monte_carlo"},
             ]
         )
+    if var_saved_key not in st.session_state:
+        st.session_state[var_saved_key] = st.session_state[var_data_key].copy()
+    if var_work_key not in st.session_state:
+        st.session_state[var_work_key] = st.session_state[var_saved_key].copy()
+    if var_edit_key not in st.session_state:
+        st.session_state[var_edit_key] = False
 
-    c1, c2, c3 = st.columns([1, 1, 2])
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
     if c1.button("Edit", key="ka_edit_button"):
-        st.session_state["ka_edit_mode"] = not st.session_state["ka_edit_mode"]
-    if c2.button("Add variable", key="ka_add_variable"):
-        st.session_state["ka_variables"] = pd.concat(
+        st.session_state[var_edit_key] = not st.session_state[var_edit_key]
+        if st.session_state[var_edit_key]:
+            st.session_state[var_work_key] = st.session_state[var_saved_key].copy()
+    if c2.button("Add Variable", key="ka_add_variable") and st.session_state[var_edit_key]:
+        st.session_state[var_work_key] = pd.concat(
             [
-                st.session_state["ka_variables"],
+                st.session_state[var_work_key],
                 pd.DataFrame([{"variable": "new_variable", "value": 0.0, "apply_to": "revenue"}]),
             ],
             ignore_index=True,
         )
-    c3.caption("Tip: Edit variable names/values to instantly manipulate analytics outputs.")
+    if c3.button("Delete Variable", key="ka_delete_variable") and st.session_state[var_edit_key]:
+        wdf = st.session_state[var_work_key]
+        if not wdf.empty:
+            sel = st.session_state.get(var_select_key, 0)
+            if sel in wdf.index:
+                st.session_state[var_work_key] = wdf.drop(index=sel).reset_index(drop=True)
+    if c4.button("Reset Changes", key="ka_reset_changes"):
+        st.session_state[var_work_key] = st.session_state[var_saved_key].copy()
+        st.session_state[var_data_key] = st.session_state[var_saved_key].copy()
 
-    if st.session_state["ka_edit_mode"]:
-        st.session_state["ka_variables"] = st.data_editor(
-            st.session_state["ka_variables"], num_rows="dynamic", use_container_width=True
-        )
+    if st.session_state[var_edit_key]:
+        wdf = st.session_state[var_work_key]
+        if not wdf.empty:
+            selected_row = st.selectbox("Variable selector", options=list(wdf.index), key=var_select_key)
+            st.markdown("**Editable variable fields**")
+            var_name = st.text_input(
+                "variable",
+                value="" if pd.isna(wdf.loc[selected_row, "variable"]) else str(wdf.loc[selected_row, "variable"]),
+                key=f"ka_field_name_{selected_row}",
+            )
+            var_value = st.number_input(
+                "value",
+                value=0.0 if pd.isna(wdf.loc[selected_row, "value"]) else float(wdf.loc[selected_row, "value"]),
+                key=f"ka_field_val_{selected_row}",
+            )
+            apply_to = st.text_input(
+                "apply_to",
+                value="" if pd.isna(wdf.loc[selected_row, "apply_to"]) else str(wdf.loc[selected_row, "apply_to"]),
+                key=f"ka_field_apply_{selected_row}",
+            )
+            b1, b2, b3, b4 = st.columns(4)
+            if b1.button("Apply Variable Changes", key="ka_apply_var"):
+                st.session_state[var_work_key].loc[selected_row, "variable"] = var_name
+                st.session_state[var_work_key].loc[selected_row, "value"] = var_value
+                st.session_state[var_work_key].loc[selected_row, "apply_to"] = apply_to
+            if b2.button("Save Changes", key="ka_save_var"):
+                st.session_state[var_saved_key] = st.session_state[var_work_key].copy()
+                st.session_state[var_data_key] = st.session_state[var_saved_key].copy()
+            if b3.button("Discard Edits", key="ka_discard_var"):
+                st.session_state[var_work_key] = st.session_state[var_saved_key].copy()
+            if b4.button("Close Editor", key="ka_close_var"):
+                st.session_state[var_edit_key] = False
+                st.session_state[var_data_key] = st.session_state[var_saved_key].copy()
+        else:
+            st.info("No variables left. Use 'Add Variable' to create one.")
+        st.dataframe(st.session_state[var_work_key], use_container_width=True)
     else:
-        st.dataframe(st.session_state["ka_variables"], use_container_width=True)
+        st.dataframe(st.session_state[var_data_key], use_container_width=True)
 
-    var_df = st.session_state["ka_variables"].copy()
+    var_df = st.session_state[var_data_key].copy()
     var_lookup = {
         str(r["variable"]): float(r["value"])
         for _, r in var_df.iterrows()
