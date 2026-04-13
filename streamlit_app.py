@@ -448,17 +448,70 @@ def _valuation_section(result) -> None:
 
 def _statement_section(result) -> None:
     st.subheader("Statements")
-    st.markdown("**Annual summary (all rows)**")
-    annual_cols = [
+    annual = result.annual.copy()
+
+    st.markdown("**Annual Financial Performance Statement (Income Statement)**")
+    perf_cols = [
         "total_revenue",
+        "other_income",
         "direct_costs",
         "gross_profit",
         "opex",
         "ebitda",
+        "depreciation",
+        "ebit",
+        "interest_expense",
+        "pre_tax_income",
+        "taxes",
         "net_income",
+    ]
+    perf_existing = [c for c in perf_cols if c in annual.columns]
+    if perf_existing:
+        st.dataframe(annual[perf_existing])
+    else:
+        st.info("No annual income-statement columns were found in the current result payload.")
+
+    st.markdown("**Annual Financial Position (Balance Sheet view)**")
+    position_cols = [
+        "cash",
+        "receivables",
+        "inventory",
+        "other_current_assets",
+        "current_assets",
+        "net_fixed_assets",
+        "total_assets",
+        "payables",
+        "other_current_liabilities",
+        "current_liabilities",
+        "debt_ending_balance",
+        "total_liabilities",
+        "equity",
+    ]
+    pos_existing = [c for c in position_cols if c in annual.columns]
+    if pos_existing:
+        st.dataframe(annual[pos_existing])
+    else:
+        st.info("No annual balance-sheet columns were found in the current result payload.")
+
+    st.markdown("**Annual Cash Flow Statement**")
+    cf_cols = [
+        "cash_flow_from_operations",
+        "change_in_nwc",
+        "capex",
+        "cash_flow_from_investing",
+        "debt_draw",
+        "debt_principal_payment",
+        "equity_injection",
+        "dividends",
+        "cash_flow_from_financing",
+        "net_change_in_cash",
         "fcff",
     ]
-    st.dataframe(result.annual.loc[:, annual_cols])
+    cf_existing = [c for c in cf_cols if c in annual.columns]
+    if cf_existing:
+        st.dataframe(annual[cf_existing])
+    else:
+        st.info("No annual cash-flow columns were found in the current result payload.")
 
     st.markdown("**Latest 12 months (monthly)**")
     st.dataframe(
