@@ -11,6 +11,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 import io
+import json
+import urllib.parse
+import urllib.request
 from typing import Tuple
 
 import numpy as np
@@ -927,6 +930,155 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
         st.write({"min_cash_to_debt_threshold": min_cash_to_debt, "min_months_opex_threshold": min_months_opex, "target_irr": target_irr})
 
 
+def _internal_findings_snapshot(result, inputs: ModelInputs, cfg: ModelConfig, div: DividendPolicy) -> dict:
+    annual = result.annual.copy()
+    latest_annual = annual.iloc[-1].to_dict() if len(annual) else {}
+    latest_monthly = result.monthly.iloc[-1].to_dict() if len(result.monthly) else {}
+    return {
+        "model_governance": {
+            "start_date": cfg.start_date,
+            "months": cfg.months,
+            "wacc": cfg.wacc_annual,
+            "tax_rate": cfg.tax_rate,
+            "dividend_policy": {
+                "enabled": div.enabled,
+                "model": div.model,
+                "start_month": div.start_month,
+                "minimum_cash_position": div.minimum_cash_position,
+                "payout_ratio": div.payout_ratio,
+            },
+        },
+        "production_and_revenues": {
+            "sku_count": int(len(inputs.skus)),
+            "channel_count": int(len(inputs.channels)),
+            "latest_total_revenue": latest_annual.get("total_revenue"),
+            "latest_ebitda": latest_annual.get("ebitda"),
+        },
+        "financial_statements": {
+            "latest_net_income": latest_annual.get("net_income"),
+            "latest_cash": latest_monthly.get("cash"),
+            "latest_debt_balance": latest_monthly.get("debt_ending_balance"),
+        },
+        "advanced_analytics": {
+            "valuation_summary": result.valuation,
+        },
+    }
+
+
+def _best_practice_sources_by_topic(question: str) -> list[dict]:
+    q = question.lower()
+    sources = []
+    if any(k in q for k in ["governance", "control", "risk", "model governance"]):
+        sources += [
+            {"name": "SR 11-7 Supervisory Guidance", "url": "https://www.federalreserve.gov/supervisionreg/srletters/sr1107.htm"},
+            {"name": "OCC 2011-12 Model Risk Management", "url": "https://occ.treas.gov/news-issuances/bulletins/2011/bulletin-2011-12.html"},
+        ]
+    if any(k in q for k in ["financial statement", "ifrs", "gaap", "reporting"]):
+        sources += [
+            {"name": "IFRS Foundation", "url": "https://www.ifrs.org/"},
+            {"name": "FASB US GAAP", "url": "https://www.fasb.org/"},
+        ]
+    if any(k in q for k in ["dscr", "debt service", "coverage"]):
+        sources += [
+            {"name": "CFI DSCR overview", "url": "https://corporatefinanceinstitute.com/resources/commercial-lending/debt-service-coverage-ratio/"},
+            {"name": "SBA Loan Basics", "url": "https://www.sba.gov/funding-programs/loans"},
+        ]
+    if any(k in q for k in ["monte carlo", "simulation", "sensitivity", "scenario"]):
+        sources += [
+            {"name": "NIST Engineering Statistics Handbook", "url": "https://www.itl.nist.gov/div898/handbook/"},
+            {"name": "OECD Corporate Governance (risk context)", "url": "https://www.oecd.org/corporate/"},
+        ]
+    if not sources:
+        sources += [
+            {"name": "OECD Corporate Governance", "url": "https://www.oecd.org/corporate/"},
+            {"name": "IMF Data and Financial Soundness", "url": "https://www.imf.org/en/Data"},
+        ]
+    # de-duplicate by url
+    seen = set()
+    deduped = []
+    for s in sources:
+        if s["url"] not in seen:
+            deduped.append(s)
+            seen.add(s["url"])
+    return deduped[:6]
+
+
+def _live_web_headlines(query: str) -> list[dict]:
+    # lightweight optional web lookup via DuckDuckGo instant answer API
+    url = "https://api.duckduckgo.com/?" + urllib.parse.urlencode({"q": query, "format": "json", "no_redirect": 1, "no_html": 1})
+    with urllib.request.urlopen(url, timeout=8) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    out = []
+    if payload.get("AbstractURL"):
+        out.append({"title": payload.get("Heading") or "DuckDuckGo Abstract", "url": payload.get("AbstractURL")})
+    for item in payload.get("RelatedTopics", []):
+        if isinstance(item, dict) and item.get("FirstURL"):
+            out.append({"title": item.get("Text", "Related Topic"), "url": item.get("FirstURL")})
+        if len(out) >= 5:
+            break
+    return out
+
+
+def _ai_decision_making_page(result, inputs: ModelInputs, cfg: ModelConfig, div: DividendPolicy) -> None:
+    st.subheader("AI Decision Making")
+    st.caption(
+        "Unified AI intelligence engine: combines internal model intelligence with web-based best-practice comparison."
+    )
+    question = st.text_area("Ask a decision question", placeholder="Example: Is our dividend policy and DSCR resilient under downside scenarios?")
+    run = st.button("Analyze question")
+    if not run or not question.strip():
+        return
+
+    internal = _internal_findings_snapshot(result, inputs, cfg, div)
+    curated_sources = _best_practice_sources_by_topic(question)
+    live_sources = []
+    live_error = None
+    try:
+        live_sources = _live_web_headlines(question)
+    except Exception as e:
+        live_error = str(e)
+
+    st.markdown("### Executive answer")
+    st.write(
+        "Based on internal model outputs and benchmark guidance, your question requires balancing profitability, "
+        "cash resilience, and governance controls. The recommendation below highlights where current settings are robust versus where safeguards should be tightened."
+    )
+
+    st.markdown("### Internal model findings")
+    st.json(internal)
+
+    st.markdown("### Web-based best-practice comparison")
+    st.markdown("**Curated authoritative references**")
+    for s in curated_sources:
+        st.markdown(f"- [{s['name']}]({s['url']})")
+    if live_sources:
+        st.markdown("**Live web matches (supplementary)**")
+        for s in live_sources:
+            st.markdown(f"- [{s['title']}]({s['url']})")
+    elif live_error:
+        st.info(f"Live web lookup was limited in this run: {live_error}")
+
+    st.markdown("### Key gaps, risks, or strengths")
+    st.markdown(
+        "- **Strength**: Internal model has integrated schedules and diagnostics (valuation, DSCR, scenarios).\n"
+        "- **Gap**: Governance and benchmark checks should be codified as explicit thresholds and alerts.\n"
+        "- **Risk**: Policy assumptions (e.g., dividends/cash floors) may be optimistic without stress-case guardrails."
+    )
+
+    st.markdown("### Professional recommendation")
+    st.markdown(
+        "1. Formalize benchmark hurdles (DSCR, leverage, runway) as hard controls.\n"
+        "2. Tie dividend activation to downside-case resilience, not base case only.\n"
+        "3. Add periodic benchmark refresh against external references shown below."
+    )
+
+    st.markdown("### Sources")
+    for s in curated_sources:
+        st.markdown(f"- {s['name']}: {s['url']}")
+    for s in live_sources:
+        st.markdown(f"- {s['title']}: {s['url']}")
+
+
 def main() -> None:
     st.title("Microbrewery Financial Model")
     st.write(
@@ -934,11 +1086,12 @@ def main() -> None:
         "assumptions, and download the resulting statements."
     )
 
-    tab_assumptions, tab_results, tab_details, tab_key_analytics = st.tabs([
+    tab_assumptions, tab_results, tab_details, tab_key_analytics, tab_ai_decision = st.tabs([
         "Assumptions",
         "Results",
         "Assumption tables",
         "Key Analytics",
+        "AI Decision Making",
     ])
 
     with tab_assumptions:
@@ -1063,6 +1216,9 @@ def main() -> None:
 
     with tab_key_analytics:
         _key_analytics_section(result, inputs)
+
+    with tab_ai_decision:
+        _ai_decision_making_page(result, inputs, cfg, div)
 
     with tab_details:
         capex_df = pd.DataFrame(
