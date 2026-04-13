@@ -444,6 +444,7 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
         ]
     )
     st.dataframe(sens_df)
+    st.bar_chart(sens_df.set_index("case")[["revenue", "ebitda"]])
 
     # Monte Carlo simulation
     st.markdown("### Monte Carlo simulation")
@@ -471,6 +472,15 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
     what_if_direct = base_direct * (1 + what_if_cost / 100.0)
     what_if_ebitda = what_if_revenue - what_if_direct - float(annual["opex"].iloc[0])
     st.write({"revenue": what_if_revenue, "direct_costs": what_if_direct, "ebitda": what_if_ebitda})
+    st.bar_chart(
+        pd.DataFrame(
+            {
+                "base": [base_revenue, base_direct, base_ebitda],
+                "what_if": [what_if_revenue, what_if_direct, what_if_ebitda],
+            },
+            index=["revenue", "direct_costs", "ebitda"],
+        )
+    )
 
     # Break-even analysis by product
     st.markdown("### Break-even analysis by product")
@@ -489,6 +499,8 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
             {"sku_id": sid, "name": sku["name"], "unit_margin": unit_margin, "break_even_units": fixed_pool / unit_margin}
         )
     st.dataframe(pd.DataFrame(be_rows))
+    be_df = pd.DataFrame(be_rows).set_index("name")
+    st.bar_chart(be_df[["break_even_units"]])
 
     # Scenario planning
     st.markdown("### Scenario planning")
@@ -500,6 +512,7 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
         ]
     )
     st.dataframe(scen_df)
+    st.line_chart(scen_df.set_index("scenario")[["revenue", "ebitda"]])
 
     # Goal seek
     st.markdown("### Goal seek")
@@ -507,6 +520,12 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
     margin_rate = max((base_ebitda / base_revenue) if base_revenue else 0.0, 1e-6)
     required_revenue = target_ebitda / margin_rate
     st.write({"required_revenue": required_revenue, "implied_revenue_uplift_pct": (required_revenue / base_revenue - 1) * 100 if base_revenue else 0.0})
+    st.bar_chart(
+        pd.DataFrame(
+            {"value": [base_revenue, required_revenue]},
+            index=["current_revenue", "required_revenue"],
+        )
+    )
 
     # Debt service coverage ratio
     st.markdown("### Debt service coverage ratio")
@@ -524,7 +543,9 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
         x = np.arange(len(y))
         coeff = np.polyfit(x, y, 1)
         pred = coeff[0] * (x + 1) + coeff[1]
-        st.dataframe(pd.DataFrame({"actual_revenue": y, "next_step_prediction": pred}, index=annual.index))
+        pred_df = pd.DataFrame({"actual_revenue": y, "next_step_prediction": pred}, index=annual.index)
+        st.dataframe(pred_df)
+        st.line_chart(pred_df)
     else:
         st.info("Need at least 3 annual revenue points for trend-based prediction.")
 
@@ -533,6 +554,9 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
     val = result.valuation
     keys = ["enterprise_value", "equity_value", "investor_irr_annual", "investor_moic"]
     st.write({k: val.get(k, None) for k in keys})
+    diag_vals = {k: val.get(k, np.nan) for k in keys if isinstance(val.get(k, np.nan), (int, float))}
+    if diag_vals:
+        st.bar_chart(pd.DataFrame({"value": diag_vals}))
 
     # Coverage & resilience
     st.markdown("### Coverage & resilience")
@@ -546,6 +570,8 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
             monthly["cash"].iloc[-1] / max(monthly["opex"].iloc[-1], 1e-6)
         )
     st.write(cov if cov else {"note": "Coverage metrics require cash/debt/opex monthly columns."})
+    if cov:
+        st.bar_chart(pd.DataFrame({"value": cov}))
 
 
 def main() -> None:
