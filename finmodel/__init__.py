@@ -7,6 +7,8 @@ from .scenarios import Scenario, ScenarioEngine, ForecastScenarioBridge, Scenari
 from .forecast import ForecastEngine
 from .monte_carlo import MonteCarloEngine
 from .analytics import MultiplesModel, AnalyticsEngine
+from .core import MicrobreweryFinancialModel
+from .default_model import build_default_model
 from .microbrewery_dataclasses import (
     PackagingSize,
     ExpansionEvent,
@@ -50,6 +52,8 @@ __all__ = [
     "MonteCarloEngine",
     "MultiplesModel",
     "AnalyticsEngine",
+    "MicrobreweryFinancialModel",
+    "build_default_model",
     "PackagingSize",
     "ExpansionEvent",
     "GeneralSettings",
