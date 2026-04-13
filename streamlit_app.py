@@ -646,46 +646,54 @@ def main() -> None:
     with tab_assumptions:
         st.subheader("Core assumptions")
         c1, c2 = st.columns(2)
-        months = c1.selectbox(
-            "Months in projection",
-            options=[36, 48, 60, 72, 84, 96, 108, 120, 132, 144, 156, 168, 180],
-            index=7,
+        start_year = c1.selectbox(
+            "Start year",
+            options=list(range(2025, 2036)),
+            index=0,
         )
-        wacc = c2.selectbox(
+        end_year = c2.selectbox(
+            "End year",
+            options=list(range(int(start_year), 2041)),
+            index=min(9, len(list(range(int(start_year), 2041))) - 1),
+        )
+        years = int(end_year) - int(start_year) + 1
+        months = years * 12
+        st.caption(f"Projection length: {years} years ({months} months)")
+
+        c3, c4 = st.columns(2)
+        wacc = c3.selectbox(
             "WACC (annual)",
             options=[round(x, 3) for x in np.arange(0.050, 0.205, 0.005)],
             index=14,
             format_func=lambda x: f"{x:.3f}",
         )
-
-        c3, c4 = st.columns(2)
-        exit_multiple = c3.selectbox(
+        exit_multiple = c4.selectbox(
             "Exit EV/EBITDA multiple",
             options=[round(x, 1) for x in np.arange(4.0, 12.5, 0.5)],
             index=8,
             format_func=lambda x: f"{x:.1f}x",
         )
-        price_inflation = c4.selectbox(
+        c5, c6 = st.columns(2)
+        price_inflation = c5.selectbox(
             "Price inflation (annual)",
             options=[round(x, 4) for x in np.arange(0.0, 0.0501, 0.0025)],
             index=6,
             format_func=lambda x: f"{x:.2%}",
         )
-
-        c5, c6 = st.columns(2)
-        cost_inflation = c5.selectbox(
+        cost_inflation = c6.selectbox(
             "Cost inflation (annual)",
             options=[round(x, 4) for x in np.arange(0.0, 0.0501, 0.0025)],
             index=6,
             format_func=lambda x: f"{x:.2%}",
         )
-        dividend_start = c6.selectbox(
+
+        c7, c8 = st.columns(2)
+        dividend_start = c7.selectbox(
             "Dividend start month",
             options=list(range(0, int(months))),
             index=min(60, int(months) - 1),
         )
-
-        min_cash = st.selectbox(
+        min_cash = c8.selectbox(
             "Minimum cash for sweep",
             options=[0.0, 250_000.0, 500_000.0, 1_000_000.0, 1_500_000.0, 2_000_000.0, 2_500_000.0, 3_000_000.0],
             index=4,
@@ -693,7 +701,7 @@ def main() -> None:
         )
 
     cfg = ModelConfig(
-        start_date="2025-01-01",
+        start_date=f"{int(start_year)}-01-01",
         months=months,
         pricing_cost_basis_month=24,
         price_inflation_annual=price_inflation,
