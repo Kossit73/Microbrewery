@@ -51,6 +51,13 @@ def _build_sample_assumptions(
                 "markup_pct": 0.60,
                 "relative_opex_weight": 1.1,
             },
+            {
+                "sku_id": 3,
+                "name": "Hazy IPA 440ml",
+                "direct_cost_per_unit": 2.85,
+                "markup_pct": 0.72,
+                "relative_opex_weight": 1.25,
+            },
         ]
     )
 
@@ -60,6 +67,7 @@ def _build_sample_assumptions(
             {"channel": "Retail", "price_factor": 2.00},
             {"channel": "E-Commerce", "price_factor": 1.75},
             {"channel": "On-Premise", "price_factor": 1.00},
+            {"channel": "Export", "price_factor": 1.55},
         ]
     )
 
@@ -69,11 +77,14 @@ def _build_sample_assumptions(
     u_sku2 = phase_growth_series(
         idx, start_month=3, start_units=6_000, monthly_growth=0.04, stop_month=None, cap_units=20_000
     )
+    u_sku3 = phase_growth_series(
+        idx, start_month=6, start_units=3_000, monthly_growth=0.05, stop_month=None, cap_units=18_000
+    )
 
-    channel_mix = {"Wholesale": 0.45, "Retail": 0.35, "E-Commerce": 0.15, "On-Premise": 0.05}
+    channel_mix = {"Wholesale": 0.40, "Retail": 0.30, "E-Commerce": 0.15, "On-Premise": 0.10, "Export": 0.05}
     rows = []
     for date in idx:
-        for sku_id, series in [(1, u_sku1), (2, u_sku2)]:
+        for sku_id, series in [(1, u_sku1), (2, u_sku2), (3, u_sku3)]:
             total_units = float(series.loc[date])
             for channel, share in channel_mix.items():
                 rows.append({"date": date, "sku_id": sku_id, "channel": channel, "units": total_units * share})
@@ -82,12 +93,14 @@ def _build_sample_assumptions(
     opex_fixed_monthly = 110_000.0
     other_income_monthly = pd.Series(0.0, index=idx)
     other_income_monthly.iloc[12:] = 15_000.0
+    other_income_monthly.iloc[48:] = 22_500.0
 
     capex_items = [
         CapexItem(name="Land (non-depreciable)", amount=875_000, capex_month=0, depreciation_years=0),
         CapexItem(name="Building", amount=1_750_000, capex_month=0, depreciation_years=25),
         CapexItem(name="Brewhouse equipment", amount=1_250_000, capex_month=1, depreciation_years=10),
         CapexItem(name="Expansion equipment", amount=900_000, capex_month=60, depreciation_years=10),
+        CapexItem(name="Packaging line upgrade", amount=650_000, capex_month=36, depreciation_years=8),
     ]
 
     debt_facilities = [
@@ -118,9 +131,18 @@ def _build_sample_assumptions(
             term_months=36,
             repayment_type="linear",
         ),
+        DebtFacility(
+            name="Working Capital Revolver",
+            principal=300_000,
+            annual_interest_rate=0.045,
+            draw_month=24,
+            grace_months=0,
+            term_months=48,
+            repayment_type="interest_only_then_linear",
+        ),
     ]
 
-    equity_injections = {0: 5_500_000.0, 12: 1_000_000.0}
+    equity_injections = {0: 5_500_000.0, 12: 1_000_000.0, 36: 750_000.0}
 
     return ModelInputs(
         skus=skus,
