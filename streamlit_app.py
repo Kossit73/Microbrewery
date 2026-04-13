@@ -759,13 +759,16 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
         draws = np.random.normal(loc=base_ebitda, scale=base_ebitda * sigma_pct, size=sims)
         mc_df = pd.DataFrame({"ebitda_sim": draws})
         st.line_chart(mc_df.sort_values("ebitda_sim").reset_index(drop=True))
-        st.write(
-            {
-                "mean": float(mc_df["ebitda_sim"].mean()),
-                "p05": float(mc_df["ebitda_sim"].quantile(0.05)),
-                "p50": float(mc_df["ebitda_sim"].quantile(0.50)),
-                "p95": float(mc_df["ebitda_sim"].quantile(0.95)),
-            }
+        mc_mean = float(mc_df["ebitda_sim"].mean())
+        mc_p05 = float(mc_df["ebitda_sim"].quantile(0.05))
+        mc_p50 = float(mc_df["ebitda_sim"].quantile(0.50))
+        mc_p95 = float(mc_df["ebitda_sim"].quantile(0.95))
+        st.markdown(
+            (
+                f"Based on **{sims:,}** simulations, average EBITDA is **{mc_mean:,.2f}**. "
+                f"The distribution ranges from **{mc_p05:,.2f}** at the 5th percentile "
+                f"to **{mc_p95:,.2f}** at the 95th percentile, with a median of **{mc_p50:,.2f}**."
+            )
         )
 
     # What-ifs analysis
@@ -843,7 +846,14 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
     target_ebitda = float(pd.to_numeric(goal_df.iloc[0].get("target_ebitda", max(base_ebitda, 1.0)), errors="coerce")) if not goal_df.empty else max(base_ebitda, 1.0)
     margin_rate = max((base_ebitda / base_revenue) if base_revenue else 0.0, 1e-6)
     required_revenue = target_ebitda / margin_rate
-    st.write({"required_revenue": required_revenue, "implied_revenue_uplift_pct": (required_revenue / base_revenue - 1) * 100 if base_revenue else 0.0})
+    implied_uplift = (required_revenue / base_revenue - 1) * 100 if base_revenue else 0.0
+    st.markdown(
+        (
+            f"To reach a target EBITDA of **{target_ebitda:,.2f}**, the model implies required revenue "
+            f"of **{required_revenue:,.2f}**, which is an uplift of **{implied_uplift:,.2f}%** "
+            "versus the current base revenue."
+        )
+    )
     st.bar_chart(
         pd.DataFrame(
             {"value": [base_revenue, required_revenue]},
@@ -900,7 +910,15 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
     target_irr = float(pd.to_numeric(ret_cfg.iloc[0].get("target_irr_pct", 20.0), errors="coerce")) / 100.0 if not ret_cfg.empty else 0.2
     val = result.valuation
     keys = ["enterprise_value", "equity_value", "investor_irr_annual", "investor_moic"]
-    st.write({k: val.get(k, None) for k in keys})
+    st.markdown(
+        (
+            f"Valuation diagnostics show enterprise value of **{float(val.get('enterprise_value', 0.0)):,.2f}** "
+            f"and equity value of **{float(val.get('equity_value', 0.0)):,.2f}**. "
+            f"Investor annual IRR is **{float(val.get('investor_irr_annual', 0.0)):.2%}** "
+            f"against a target IRR of **{target_irr:.2%}**, and investor MOIC is "
+            f"**{float(val.get('investor_moic', 0.0)):.2f}x**."
+        )
+    )
     diag_vals = {k: val.get(k, np.nan) for k in keys if isinstance(val.get(k, np.nan), (int, float))}
     if diag_vals:
         st.bar_chart(pd.DataFrame({"value": diag_vals}))
@@ -924,10 +942,24 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
         cov["months_of_opex_covered_last_month"] = float(
             monthly["cash"].iloc[-1] / max(monthly["opex"].iloc[-1], 1e-6)
         )
-    st.write(cov if cov else {"note": "Coverage metrics require cash/debt/opex monthly columns."})
+    if cov:
+        cov_parts = []
+        if "cash_to_debt_ratio_last_month" in cov:
+            cov_parts.append(
+                f"cash-to-debt ratio is **{cov['cash_to_debt_ratio_last_month']:.2f}x** "
+                f"(threshold **{min_cash_to_debt:.2f}x**)"
+            )
+        if "months_of_opex_covered_last_month" in cov:
+            cov_parts.append(
+                f"cash coverage equals **{cov['months_of_opex_covered_last_month']:.2f}** months of opex "
+                f"(threshold **{min_months_opex:.2f}** months)"
+            )
+        st.markdown("Latest resilience view: " + " and ".join(cov_parts) + ".")
+        st.markdown(f"Reference target IRR for this diagnostic set is **{target_irr:.2%}**.")
+    else:
+        st.info("Coverage metrics require cash, debt, and opex monthly columns.")
     if cov:
         st.bar_chart(pd.DataFrame({"value": cov}))
-        st.write({"min_cash_to_debt_threshold": min_cash_to_debt, "min_months_opex_threshold": min_months_opex, "target_irr": target_irr})
 
 
 def _internal_findings_snapshot(result, inputs: ModelInputs, cfg: ModelConfig, div: DividendPolicy) -> dict:
