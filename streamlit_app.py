@@ -265,18 +265,21 @@ def _assumption_editor(title: str, key: str, df: pd.DataFrame) -> pd.DataFrame:
                         key=f"field_{key}_{selected_row}_{col}",
                     )
 
-            b1, b2, b3, b4 = st.columns(4)
-            if b1.button("Apply row changes", key=f"btn_apply_row_{key}"):
+            if st.button("Apply row changes", key=f"btn_apply_row_{key}"):
                 for col, val in updated_row.items():
                     st.session_state[work_key].loc[selected_row, col] = val
-            if b2.button("Save changes", key=f"btn_save_{key}"):
-                st.session_state[saved_key] = st.session_state[work_key].copy()
-                st.session_state[data_key] = st.session_state[saved_key].copy()
-            if b3.button("Discard edits", key=f"btn_discard_{key}"):
-                st.session_state[work_key] = st.session_state[saved_key].copy()
-            if b4.button("Close editor", key=f"btn_close_{key}"):
-                st.session_state[edit_key] = False
-                st.session_state[data_key] = st.session_state[saved_key].copy()
+        else:
+            st.info("No rows available. Use 'Add row' to create one.")
+
+        b2, b3, b4 = st.columns(3)
+        if b2.button("Save changes", key=f"btn_save_{key}"):
+            st.session_state[saved_key] = st.session_state[work_key].copy()
+            st.session_state[data_key] = st.session_state[saved_key].copy()
+        if b3.button("Discard edits", key=f"btn_discard_{key}"):
+            st.session_state[work_key] = st.session_state[saved_key].copy()
+        if b4.button("Close editor", key=f"btn_close_{key}"):
+            st.session_state[edit_key] = False
+            st.session_state[data_key] = st.session_state[saved_key].copy()
 
         st.dataframe(st.session_state[work_key], use_container_width=True)
     else:
