@@ -446,11 +446,12 @@ def _sales_plan_editor_view_to_base(view_df: pd.DataFrame, frequency: str) -> pd
     if view_df is None or view_df.empty:
         return pd.DataFrame(columns=["date", "sku_id", "channel", "units"])
     out = view_df.copy()
+    safe_col = lambda name, default="": out[name] if name in out.columns else pd.Series([default] * len(out), index=out.index)
     if frequency == "monthly":
-        out["date"] = pd.to_datetime(out.get("month"), errors="coerce").dt.to_period("M").dt.start_time
+        out["date"] = pd.to_datetime(safe_col("month"), errors="coerce").dt.to_period("M").dt.start_time
         out = out.drop(columns=["month"], errors="ignore")
     elif frequency == "quarterly":
-        quarter_raw = out.get("quarter").astype(str).str.upper().str.replace(" ", "", regex=False).str.replace("-Q", "Q", regex=False)
+        quarter_raw = safe_col("quarter").astype(str).str.upper().str.replace(" ", "", regex=False).str.replace("-Q", "Q", regex=False)
         extracted = quarter_raw.str.extract(r"(?P<year>\d{4})Q(?P<q>[1-4])")
         year = pd.to_numeric(extracted["year"], errors="coerce")
         q = pd.to_numeric(extracted["q"], errors="coerce")
@@ -461,8 +462,8 @@ def _sales_plan_editor_view_to_base(view_df: pd.DataFrame, frequency: str) -> pd
         )
         out = out.drop(columns=["quarter"], errors="ignore")
     else:
-        year_numeric = pd.to_numeric(out.get("year"), errors="coerce").fillna(0).astype(int)
-        out["date"] = pd.to_datetime(year_numeric.astype(str) + "-01-01", errors="coerce")
+        year_numeric = pd.to_numeric(safe_col("year"), errors="coerce")
+        out["date"] = pd.to_datetime(year_numeric.astype("Int64").astype(str) + "-01-01", errors="coerce")
         out = out.drop(columns=["year"], errors="ignore")
     out["units"] = pd.to_numeric(out.get("units", 0.0), errors="coerce")
     return out[["date", "sku_id", "channel", "units"]]
