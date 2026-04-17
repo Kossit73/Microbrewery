@@ -94,6 +94,43 @@ Use the horizontal tab bar to adjust key assumptions (WACC, exit multiple, infla
 
 This repository now includes the `finmodel` package that implements a modular valuation toolkit (DCF/rNPV, scenarios, forecasts, Monte Carlo, and ML multiples). See `docs/ARCHITECTURE.md` for class-level details.
 
+## Driver-based OPEX allocation (new)
+
+Flat OPEX-per-SKU rates are convenient but usually not investor-grade because they hide the operational drivers of cost (volume, complexity, channel mix, and scale steps). The package now supports driver-based OPEX pools that allocate to SKUs by year and reconcile back to total OPEX.
+
+### Why this is better than flat OPEX-per-SKU
+- Captures scale behavior (fixed, variable, step-fixed pools).
+- Supports targeted scope (family/channel/SKU-specific pools).
+- Produces traceable per-SKU unit costs (`opex_per_unit`, `opex_per_liter`) and pool breakdowns.
+- Reconciles allocations to total OPEX by year for auditability.
+
+### Core API
+```python
+from finmodel import build_default_model
+
+model = build_default_model()
+contexts = model.opex_contexts_by_sku_and_year()
+allocation_report = model.allocate_opex()
+metrics = model.opex_metrics_by_sku_and_year()
+recon = model.reconcile_opex_allocation()
+```
+
+### Cost pools and driver mappings
+Default pools include: Indirect Labor, Utilities, Supplies, Marketing & Advertising, Events & Promotion, Insurance, Permits & License, Local Fees, Transport, Administrative Expense, Quality Control, Certificates, Professional Services, Other Expense, and Contingencies.
+
+You can map pools to drivers such as:
+- `LITERS`, `UNITS`, `REVENUE`
+- `CHANNEL_REVENUE`, `CHANNEL_UNITS`
+- `FIXED_EQUAL`, `ACTIVE_SKU`, `COMPLEXITY`
+- `STEP_CAPACITY`, `EXPLICIT_WEIGHT`
+
+Blended rules are supported (for example 70% liters / 20% units / 10% complexity).
+
+### Customizing pools
+1. Build or edit `OpexCostPool` entries (driver, scope, classification, annual amounts).
+2. Add optional blended `OpexAllocationRule` weights.
+3. Pass custom pools to `model.allocate_opex(pools=...)`.
+
 ## Making the brewery model more detailed
 
 For a prioritized checklist of granular features to add (e.g., seasonality, SKU-level BOMs, payroll plans, covenants, and sensitivity dashboards), see `docs/MODEL_ENHANCEMENTS.md`. Start with the **Critical missing schedules and assumptions** section to surface the biggest gaps.

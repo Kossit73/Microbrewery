@@ -6,6 +6,9 @@ from typing import Dict, List, Optional, Tuple
 
 from .constants import DAYS_PER_YEAR, FORECAST_YEARS, WORKSHEETS, YEAR_LABELS
 from .data.pdf_pages import RAW_PDF_PAGES
+from .allocation import DEFAULT_CHANNEL_WEIGHTS, allocate_opex_by_drivers
+from .opex_defaults import build_default_opex_cost_pools
+from .opex_schemas import OpexAllocationReport, OpexCostPool, SKUCostContext
 from .schemas import (
     CapexItem,
     DebtFacility,
@@ -51,6 +54,7 @@ class MicrobreweryFinancialModel:
         property_value_without_inflation: float = 1_500_000.0,
         dividend_payout_ratio: float = 0.25,
         dividend_start_year: int = 5,
+        opex_cost_pools: Optional[List[OpexCostPool]] = None,
     ):
         self.general = general
         self.packaging_sizes = packaging_sizes
@@ -73,6 +77,7 @@ class MicrobreweryFinancialModel:
         self.property_value_without_inflation = property_value_without_inflation
         self.dividend_payout_ratio = dividend_payout_ratio
         self.dividend_start_year = dividend_start_year
+        self.opex_cost_pools = opex_cost_pools
         self.raw_pdf_pages = RAW_PDF_PAGES
 
     @staticmethod
@@ -346,6 +351,79 @@ class MicrobreweryFinancialModel:
                 "results": self.results_snapshot(),
             }
         )
+
+    def _build_default_channel_mix(self) -> Dict[str, float]:
+        return DEFAULT_CHANNEL_WEIGHTS.copy()
+
+    def opex_contexts_by_sku_and_year(self) -> List[SKUCostContext]:
+        channel_mix = self._build_default_channel_mix()
+        revenue_by_sku = self.revenue_by_sku_and_year()
+        contexts: List[SKUCostContext] = []
+        for sku in self.skus:
+            if not sku.include:
+                active = False
+            else:
+                active = any(float(sku.annual_units.get(year, 0.0)) > 0.0 for year in self.forecast_years())
+            units_by_year = {year: float(sku.annual_units.get(year, 0.0)) for year in self.forecast_years()}
+            liters_by_year = {year: units_by_year[year] * float(sku.liters_per_sku) for year in self.forecast_years()}
+            rev_by_year = revenue_by_sku.get(sku.name, {year: 0.0 for year in self.forecast_years()})
+            rev_by_channel = {
+                year: {ch: rev_by_year.get(year, 0.0) * wt for ch, wt in channel_mix.items()}
+                for year in self.forecast_years()
+            }
+            units_by_channel = {
+                year: {ch: units_by_year.get(year, 0.0) * wt for ch, wt in channel_mix.items()}
+                for year in self.forecast_years()
+            }
+            complexity = 1.0 + (0.1 if sku.packaging_size == "Keg" else 0.0) + (0.05 if "Can" in sku.name else 0.0)
+            contexts.append(
+                SKUCostContext(
+                    sku_id=sku.sku_id,
+                    sku_name=sku.name,
+                    product_family=sku.product_type,
+                    package_type=sku.packaging_size,
+                    package_size=sku.volume_unit,
+                    active=active,
+                    units_sold_by_year=units_by_year,
+                    liters_sold_by_year=liters_by_year,
+                    revenue_by_year={k: float(v) for k, v in rev_by_year.items()},
+                    revenue_by_channel_by_year=rev_by_channel,
+                    units_by_channel_by_year=units_by_channel,
+                    complexity_score=complexity,
+                    batch_count_by_year={year: liters_by_year[year] / 500.0 for year in self.forecast_years()},
+                    order_count_by_year={year: units_by_year[year] / 1000.0 for year in self.forecast_years()},
+                    shipment_count_by_year={year: units_by_year[year] / 1200.0 for year in self.forecast_years()},
+                )
+            )
+        return contexts
+
+    def allocate_opex(self, pools: Optional[List[OpexCostPool]] = None) -> OpexAllocationReport:
+        opex = self.opex_by_year()
+        selected_pools = pools or self.opex_cost_pools or build_default_opex_cost_pools(opex)
+        self.opex_cost_pools = selected_pools
+        return allocate_opex_by_drivers(self.forecast_years(), self.opex_contexts_by_sku_and_year(), selected_pools)
+
+    def opex_metrics_by_sku_and_year(self) -> Dict[int, Dict[str, Dict[str, float]]]:
+        report = self.allocate_opex()
+        out: Dict[int, Dict[str, Dict[str, float]]] = {}
+        for row in report.allocations:
+            out.setdefault(row.sku_id, {})[row.year] = {
+                "total_allocated_opex": row.total_allocated_opex,
+                "opex_per_unit": row.opex_per_unit,
+                "opex_per_liter": row.opex_per_liter,
+            }
+        return out
+
+    def reconcile_opex_allocation(self) -> Dict[str, Dict[str, float]]:
+        report = self.allocate_opex()
+        return {
+            s.year: {
+                "total_pool_opex": s.total_pool_opex,
+                "total_allocated_opex": s.total_allocated_opex,
+                "reconciliation_gap": s.reconciliation_gap,
+            }
+            for s in report.summaries
+        }
 
     def preserved_source(self) -> Dict[str, object]:
         return {"worksheets": WORKSHEETS, "raw_pdf_pages": RAW_PDF_PAGES}
