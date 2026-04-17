@@ -133,6 +133,8 @@ You can map pools to drivers such as:
 - `STEP_CAPACITY`, `EXPLICIT_WEIGHT`
 - `BATCH_COUNT`, `ORDER_COUNT`, `SHIPMENT_COUNT`
 
+`CostPoolInput` supports both `cost_type="direct"` and `cost_type="indirect"` so the same pool framework can model direct unit economics and indirect overheads.
+
 Blended rules are supported (for example 70% liters / 20% units / 10% complexity).
 
 ### Customizing pools

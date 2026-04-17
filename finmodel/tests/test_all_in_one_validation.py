@@ -30,7 +30,10 @@ def test_all_in_one_coerces_numeric_sku_and_channel_inputs():
             skus=skus,
             channels=channels,
             sales_plan=sales,
-            cost_pools=[CostPoolInput(name="Admin", fixed_monthly_cost=1000.0, behavior="fixed", allocation_driver="units")],
+            cost_pools=[
+                CostPoolInput(name="Malt", cost_type="direct", behavior="variable", allocation_driver="units", unit_variable_cost=0.5),
+                CostPoolInput(name="Admin", cost_type="indirect", fixed_monthly_cost=1000.0, behavior="fixed", allocation_driver="units"),
+            ],
         ),
     )
 
@@ -41,3 +44,4 @@ def test_all_in_one_coerces_numeric_sku_and_channel_inputs():
     assert "driver_view" in result.opex_allocation_views
     assert "product_view" in result.opex_allocation_views
     assert "reconciliation_view" in result.opex_allocation_views
+    assert float(result.monthly["direct_costs"].sum()) > 0.0

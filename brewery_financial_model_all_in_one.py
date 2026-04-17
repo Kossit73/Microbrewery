@@ -396,13 +396,14 @@ class MicrobreweryFinancialModel:
             return totals
         return pd.Series(0.0, index=idx)
 
-    def _indirect_cost_pool_monthly(
+    def _cost_pool_monthly_by_type(
         self,
         idx: pd.DatetimeIndex,
         units_wide: pd.DataFrame,
         revenue_wide: pd.DataFrame,
+        cost_type: Literal["direct", "indirect"],
     ) -> pd.DataFrame:
-        pools = [p for p in (self.inputs.cost_pools or []) if p.cost_type == "indirect"]
+        pools = [p for p in (self.inputs.cost_pools or []) if p.cost_type == cost_type]
         data: Dict[str, pd.Series] = {}
         for pool in pools:
             driver = self._pool_driver_series(idx, units_wide, revenue_wide, pool)
@@ -420,6 +421,12 @@ class MicrobreweryFinancialModel:
                 total = fixed_component + variable_component + (steps * float(pool.step_increment))
             data[pool.name] = total.astype(float)
         return pd.DataFrame(data, index=idx)
+
+    def _indirect_cost_pool_monthly(self, idx: pd.DatetimeIndex, units_wide: pd.DataFrame, revenue_wide: pd.DataFrame) -> pd.DataFrame:
+        return self._cost_pool_monthly_by_type(idx, units_wide, revenue_wide, "indirect")
+
+    def _direct_cost_pool_monthly(self, idx: pd.DatetimeIndex, units_wide: pd.DataFrame, revenue_wide: pd.DataFrame) -> pd.DataFrame:
+        return self._cost_pool_monthly_by_type(idx, units_wide, revenue_wide, "direct")
 
     # ---------- pricing ----------
     @staticmethod
@@ -838,6 +845,11 @@ class MicrobreweryFinancialModel:
             direct_costs_wide = units_wide.mul(costs_wide, fill_value=0.0)
             direct_costs = direct_costs_wide.sum(axis=1).rename("direct_costs")
 
+        # Add direct cost pools (unit/fixed/step/blended) on top of SKU base direct costs.
+        direct_pool_monthly = self._direct_cost_pool_monthly(idx, units_wide, revenue_wide)
+        if not direct_pool_monthly.empty:
+            direct_costs = (direct_costs + (direct_pool_monthly.sum(axis=1) * cost_idx)).rename("direct_costs")
+
         gross_profit = (revenue - direct_costs).rename("gross_profit")
 
         # Indirect operating costs from explicit cost pools (no lump-sum monthly OPEX input).
@@ -1101,6 +1113,11 @@ def main() -> None:
     # Cost pools and other income (monthly)
     # ----------------------------
     cost_pools = [
+        CostPoolInput(name="Malt & Grain", cost_type="direct", behavior="variable", allocation_driver="liters", unit_variable_cost=0.22),
+        CostPoolInput(name="Hops & Yeast", cost_type="direct", behavior="variable", allocation_driver="liters", unit_variable_cost=0.09),
+        CostPoolInput(name="Packaging Materials", cost_type="direct", behavior="variable", allocation_driver="units", unit_variable_cost=0.14),
+        CostPoolInput(name="Production Direct Labor", cost_type="direct", behavior="step_fixed", allocation_driver="liters", fixed_monthly_cost=6_000.0, step_threshold=180_000.0, step_increment=850.0),
+        CostPoolInput(name="Brew QA Consumables", cost_type="direct", behavior="variable", allocation_driver="liters", unit_variable_cost=0.015),
         CostPoolInput(name="Indirect Labor", cost_type="indirect", behavior="step_fixed", allocation_driver="liters", fixed_monthly_cost=22_000.0, step_threshold=250_000.0, step_increment=2_000.0),
         CostPoolInput(name="Utilities", cost_type="indirect", behavior="variable", allocation_driver="liters", unit_variable_cost=0.035),
         CostPoolInput(name="Supplies", cost_type="indirect", behavior="variable", allocation_driver="units", unit_variable_cost=0.015),
