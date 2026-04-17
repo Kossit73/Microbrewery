@@ -354,7 +354,7 @@ class MicrobreweryFinancialModel:
             portion = float(r["units"]) / len(months)
             for m in months:
                 rows.append({"date": m, "sku_id": r["sku_id"], "channel": r["channel"], "units": portion})
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows, columns=["date", "sku_id", "channel", "units"])
 
     def _units_matrix(self, idx: pd.DatetimeIndex) -> pd.DataFrame:
         """

@@ -182,3 +182,34 @@ def test_all_in_one_handles_empty_sales_plan_without_alignment_error():
 
     result = model.run()
     assert result.monthly["revenue"].tolist() == [0.0, 0.0]
+
+
+def test_all_in_one_handles_out_of_horizon_quarterly_sales_without_keyerror():
+    skus = pd.DataFrame(
+        [
+            {
+                "sku_id": 1,
+                "name": "Test SKU",
+                "direct_cost_per_unit": 2.10,
+                "markup_pct": 0.65,
+                "relative_opex_weight": 1.0,
+            }
+        ]
+    )
+    channels = pd.DataFrame([{"channel": "Retail", "price_factor": 1.0}])
+    # Deliberately outside model horizon (model starts in 2025).
+    sales = pd.DataFrame([{"date": "2030-01-01", "sku_id": 1, "channel": "Retail", "units": 1200.0}])
+
+    model = MicrobreweryFinancialModel(
+        ModelConfig(start_date="2025-01-01", months=12, pricing_cost_basis_month=0),
+        DividendPolicy(enabled=False),
+        ModelInputs(
+            skus=skus,
+            channels=channels,
+            sales_plan=sales,
+            sales_plan_frequency="quarterly",
+        ),
+    )
+
+    result = model.run()
+    assert result.monthly["revenue"].sum() == 0.0
