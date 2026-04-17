@@ -27,12 +27,12 @@ from brewery_financial_model_all_in_one import (
     CapexItem,
     DebtFacility,
     DividendPolicy,
+    ModelRunResult,
     MicrobreweryFinancialModel,
     ModelConfig,
     ModelInputs,
     phase_growth_series,
 )
-from finmodel.defaults import build_default_model as build_finmodel_default_model
 
 
 MODEL_CHANGE_SUMMARY_PATH = Path(__file__).resolve().parent / "docs" / "MODEL_CHANGE_SUMMARY.md"
@@ -57,7 +57,7 @@ def _about_methodology_panel() -> None:
     st.markdown(_load_model_change_summary())
 
 
-def _driver_based_opex_views_section(price_inflation_annual: float, cost_inflation_annual: float) -> None:
+def _driver_based_opex_views_section(result: ModelRunResult) -> None:
     """
     Display the three OPEX output views from the driver-based allocation engine:
       A) OPEX by pool
@@ -69,34 +69,28 @@ def _driver_based_opex_views_section(price_inflation_annual: float, cost_inflati
         "This section renders the new pool-driven OPEX engine outputs (management, model-control, and pricing views)."
     )
 
-    fm_model = build_finmodel_default_model()
-    fm_model.general.price_inflation = float(price_inflation_annual)
-    fm_model.general.cost_inflation = float(cost_inflation_annual)
-
-    pool_view = fm_model.opex_by_pool_view()
-    driver_view = fm_model.opex_by_driver_type_view()
-    product_view = fm_model.opex_by_product_view()
-    reconciliation = fm_model.reconcile_opex_allocation()
+    views = result.opex_allocation_views
+    pool_view = views.get("pool_view", pd.DataFrame())
+    driver_view = views.get("driver_view", pd.DataFrame())
+    product_df = views.get("product_view", pd.DataFrame())
+    rec_df = views.get("reconciliation_view", pd.DataFrame())
 
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("#### A. OPEX by pool")
-        st.dataframe(pd.DataFrame(pool_view).T, use_container_width=True)
+        st.dataframe(pool_view, use_container_width=True)
     with c2:
         st.markdown("#### B. OPEX by driver type")
-        st.dataframe(pd.DataFrame(driver_view).T, use_container_width=True)
+        st.dataframe(driver_view, use_container_width=True)
 
     st.markdown("#### C. OPEX by product")
-    product_rows = []
-    for sku_id, year_map in product_view.items():
-        for year, metrics in year_map.items():
-            product_rows.append({"sku_id": sku_id, "year": year, **metrics})
-    product_df = pd.DataFrame(product_rows).sort_values(["sku_id", "year"])
+    if not product_df.empty:
+        product_df = product_df.sort_values(["sku_id", "year"])
     st.dataframe(product_df, use_container_width=True)
 
     st.markdown("#### Reconciliation check")
-    rec_df = pd.DataFrame(reconciliation).T
-    rec_df["within_tolerance"] = rec_df["reconciliation_gap"].abs() <= 1e-6
+    if not rec_df.empty:
+        rec_df["within_tolerance"] = rec_df["reconciliation_gap"].abs() <= 1e-6
     st.dataframe(rec_df, use_container_width=True)
 
 
@@ -1331,7 +1325,7 @@ def main() -> None:
         _statement_section(result)
         _charts_section(result)
         _schedules_section(result)
-        _driver_based_opex_views_section(price_inflation, cost_inflation)
+        _driver_based_opex_views_section(result)
         _download_section(result)
 
         st.caption(

@@ -32,3 +32,7 @@ def test_all_in_one_coerces_numeric_sku_and_channel_inputs():
     result = model.run()
     assert not result.prices.empty
     assert float(result.prices.iloc[0, 0]) > 0.0
+    assert "pool_view" in result.opex_allocation_views
+    assert "driver_view" in result.opex_allocation_views
+    assert "product_view" in result.opex_allocation_views
+    assert "reconciliation_view" in result.opex_allocation_views

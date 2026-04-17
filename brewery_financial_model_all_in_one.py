@@ -35,10 +35,14 @@ Notes:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Dict, Iterable, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from finmodel.allocation import allocate_opex_by_drivers
+from finmodel.opex_defaults import build_default_opex_cost_pools
+from finmodel.opex_schemas import OpexCostPool, SKUCostContext
 
 
 # =============================
@@ -181,6 +185,7 @@ class ModelRunResult:
     prices: pd.DataFrame
     debt_schedules: Dict[str, pd.DataFrame]
     valuation: Dict[str, float]
+    opex_allocation_views: Dict[str, pd.DataFrame]
 
 
 # =============================
@@ -308,6 +313,67 @@ class MicrobreweryFinancialModel:
         return wide.sort_index(axis=1)
 
     # ---------- pricing ----------
+    @staticmethod
+    def _liters_per_unit_from_name(sku_name: str) -> float:
+        text = str(sku_name).lower()
+        m_ml = re.search(r"(\\d+(?:\\.\\d+)?)\\s*ml", text)
+        if m_ml:
+            return float(m_ml.group(1)) / 1000.0
+        m_l = re.search(r"(\\d+(?:\\.\\d+)?)\\s*l", text)
+        if m_l:
+            return float(m_l.group(1))
+        if "keg" in text:
+            return 20.0
+        return 0.5
+
+    def _allocate_basis_opex_by_pool(
+        self,
+        basis_date: pd.Timestamp,
+        units_wide: pd.DataFrame,
+        channels: pd.DataFrame,
+        skus: pd.DataFrame,
+        opex_basis: float,
+    ) -> pd.Series:
+        units_row = units_wide.loc[basis_date] if not units_wide.empty else pd.Series(dtype=float)
+        channel_price_factor = channels.set_index("channel")["price_factor"].to_dict()
+
+        contexts: List[SKUCostContext] = []
+        for sku_id, row in skus.iterrows():
+            channel_units = {}
+            for ch in channels["channel"].tolist():
+                channel_units[ch] = float(units_row.get((sku_id, ch), 0.0))
+            total_units = float(sum(channel_units.values()))
+            liters_per_unit = self._liters_per_unit_from_name(str(row.get("name", "")))
+            estimated_base_unit_price = float(row["direct_cost_per_unit"]) * (1.0 + float(row["markup_pct"]))
+            channel_revenue = {
+                ch: channel_units[ch] * estimated_base_unit_price * float(channel_price_factor.get(ch, 1.0))
+                for ch in channel_units
+            }
+            contexts.append(
+                SKUCostContext(
+                    sku_id=int(sku_id),
+                    sku_name=str(row.get("name", f"SKU {sku_id}")),
+                    product_family=str(row.get("product_family", "Core")),
+                    package_type=str(row.get("package_type", "Standard")),
+                    package_size=str(row.get("package_size", "Standard")),
+                    active=total_units > 0.0,
+                    units_sold_by_year={"Basis": total_units},
+                    liters_sold_by_year={"Basis": total_units * liters_per_unit},
+                    revenue_by_year={"Basis": float(sum(channel_revenue.values()))},
+                    revenue_by_channel_by_year={"Basis": channel_revenue},
+                    units_by_channel_by_year={"Basis": channel_units},
+                    complexity_score=float(row.get("relative_opex_weight", 1.0)),
+                    batch_count_by_year={"Basis": (total_units * liters_per_unit) / 500.0},
+                    order_count_by_year={"Basis": total_units / 1000.0},
+                    shipment_count_by_year={"Basis": total_units / 1200.0},
+                )
+            )
+
+        pools = build_default_opex_cost_pools({"Basis": float(max(opex_basis, 0.0))})
+        report = allocate_opex_by_drivers(["Basis"], contexts, pools)
+        allocated = {a.sku_id: a.total_allocated_opex for a in report.allocations if a.year == "Basis"}
+        return pd.Series(allocated, index=skus.index).fillna(0.0)
+
     def _base_cost_plus_price_by_sku(self, idx: pd.DatetimeIndex, units_wide: pd.DataFrame) -> pd.Series:
         """
         Compute a base (month-0) cost-plus price for each SKU using a cost basis month:
@@ -334,13 +400,14 @@ class MicrobreweryFinancialModel:
         opex_fixed = self._as_monthly_series(self.inputs.opex_fixed_monthly, idx, "opex_fixed")
         opex_basis = float(opex_fixed.loc[basis_date] * cost_index.loc[basis_date])
 
-        # Allocate fixed OPEX to SKUs proportional to (units * relative_weight)
-        weights = units_sku * skus["relative_opex_weight"]
-        denom = float(weights.sum())
-        alloc = pd.Series(0.0, index=skus.index)
-        if denom > 0:
-            alloc = opex_basis * weights / denom
-
+        # Allocate OPEX via cost-pool allocator (no lump-style weighted-smear).
+        alloc = self._allocate_basis_opex_by_pool(
+            basis_date=basis_date,
+            units_wide=units_wide,
+            channels=self.inputs.channels,
+            skus=skus,
+            opex_basis=opex_basis,
+        )
         opex_per_unit = alloc / units_sku.replace(0.0, np.nan)
         opex_per_unit = opex_per_unit.fillna(0.0)
 
@@ -522,6 +589,106 @@ class MicrobreweryFinancialModel:
             schedules[fac.name] = self._debt_schedule_one(idx, fac)
         return schedules
 
+    def _annual_opex_allocation_views(
+        self,
+        idx: pd.DatetimeIndex,
+        units_wide: pd.DataFrame,
+        revenue_wide: pd.DataFrame,
+        opex_series: pd.Series,
+    ) -> Dict[str, pd.DataFrame]:
+        skus = self.inputs.skus.set_index("sku_id")
+        channels = self.inputs.channels["channel"].tolist()
+        year_labels = sorted(idx.year.unique())
+        year_keys = {y: f"Year {i + 1}" for i, y in enumerate(year_labels)}
+
+        annual_opex = {}
+        for y in year_labels:
+            annual_opex[year_keys[y]] = float(opex_series[idx.year == y].sum())
+
+        contexts: List[SKUCostContext] = []
+        for sku_id, row in skus.iterrows():
+            units_by_year = {}
+            liters_by_year = {}
+            revenue_by_year = {}
+            revenue_ch_by_year: Dict[str, Dict[str, float]] = {}
+            units_ch_by_year: Dict[str, Dict[str, float]] = {}
+            batch_by_year = {}
+            order_by_year = {}
+            ship_by_year = {}
+            liters_per_unit = self._liters_per_unit_from_name(str(row.get("name", "")))
+            for y in year_labels:
+                key = year_keys[y]
+                mask = idx.year == y
+                units_year = units_wide.loc[mask] if not units_wide.empty else pd.DataFrame(index=idx[mask])
+                rev_year = revenue_wide.loc[mask] if not revenue_wide.empty else pd.DataFrame(index=idx[mask])
+                ch_units = {ch: float(units_year.get((sku_id, ch), pd.Series(dtype=float)).sum()) for ch in channels}
+                ch_revenue = {ch: float(rev_year.get((sku_id, ch), pd.Series(dtype=float)).sum()) for ch in channels}
+                total_units = float(sum(ch_units.values()))
+                total_revenue = float(sum(ch_revenue.values()))
+                units_by_year[key] = total_units
+                liters_by_year[key] = total_units * liters_per_unit
+                revenue_by_year[key] = total_revenue
+                units_ch_by_year[key] = ch_units
+                revenue_ch_by_year[key] = ch_revenue
+                batch_by_year[key] = (total_units * liters_per_unit) / 500.0
+                order_by_year[key] = total_units / 1000.0
+                ship_by_year[key] = total_units / 1200.0
+
+            contexts.append(
+                SKUCostContext(
+                    sku_id=int(sku_id),
+                    sku_name=str(row.get("name", f"SKU {sku_id}")),
+                    product_family=str(row.get("product_family", "Core")),
+                    package_type=str(row.get("package_type", "Standard")),
+                    package_size=str(row.get("package_size", "Standard")),
+                    active=any(v > 0.0 for v in units_by_year.values()),
+                    units_sold_by_year=units_by_year,
+                    liters_sold_by_year=liters_by_year,
+                    revenue_by_year=revenue_by_year,
+                    revenue_by_channel_by_year=revenue_ch_by_year,
+                    units_by_channel_by_year=units_ch_by_year,
+                    complexity_score=float(row.get("relative_opex_weight", 1.0)),
+                    batch_count_by_year=batch_by_year,
+                    order_count_by_year=order_by_year,
+                    shipment_count_by_year=ship_by_year,
+                )
+            )
+
+        pools: List[OpexCostPool] = build_default_opex_cost_pools(annual_opex)
+        report = allocate_opex_by_drivers(list(annual_opex.keys()), contexts, pools)
+        pool_view = pd.DataFrame({s.year: s.by_pool_totals for s in report.summaries}).T
+        driver_view = pd.DataFrame({s.year: s.by_driver_type_totals for s in report.summaries}).T
+        rec_view = pd.DataFrame(
+            {
+                s.year: {
+                    "total_pool_opex": s.total_pool_opex,
+                    "total_allocated_opex": s.total_allocated_opex,
+                    "reconciliation_gap": s.reconciliation_gap,
+                }
+                for s in report.summaries
+            }
+        ).T
+        product_view = pd.DataFrame(
+            [
+                {
+                    "year": a.year,
+                    "sku_id": a.sku_id,
+                    "sku_name": a.sku_name,
+                    "total_allocated_opex": a.total_allocated_opex,
+                    "opex_per_unit": a.opex_per_unit,
+                    "opex_per_liter": a.opex_per_liter,
+                    "opex_per_case": a.opex_per_case,
+                }
+                for a in report.allocations
+            ]
+        )
+        return {
+            "pool_view": pool_view,
+            "driver_view": driver_view,
+            "product_view": product_view,
+            "reconciliation_view": rec_view,
+        }
+
     # ---------- Run model ----------
     def run(self) -> ModelRunResult:
         idx = self._timeline()
@@ -702,12 +869,20 @@ class MicrobreweryFinancialModel:
 
         annual = monthly.resample("YE").sum(numeric_only=True).rename_axis("year_end")
 
+        opex_allocation_views = self._annual_opex_allocation_views(
+            idx=idx,
+            units_wide=units_wide,
+            revenue_wide=revenue_wide,
+            opex_series=opex,
+        )
+
         return ModelRunResult(
             monthly=monthly,
             annual=annual,
             prices=prices_wide,
             debt_schedules=debt_schedules,
             valuation=valuation,
+            opex_allocation_views=opex_allocation_views,
         )
 
 
