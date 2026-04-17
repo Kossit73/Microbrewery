@@ -1278,17 +1278,6 @@ def main() -> None:
             format_func=lambda x: f"${x:,.0f}",
         )
 
-        current_sales_plan_frequency = str(st.session_state.get("assump_sales_plan_frequency", "monthly"))
-        sales_plan_freq_options = ["monthly", "quarterly", "yearly"]
-        if current_sales_plan_frequency not in sales_plan_freq_options:
-            current_sales_plan_frequency = "monthly"
-        st.session_state["assump_sales_plan_frequency"] = st.selectbox(
-            "Sales plan frequency",
-            options=sales_plan_freq_options,
-            index=sales_plan_freq_options.index(current_sales_plan_frequency),
-            help="How to interpret each sales-plan row before monthly calculations are run.",
-        )
-
     cfg = ModelConfig(
         start_date=f"{int(start_year)}-01-01",
         months=months,
@@ -1441,7 +1430,19 @@ def main() -> None:
         _assumption_editor("Dividend assumptions", "dividend", dividend_df)
         _assumption_editor("SKUs", "skus", inputs.skus)
         _assumption_editor("Channels", "channels", inputs.channels)
-        st.caption(f"Sales plan frequency: `{inputs.sales_plan_frequency}`")
+        sales_plan_freq_labels = {"monthly": "Monthly", "quarterly": "Quarterly", "yearly": "Yearly"}
+        label_to_value = {v: k for k, v in sales_plan_freq_labels.items()}
+        current_sales_plan_frequency = str(st.session_state.get("assump_sales_plan_frequency", inputs.sales_plan_frequency))
+        if current_sales_plan_frequency not in sales_plan_freq_labels:
+            current_sales_plan_frequency = "monthly"
+        selected_frequency_label = st.selectbox(
+            "Sales plan frequency",
+            options=["Monthly", "Quarterly", "Yearly"],
+            index=["Monthly", "Quarterly", "Yearly"].index(sales_plan_freq_labels[current_sales_plan_frequency]),
+            key="assump_sales_plan_frequency_selector",
+            help="How each sales-plan row is expanded before monthly model calculations run.",
+        )
+        st.session_state["assump_sales_plan_frequency"] = label_to_value[selected_frequency_label]
         _assumption_editor("Sales plan", "sales_plan", inputs.sales_plan)
         _assumption_editor("Cost pools", "cost_pools", cost_pool_df)
         _assumption_editor("Other income monthly", "other_income", other_income_df)
