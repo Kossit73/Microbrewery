@@ -450,5 +450,63 @@ class MicrobreweryFinancialModel:
     def opex_by_product_view(self) -> Dict[int, Dict[str, Dict[str, float]]]:
         return self.opex_metrics_by_sku_and_year()
 
+    def allocate_direct_costs(self) -> Dict[int, Dict[str, float]]:
+        out: Dict[int, Dict[str, float]] = {}
+        for sku in self.skus:
+            per_year: Dict[str, float] = {}
+            for year in self.forecast_years():
+                idx = self.year_to_index(year) - 1
+                infl = (1.0 + self.general.cost_inflation) ** max(idx, 0)
+                per_year[year] = float(sku.annual_units.get(year, 0.0)) * float(sku.direct_cost_year1_per_sku) * infl
+            out[sku.sku_id] = per_year
+        return out
+
+    def allocate_indirect_costs(self) -> Dict[int, Dict[str, float]]:
+        report = self.allocate_opex()
+        out: Dict[int, Dict[str, float]] = {}
+        for a in report.allocations:
+            out.setdefault(a.sku_id, {})[a.year] = a.total_allocated_opex
+        return out
+
+    def allocate_total_unit_costs(self) -> Dict[int, Dict[str, float]]:
+        direct = self.allocate_direct_costs()
+        indirect = self.allocate_indirect_costs()
+        out: Dict[int, Dict[str, float]] = {}
+        for sku in self.skus:
+            out[sku.sku_id] = {}
+            for year in self.forecast_years():
+                out[sku.sku_id][year] = direct.get(sku.sku_id, {}).get(year, 0.0) + indirect.get(sku.sku_id, {}).get(year, 0.0)
+        return out
+
+    def unit_cost_metrics_by_sku_and_year(self) -> Dict[int, Dict[str, Dict[str, float]]]:
+        metrics = self.opex_metrics_by_sku_and_year()
+        direct = self.allocate_direct_costs()
+        for sku in self.skus:
+            for year in self.forecast_years():
+                units = float(sku.annual_units.get(year, 0.0))
+                liters = units * float(sku.liters_per_sku)
+                direct_cost = direct.get(sku.sku_id, {}).get(year, 0.0)
+                indirect_cost = metrics.get(sku.sku_id, {}).get(year, {}).get("total_allocated_opex", 0.0)
+                total = direct_cost + indirect_cost
+                row = metrics.setdefault(sku.sku_id, {}).setdefault(year, {})
+                row["allocated_direct_cost"] = direct_cost
+                row["allocated_indirect_cost"] = indirect_cost
+                row["total_allocated_operating_cost"] = total
+                row["unit_variable_cost"] = direct_cost / units if units > 0 else 0.0
+                row["unit_fixed_cost"] = indirect_cost / units if units > 0 else 0.0
+                row["total_unit_cost"] = total / units if units > 0 else 0.0
+                row["cost_per_liter"] = total / liters if liters > 0 else 0.0
+                row["cost_per_unit"] = total / units if units > 0 else 0.0
+        return metrics
+
+    def reconcile_cost_allocations(self) -> Dict[str, Dict[str, float]]:
+        recon = self.reconcile_opex_allocation()
+        direct = self.allocate_direct_costs()
+        for year in self.forecast_years():
+            recon.setdefault(year, {})
+            recon[year]["total_direct_cost"] = sum(v.get(year, 0.0) for v in direct.values())
+            recon[year]["total_modeled_operating_cost"] = recon[year]["total_direct_cost"] + recon[year].get("total_pool_opex", 0.0)
+        return recon
+
     def preserved_source(self) -> Dict[str, object]:
         return {"worksheets": WORKSHEETS, "raw_pdf_pages": RAW_PDF_PAGES}

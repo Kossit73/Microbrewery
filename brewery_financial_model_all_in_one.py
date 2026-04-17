@@ -148,6 +148,20 @@ class CapexItem:
     depreciation_years: float = 0.0  # 0 => non-depreciable (e.g., land)
 
 
+@dataclass(frozen=True)
+class CostPoolInput:
+    name: str
+    cost_type: Literal["direct", "indirect"] = "indirect"
+    behavior: Literal["variable", "fixed", "step_fixed", "blended"] = "blended"
+    allocation_driver: Literal["units", "liters", "revenue", "channel_units", "channel_revenue", "active_sku", "complexity"] = "units"
+    scope: Literal["global", "family", "channel", "sku"] = "global"
+    channel: Optional[str] = None
+    unit_variable_cost: float = 0.0
+    fixed_monthly_cost: float = 0.0
+    step_threshold: float = 0.0
+    step_increment: float = 0.0
+
+
 @dataclass
 class ModelInputs:
     """
@@ -160,8 +174,8 @@ class ModelInputs:
         date (datetime), sku_id, channel, units
 
     Optional inputs:
-    - opex_fixed_monthly: Series indexed by date (monthly) or scalar float
     - other_income_monthly: Series indexed by date or scalar float
+    - cost_pools: list of CostPoolInput
     - capex_items: list of CapexItem
     - debt_facilities: list of DebtFacility
     - equity_injections: dict month -> amount (positive cash-in)
@@ -170,8 +184,8 @@ class ModelInputs:
     channels: pd.DataFrame
     sales_plan: pd.DataFrame
 
-    opex_fixed_monthly: float | pd.Series = 0.0
     other_income_monthly: float | pd.Series = 0.0
+    cost_pools: Optional[List[CostPoolInput]] = None
 
     capex_items: Optional[List[CapexItem]] = None
     debt_facilities: Optional[List[DebtFacility]] = None
@@ -266,6 +280,8 @@ class MicrobreweryFinancialModel:
             self.inputs.debt_facilities = []
         if self.inputs.equity_injections is None:
             self.inputs.equity_injections = {}
+        if self.inputs.cost_pools is None:
+            self.inputs.cost_pools = []
 
     # ---------- timeline ----------
     def _timeline(self) -> pd.DatetimeIndex:
@@ -311,6 +327,97 @@ class MicrobreweryFinancialModel:
             .fillna(0.0)
         )
         return wide.sort_index(axis=1)
+
+    def _estimated_revenue_wide_from_units(self, idx: pd.DatetimeIndex, units_wide: pd.DataFrame) -> pd.DataFrame:
+        if units_wide.empty:
+            return pd.DataFrame(index=idx)
+        skus = self.inputs.skus.set_index("sku_id")
+        channels = self.inputs.channels.set_index("channel")
+        cols: List[Tuple[int, str]] = []
+        data: List[np.ndarray] = []
+        for sku_id, row in skus.iterrows():
+            base_price = float(row["direct_cost_per_unit"]) * (1.0 + float(row["markup_pct"]))
+            for ch, ch_row in channels.iterrows():
+                cols.append((sku_id, ch))
+                data.append(np.full(len(idx), base_price * float(ch_row["price_factor"])))
+        price_proxy = pd.DataFrame(
+            np.array(data).T,
+            index=idx,
+            columns=pd.MultiIndex.from_tuples(cols, names=["sku_id", "channel"]),
+        ).sort_index(axis=1)
+        return units_wide.mul(price_proxy, fill_value=0.0)
+
+    def _pool_driver_series(
+        self,
+        idx: pd.DatetimeIndex,
+        units_wide: pd.DataFrame,
+        revenue_wide: pd.DataFrame,
+        pool: CostPoolInput,
+    ) -> pd.Series:
+        if pool.allocation_driver == "units":
+            return units_wide.sum(axis=1).reindex(idx).fillna(0.0) if not units_wide.empty else pd.Series(0.0, index=idx)
+        if pool.allocation_driver == "liters":
+            liters = pd.Series(0.0, index=idx)
+            if not units_wide.empty:
+                for sku_id in self.inputs.skus["sku_id"].tolist():
+                    liters_per = self._liters_per_unit_from_name(str(self.inputs.skus.set_index("sku_id").loc[sku_id, "name"]))
+                    sku_units = units_wide.xs(sku_id, axis=1, level=0, drop_level=False).sum(axis=1)
+                    liters = liters + sku_units * liters_per
+            return liters
+        if pool.allocation_driver == "revenue":
+            return revenue_wide.sum(axis=1).reindex(idx).fillna(0.0) if not revenue_wide.empty else pd.Series(0.0, index=idx)
+        if pool.allocation_driver == "channel_units":
+            if units_wide.empty:
+                return pd.Series(0.0, index=idx)
+            if pool.channel:
+                return units_wide.xs(pool.channel, axis=1, level=1, drop_level=False).sum(axis=1)
+            return units_wide.sum(axis=1)
+        if pool.allocation_driver == "channel_revenue":
+            if revenue_wide.empty:
+                return pd.Series(0.0, index=idx)
+            if pool.channel:
+                return revenue_wide.xs(pool.channel, axis=1, level=1, drop_level=False).sum(axis=1)
+            return revenue_wide.sum(axis=1)
+        if pool.allocation_driver == "active_sku":
+            if units_wide.empty:
+                return pd.Series(0.0, index=idx)
+            active = (units_wide.groupby(level=0, axis=1).sum() > 0).sum(axis=1)
+            return active.astype(float)
+        if pool.allocation_driver == "complexity":
+            if units_wide.empty:
+                return pd.Series(0.0, index=idx)
+            sku_weights = self.inputs.skus.set_index("sku_id")["relative_opex_weight"].to_dict()
+            totals = pd.Series(0.0, index=idx)
+            for sku_id, w in sku_weights.items():
+                sku_units = units_wide.xs(sku_id, axis=1, level=0, drop_level=False).sum(axis=1)
+                totals = totals + (sku_units > 0).astype(float) * float(w)
+            return totals
+        return pd.Series(0.0, index=idx)
+
+    def _indirect_cost_pool_monthly(
+        self,
+        idx: pd.DatetimeIndex,
+        units_wide: pd.DataFrame,
+        revenue_wide: pd.DataFrame,
+    ) -> pd.DataFrame:
+        pools = [p for p in (self.inputs.cost_pools or []) if p.cost_type == "indirect"]
+        data: Dict[str, pd.Series] = {}
+        for pool in pools:
+            driver = self._pool_driver_series(idx, units_wide, revenue_wide, pool)
+            variable_component = float(pool.unit_variable_cost) * driver
+            fixed_component = pd.Series(float(pool.fixed_monthly_cost), index=idx)
+            if pool.behavior == "variable":
+                total = variable_component
+            elif pool.behavior == "fixed":
+                total = fixed_component
+            elif pool.behavior == "step_fixed":
+                steps = np.floor(driver / max(float(pool.step_threshold), 1.0))
+                total = fixed_component + steps * float(pool.step_increment)
+            else:
+                steps = np.floor(driver / max(float(pool.step_threshold), 1.0)) if float(pool.step_threshold) > 0 else 0.0
+                total = fixed_component + variable_component + (steps * float(pool.step_increment))
+            data[pool.name] = total.astype(float)
+        return pd.DataFrame(data, index=idx)
 
     # ---------- pricing ----------
     @staticmethod
@@ -396,9 +503,10 @@ class MicrobreweryFinancialModel:
             units_sku = units_wide.loc[basis_date].groupby(level=0).sum()
         units_sku = units_sku.reindex(skus.index).fillna(0.0)
 
-        # OPEX cash in basis month
-        opex_fixed = self._as_monthly_series(self.inputs.opex_fixed_monthly, idx, "opex_fixed")
-        opex_basis = float(opex_fixed.loc[basis_date] * cost_index.loc[basis_date])
+        # OPEX cash in basis month from indirect cost pools (no monthly lump assumption).
+        revenue_proxy = self._estimated_revenue_wide_from_units(idx, units_wide)
+        pool_monthly = self._indirect_cost_pool_monthly(idx, units_wide, revenue_proxy)
+        opex_basis = float(pool_monthly.sum(axis=1).reindex(idx).fillna(0.0).loc[basis_date] * cost_index.loc[basis_date])
 
         # Allocate OPEX via cost-pool allocator (no lump-style weighted-smear).
         alloc = self._allocate_basis_opex_by_pool(
@@ -730,9 +838,9 @@ class MicrobreweryFinancialModel:
 
         gross_profit = (revenue - direct_costs).rename("gross_profit")
 
-        # OPEX
-        opex_fixed = self._as_monthly_series(self.inputs.opex_fixed_monthly, idx, "opex_fixed")
-        opex = (opex_fixed * cost_idx).rename("opex")
+        # Indirect operating costs from explicit cost pools (no lump-sum monthly OPEX input).
+        pool_monthly = self._indirect_cost_pool_monthly(idx, units_wide, revenue_wide)
+        opex = (pool_monthly.sum(axis=1) * cost_idx).rename("opex")
 
         ebitda = (total_revenue - direct_costs - opex).rename("ebitda")
 
@@ -988,9 +1096,25 @@ def main() -> None:
     sales_plan = pd.DataFrame(rows)
 
     # ----------------------------
-    # OPEX and other income (monthly)
+    # Cost pools and other income (monthly)
     # ----------------------------
-    opex_fixed_monthly = 110_000.0
+    cost_pools = [
+        CostPoolInput(name="Indirect Labor", cost_type="indirect", behavior="step_fixed", allocation_driver="liters", fixed_monthly_cost=22_000.0, step_threshold=250_000.0, step_increment=2_000.0),
+        CostPoolInput(name="Utilities", cost_type="indirect", behavior="variable", allocation_driver="liters", unit_variable_cost=0.035),
+        CostPoolInput(name="Supplies", cost_type="indirect", behavior="variable", allocation_driver="units", unit_variable_cost=0.015),
+        CostPoolInput(name="Marketing & Advertising", cost_type="indirect", behavior="blended", allocation_driver="channel_revenue", fixed_monthly_cost=8_500.0, unit_variable_cost=0.003, channel=None),
+        CostPoolInput(name="Events & Promotion", cost_type="indirect", behavior="variable", allocation_driver="channel_units", unit_variable_cost=0.01, channel="On-Premise"),
+        CostPoolInput(name="Insurance", cost_type="indirect", behavior="fixed", allocation_driver="revenue", fixed_monthly_cost=3_000.0),
+        CostPoolInput(name="Permits & License", cost_type="indirect", behavior="blended", allocation_driver="active_sku", fixed_monthly_cost=1_250.0, unit_variable_cost=350.0),
+        CostPoolInput(name="Local Fees", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=900.0),
+        CostPoolInput(name="Transport", cost_type="indirect", behavior="variable", allocation_driver="channel_units", unit_variable_cost=0.018),
+        CostPoolInput(name="Administrative Expense", cost_type="indirect", behavior="blended", allocation_driver="active_sku", fixed_monthly_cost=9_500.0, unit_variable_cost=250.0),
+        CostPoolInput(name="Quality Control", cost_type="indirect", behavior="blended", allocation_driver="liters", fixed_monthly_cost=2_500.0, unit_variable_cost=0.01),
+        CostPoolInput(name="Certificates", cost_type="indirect", behavior="variable", allocation_driver="active_sku", unit_variable_cost=180.0),
+        CostPoolInput(name="Professional Services", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=2_200.0),
+        CostPoolInput(name="Other Expense", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=1_400.0),
+        CostPoolInput(name="Contingencies", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=1_800.0),
+    ]
 
     other_income_monthly = pd.Series(0.0, index=idx)
     other_income_monthly.iloc[12:] = 15_000.0  # from month 13 onward
@@ -1020,8 +1144,8 @@ def main() -> None:
         skus=skus,
         channels=channels,
         sales_plan=sales_plan,
-        opex_fixed_monthly=opex_fixed_monthly,
         other_income_monthly=other_income_monthly,
+        cost_pools=cost_pools,
         capex_items=capex_items,
         debt_facilities=debt_facilities,
         equity_injections=equity_injections,

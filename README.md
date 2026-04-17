@@ -116,6 +116,11 @@ recon = model.reconcile_opex_allocation()
 pool_view = model.opex_by_pool_view()
 driver_view = model.opex_by_driver_type_view()
 product_view = model.opex_by_product_view()
+direct_costs = model.allocate_direct_costs()
+indirect_costs = model.allocate_indirect_costs()
+total_costs = model.allocate_total_unit_costs()
+unit_metrics = model.unit_cost_metrics_by_sku_and_year()
+cost_recon = model.reconcile_cost_allocations()
 ```
 
 ### Cost pools and driver mappings

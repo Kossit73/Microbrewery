@@ -5,7 +5,7 @@ import pandas as pd
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
-from brewery_financial_model_all_in_one import DividendPolicy, ModelConfig, ModelInputs, MicrobreweryFinancialModel
+from brewery_financial_model_all_in_one import CostPoolInput, DividendPolicy, ModelConfig, ModelInputs, MicrobreweryFinancialModel
 
 
 def test_all_in_one_coerces_numeric_sku_and_channel_inputs():
@@ -26,7 +26,12 @@ def test_all_in_one_coerces_numeric_sku_and_channel_inputs():
     model = MicrobreweryFinancialModel(
         ModelConfig(months=3, pricing_cost_basis_month=0),
         DividendPolicy(enabled=False),
-        ModelInputs(skus=skus, channels=channels, sales_plan=sales, opex_fixed_monthly=1000.0),
+        ModelInputs(
+            skus=skus,
+            channels=channels,
+            sales_plan=sales,
+            cost_pools=[CostPoolInput(name="Admin", fixed_monthly_cost=1000.0, behavior="fixed", allocation_driver="units")],
+        ),
     )
 
     result = model.run()

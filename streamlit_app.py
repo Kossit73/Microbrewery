@@ -24,6 +24,7 @@ st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
 
 from brewery_financial_model_all_in_one import (
     CapexItem,
+    CostPoolInput,
     DebtFacility,
     DividendPolicy,
     ModelRunResult,
@@ -131,7 +132,23 @@ def _build_sample_assumptions(
                 rows.append({"date": date, "sku_id": sku_id, "channel": channel, "units": total_units * share})
     sales_plan = pd.DataFrame(rows)
 
-    opex_fixed_monthly = 110_000.0
+    cost_pools = [
+        CostPoolInput(name="Indirect Labor", cost_type="indirect", behavior="step_fixed", allocation_driver="liters", fixed_monthly_cost=22_000.0, step_threshold=250_000.0, step_increment=2_000.0),
+        CostPoolInput(name="Utilities", cost_type="indirect", behavior="variable", allocation_driver="liters", unit_variable_cost=0.035),
+        CostPoolInput(name="Supplies", cost_type="indirect", behavior="variable", allocation_driver="units", unit_variable_cost=0.015),
+        CostPoolInput(name="Marketing & Advertising", cost_type="indirect", behavior="blended", allocation_driver="channel_revenue", fixed_monthly_cost=8_500.0, unit_variable_cost=0.003),
+        CostPoolInput(name="Events & Promotion", cost_type="indirect", behavior="variable", allocation_driver="channel_units", unit_variable_cost=0.01, channel="On-Premise"),
+        CostPoolInput(name="Insurance", cost_type="indirect", behavior="fixed", allocation_driver="revenue", fixed_monthly_cost=3_000.0),
+        CostPoolInput(name="Permits & License", cost_type="indirect", behavior="blended", allocation_driver="active_sku", fixed_monthly_cost=1_250.0, unit_variable_cost=350.0),
+        CostPoolInput(name="Local Fees", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=900.0),
+        CostPoolInput(name="Transport", cost_type="indirect", behavior="variable", allocation_driver="channel_units", unit_variable_cost=0.018),
+        CostPoolInput(name="Administrative Expense", cost_type="indirect", behavior="blended", allocation_driver="active_sku", fixed_monthly_cost=9_500.0, unit_variable_cost=250.0),
+        CostPoolInput(name="Quality Control", cost_type="indirect", behavior="blended", allocation_driver="liters", fixed_monthly_cost=2_500.0, unit_variable_cost=0.01),
+        CostPoolInput(name="Certificates", cost_type="indirect", behavior="variable", allocation_driver="active_sku", unit_variable_cost=180.0),
+        CostPoolInput(name="Professional Services", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=2_200.0),
+        CostPoolInput(name="Other Expense", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=1_400.0),
+        CostPoolInput(name="Contingencies", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=1_800.0),
+    ]
     other_income_monthly = pd.Series(0.0, index=idx)
     other_income_monthly.iloc[12:] = 15_000.0
     other_income_monthly.iloc[48:] = 22_500.0
@@ -189,7 +206,7 @@ def _build_sample_assumptions(
         skus=skus,
         channels=channels,
         sales_plan=sales_plan,
-        opex_fixed_monthly=opex_fixed_monthly,
+        cost_pools=cost_pools,
         other_income_monthly=other_income_monthly,
         capex_items=capex_items,
         debt_facilities=debt_facilities,
@@ -401,15 +418,27 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
     channels = _non_empty_rows(st.session_state.get("assump_data_channels", base_inputs.channels)).copy()
     sales_plan = _non_empty_rows(st.session_state.get("assump_data_sales_plan", base_inputs.sales_plan)).copy()
 
-    opex_src = st.session_state.get("assump_data_opex_fixed")
-    if isinstance(opex_src, pd.DataFrame) and not opex_src.empty and "date" in opex_src.columns:
-        if len(opex_src) == 1 and str(opex_src.iloc[0]["date"]) == "all_months":
-            opex_fixed_monthly = float(opex_src.iloc[0]["opex_fixed_monthly"])
-        else:
-            s = pd.Series(opex_src["opex_fixed_monthly"].values, index=pd.to_datetime(opex_src["date"]))
-            opex_fixed_monthly = s
+    cp_src = st.session_state.get("assump_data_cost_pools")
+    if isinstance(cp_src, pd.DataFrame):
+        cp_src = _non_empty_rows(cp_src)
+        cost_pools = [
+            CostPoolInput(
+                name=str(r["name"]),
+                cost_type=str(r.get("cost_type", "indirect")),
+                behavior=str(r.get("behavior", "blended")),
+                allocation_driver=str(r.get("allocation_driver", "units")),
+                scope=str(r.get("scope", "global")),
+                channel=None if pd.isna(r.get("channel")) else str(r.get("channel")),
+                unit_variable_cost=float(r.get("unit_variable_cost", 0.0)),
+                fixed_monthly_cost=float(r.get("fixed_monthly_cost", 0.0)),
+                step_threshold=float(r.get("step_threshold", 0.0)),
+                step_increment=float(r.get("step_increment", 0.0)),
+            )
+            for _, r in cp_src.iterrows()
+            if pd.notna(r.get("name"))
+        ]
     else:
-        opex_fixed_monthly = base_inputs.opex_fixed_monthly
+        cost_pools = base_inputs.cost_pools
 
     oi_src = st.session_state.get("assump_data_other_income")
     if isinstance(oi_src, pd.DataFrame) and not oi_src.empty and "date" in oi_src.columns:
@@ -471,7 +500,7 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
         skus=skus,
         channels=channels,
         sales_plan=sales_plan,
-        opex_fixed_monthly=opex_fixed_monthly,
+        cost_pools=cost_pools,
         other_income_monthly=other_income_monthly,
         capex_items=capex_items,
         debt_facilities=debt_facilities,
@@ -1370,10 +1399,22 @@ def main() -> None:
                 }
             ]
         )
-        opex_df = pd.DataFrame(
-            [{"date": d, "opex_fixed_monthly": v} for d, v in inputs.opex_fixed_monthly.items()]
-            if isinstance(inputs.opex_fixed_monthly, pd.Series)
-            else [{"date": "all_months", "opex_fixed_monthly": float(inputs.opex_fixed_monthly)}]
+        cost_pool_df = pd.DataFrame(
+            [
+                {
+                    "name": p.name,
+                    "cost_type": p.cost_type,
+                    "behavior": p.behavior,
+                    "allocation_driver": p.allocation_driver,
+                    "scope": p.scope,
+                    "channel": p.channel,
+                    "unit_variable_cost": p.unit_variable_cost,
+                    "fixed_monthly_cost": p.fixed_monthly_cost,
+                    "step_threshold": p.step_threshold,
+                    "step_increment": p.step_increment,
+                }
+                for p in (inputs.cost_pools or [])
+            ]
         )
         other_income_df = pd.DataFrame(
             [{"date": d, "other_income_monthly": v} for d, v in inputs.other_income_monthly.items()]
@@ -1386,7 +1427,7 @@ def main() -> None:
         _assumption_editor("SKUs", "skus", inputs.skus)
         _assumption_editor("Channels", "channels", inputs.channels)
         _assumption_editor("Sales plan", "sales_plan", inputs.sales_plan)
-        _assumption_editor("OPEX fixed monthly", "opex_fixed", opex_df)
+        _assumption_editor("Cost pools", "cost_pools", cost_pool_df)
         _assumption_editor("Other income monthly", "other_income", other_income_df)
         _assumption_editor("CAPEX schedule", "capex", capex_df)
         _assumption_editor("Debt facilities", "debt", debt_df)
