@@ -381,7 +381,9 @@ class MicrobreweryFinancialModel:
         if pool.allocation_driver == "active_sku":
             if units_wide.empty:
                 return pd.Series(0.0, index=idx)
-            active = (units_wide.groupby(level=0, axis=1).sum() > 0).sum(axis=1)
+            # pandas>=3 removed axis=1 on DataFrame.groupby; group columns through transpose.
+            sku_units = units_wide.T.groupby(level=0).sum().T
+            active = (sku_units > 0).sum(axis=1)
             return active.astype(float)
         if pool.allocation_driver == "complexity":
             if units_wide.empty:
