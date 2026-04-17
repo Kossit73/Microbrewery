@@ -150,3 +150,35 @@ def test_all_in_one_aggregates_other_income_items():
 
     result = model.run()
     assert result.monthly["other_income"].tolist() == [150.0, 150.0]
+
+
+def test_all_in_one_handles_empty_sales_plan_without_alignment_error():
+    skus = pd.DataFrame(
+        [
+            {
+                "sku_id": 1,
+                "name": "Test SKU",
+                "direct_cost_per_unit": 2.10,
+                "markup_pct": 0.65,
+                "relative_opex_weight": 1.0,
+            }
+        ]
+    )
+    channels = pd.DataFrame([{"channel": "Retail", "price_factor": 1.0}])
+    empty_sales = pd.DataFrame(columns=["date", "sku_id", "channel", "units"])
+
+    model = MicrobreweryFinancialModel(
+        ModelConfig(start_date="2025-01-01", months=2, pricing_cost_basis_month=0, cost_inflation_annual=0.0),
+        DividendPolicy(enabled=False),
+        ModelInputs(
+            skus=skus,
+            channels=channels,
+            sales_plan=empty_sales,
+            cost_pools=[
+                CostPoolInput(name="Admin", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=0.0),
+            ],
+        ),
+    )
+
+    result = model.run()
+    assert result.monthly["revenue"].tolist() == [0.0, 0.0]

@@ -365,7 +365,10 @@ class MicrobreweryFinancialModel:
         sales = self._expand_sales_plan_to_monthly(idx)
         sales = sales[sales["date"].isin(idx)].copy()
         if sales.empty:
-            return pd.DataFrame(index=idx)
+            return pd.DataFrame(
+                index=idx,
+                columns=pd.MultiIndex.from_tuples([], names=["sku_id", "channel"]),
+            )
 
         wide = (
             sales.pivot_table(
@@ -868,8 +871,15 @@ class MicrobreweryFinancialModel:
         # Units, prices, revenue
         units_wide = self._units_matrix(idx)
         prices_wide = self._prices_matrix(idx, units_wide)
+        if isinstance(units_wide.columns, pd.MultiIndex):
+            units_wide.columns = units_wide.columns.set_names(["sku_id", "channel"])
+        if isinstance(prices_wide.columns, pd.MultiIndex):
+            prices_wide.columns = prices_wide.columns.set_names(["sku_id", "channel"])
 
-        revenue_wide = units_wide.mul(prices_wide, fill_value=0.0)
+        if units_wide.empty:
+            revenue_wide = pd.DataFrame(index=idx, columns=units_wide.columns)
+        else:
+            revenue_wide = units_wide.mul(prices_wide, fill_value=0.0)
         revenue = revenue_wide.sum(axis=1).rename("revenue")
 
         other_income = self._other_income_series(idx)
