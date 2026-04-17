@@ -331,14 +331,17 @@ class MicrobreweryFinancialModel:
     # ---------- sales ----------
     def _expand_sales_plan_to_monthly(self, idx: pd.DatetimeIndex) -> pd.DataFrame:
         sales = self.inputs.sales_plan.copy()
-        sales["date"] = pd.to_datetime(sales["date"])
+        sales["date"] = pd.to_datetime(sales["date"], errors="coerce")
+        sales = sales.dropna(subset=["date"])
         freq = self.inputs.sales_plan_frequency
         if freq == "monthly":
             return sales
 
         rows: List[Dict[str, object]] = []
         for _, r in sales.iterrows():
-            date = pd.to_datetime(r["date"])
+            date = pd.to_datetime(r["date"], errors="coerce")
+            if pd.isna(date):
+                continue
             if freq == "quarterly":
                 start = date.to_period("Q").start_time
                 months = pd.date_range(start=start, periods=3, freq="MS")
