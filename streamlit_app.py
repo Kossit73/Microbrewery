@@ -356,6 +356,106 @@ def _non_empty_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(how="all").copy()
 
 
+def _expand_sales_plan_to_monthly(sales_df: pd.DataFrame, frequency: str) -> pd.DataFrame:
+    if sales_df is None or sales_df.empty:
+        return pd.DataFrame(columns=["date", "sku_id", "channel", "units"])
+    base = sales_df.copy()
+    if "date" not in base.columns:
+        return pd.DataFrame(columns=["date", "sku_id", "channel", "units"])
+    base["date"] = pd.to_datetime(base["date"], errors="coerce")
+    base["units"] = pd.to_numeric(base.get("units", 0.0), errors="coerce").fillna(0.0)
+    base = base.dropna(subset=["date"])
+    if frequency == "monthly":
+        return base[["date", "sku_id", "channel", "units"]].copy()
+
+    rows = []
+    for _, r in base.iterrows():
+        dt = pd.to_datetime(r["date"])
+        if frequency == "quarterly":
+            start = dt.to_period("Q").start_time
+            month_points = pd.date_range(start=start, periods=3, freq="MS")
+        else:
+            start = dt.to_period("Y").start_time
+            month_points = pd.date_range(start=start, periods=12, freq="MS")
+        portion = float(r["units"]) / max(len(month_points), 1)
+        for month_dt in month_points:
+            rows.append(
+                {
+                    "date": month_dt,
+                    "sku_id": r.get("sku_id"),
+                    "channel": r.get("channel"),
+                    "units": portion,
+                }
+            )
+    return pd.DataFrame(rows, columns=["date", "sku_id", "channel", "units"])
+
+
+def _compress_monthly_sales_plan(monthly_df: pd.DataFrame, frequency: str) -> pd.DataFrame:
+    if monthly_df is None or monthly_df.empty:
+        return pd.DataFrame(columns=["date", "sku_id", "channel", "units"])
+    out = monthly_df.copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out["units"] = pd.to_numeric(out.get("units", 0.0), errors="coerce").fillna(0.0)
+    out = out.dropna(subset=["date"])
+    if frequency == "monthly":
+        out["date"] = out["date"].dt.to_period("M").dt.start_time
+    elif frequency == "quarterly":
+        out["date"] = out["date"].dt.to_period("Q").dt.start_time
+    else:
+        out["date"] = out["date"].dt.to_period("Y").dt.start_time
+    out = (
+        out.groupby(["date", "sku_id", "channel"], dropna=False, as_index=False)["units"]
+        .sum()
+        .sort_values(["date", "sku_id", "channel"])
+        .reset_index(drop=True)
+    )
+    return out
+
+
+def _sales_plan_editor_view(sales_df: pd.DataFrame, frequency: str) -> pd.DataFrame:
+    if sales_df is None or sales_df.empty:
+        label = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}[frequency]
+        return pd.DataFrame(columns=[label, "sku_id", "channel", "units"])
+    view = sales_df.copy()
+    view["date"] = pd.to_datetime(view["date"], errors="coerce")
+    if frequency == "monthly":
+        view.insert(0, "month", view["date"].dt.to_period("M").astype(str))
+        view = view.drop(columns=["date"])
+    elif frequency == "quarterly":
+        view.insert(0, "quarter", view["date"].dt.to_period("Q").astype(str).str.replace("Q", "-Q", regex=False))
+        view = view.drop(columns=["date"])
+    else:
+        view.insert(0, "year", view["date"].dt.year.astype("Int64").astype(str))
+        view = view.drop(columns=["date"])
+    return view
+
+
+def _sales_plan_editor_view_to_base(view_df: pd.DataFrame, frequency: str) -> pd.DataFrame:
+    if view_df is None or view_df.empty:
+        return pd.DataFrame(columns=["date", "sku_id", "channel", "units"])
+    out = view_df.copy()
+    if frequency == "monthly":
+        out["date"] = pd.to_datetime(out.get("month"), errors="coerce").dt.to_period("M").dt.start_time
+        out = out.drop(columns=["month"], errors="ignore")
+    elif frequency == "quarterly":
+        quarter_raw = out.get("quarter").astype(str).str.upper().str.replace(" ", "", regex=False).str.replace("-Q", "Q", regex=False)
+        extracted = quarter_raw.str.extract(r"(?P<year>\d{4})Q(?P<q>[1-4])")
+        year = pd.to_numeric(extracted["year"], errors="coerce")
+        q = pd.to_numeric(extracted["q"], errors="coerce")
+        month = ((q - 1) * 3 + 1).astype("Int64")
+        out["date"] = pd.to_datetime(
+            year.astype("Int64").astype(str) + "-" + month.astype(str).str.zfill(2) + "-01",
+            errors="coerce",
+        )
+        out = out.drop(columns=["quarter"], errors="ignore")
+    else:
+        year_numeric = pd.to_numeric(out.get("year"), errors="coerce").fillna(0).astype(int)
+        out["date"] = pd.to_datetime(year_numeric.astype(str) + "-01-01", errors="coerce")
+        out = out.drop(columns=["year"], errors="ignore")
+    out["units"] = pd.to_numeric(out.get("units", 0.0), errors="coerce")
+    return out[["date", "sku_id", "channel", "units"]]
+
+
 def _dynamic_table_editor(title: str, key: str, default_df: pd.DataFrame, label: str = "row") -> pd.DataFrame:
     data_key = f"dyn_data_{key}"
     saved_key = f"dyn_saved_{key}"
@@ -514,6 +614,50 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
         debt_facilities=debt_facilities,
         equity_injections=equity_injections,
     )
+
+
+def _sales_plan_assumption_editor(base_sales_plan: pd.DataFrame, base_frequency: str) -> pd.DataFrame:
+    frequency_options = {"Monthly": "monthly", "Quarterly": "quarterly", "Yearly": "yearly"}
+    reverse_options = {v: k for k, v in frequency_options.items()}
+
+    if "assump_sales_plan_frequency" not in st.session_state:
+        st.session_state["assump_sales_plan_frequency"] = base_frequency
+    current_frequency = str(st.session_state["assump_sales_plan_frequency"])
+    if current_frequency not in reverse_options:
+        current_frequency = "monthly"
+
+    selected_label = st.selectbox(
+        "Sales plan frequency",
+        options=list(frequency_options.keys()),
+        index=list(frequency_options.values()).index(current_frequency),
+        key="assump_sales_plan_frequency_selector",
+        help="Sales plan schedule granularity shown in the table and used by the model.",
+    )
+    selected_frequency = frequency_options[selected_label]
+
+    previous_frequency = str(st.session_state.get("assump_prev_sales_plan_frequency", current_frequency))
+    canonical_plan = _non_empty_rows(st.session_state.get("assump_data_sales_plan", base_sales_plan)).copy()
+    if canonical_plan is None:
+        canonical_plan = base_sales_plan.copy()
+
+    if selected_frequency != previous_frequency:
+        monthly = _expand_sales_plan_to_monthly(canonical_plan, previous_frequency)
+        canonical_plan = _compress_monthly_sales_plan(monthly, selected_frequency)
+        st.session_state["assump_data_sales_plan"] = canonical_plan.copy()
+        st.session_state["assump_saved_sales_plan"] = canonical_plan.copy()
+        st.session_state["assump_work_sales_plan"] = canonical_plan.copy()
+        st.session_state["assump_edit_sales_plan"] = False
+
+    st.session_state["assump_sales_plan_frequency"] = selected_frequency
+    st.session_state["assump_prev_sales_plan_frequency"] = selected_frequency
+
+    view_df = _sales_plan_editor_view(canonical_plan, selected_frequency)
+    edited_view = _assumption_editor("Sales plan", "sales_plan", view_df)
+    edited_base = _sales_plan_editor_view_to_base(edited_view, selected_frequency)
+    st.session_state["assump_data_sales_plan"] = edited_base.copy()
+    if not st.session_state.get("assump_edit_sales_plan", False):
+        st.session_state["assump_saved_sales_plan"] = edited_base.copy()
+    return edited_base
 
 
 def _valuation_section(result) -> None:
@@ -1430,20 +1574,7 @@ def main() -> None:
         _assumption_editor("Dividend assumptions", "dividend", dividend_df)
         _assumption_editor("SKUs", "skus", inputs.skus)
         _assumption_editor("Channels", "channels", inputs.channels)
-        sales_plan_freq_labels = {"monthly": "Monthly", "quarterly": "Quarterly", "yearly": "Yearly"}
-        label_to_value = {v: k for k, v in sales_plan_freq_labels.items()}
-        current_sales_plan_frequency = str(st.session_state.get("assump_sales_plan_frequency", inputs.sales_plan_frequency))
-        if current_sales_plan_frequency not in sales_plan_freq_labels:
-            current_sales_plan_frequency = "monthly"
-        selected_frequency_label = st.selectbox(
-            "Sales plan frequency",
-            options=["Monthly", "Quarterly", "Yearly"],
-            index=["Monthly", "Quarterly", "Yearly"].index(sales_plan_freq_labels[current_sales_plan_frequency]),
-            key="assump_sales_plan_frequency_selector",
-            help="How each sales-plan row is expanded before monthly model calculations run.",
-        )
-        st.session_state["assump_sales_plan_frequency"] = label_to_value[selected_frequency_label]
-        _assumption_editor("Sales plan", "sales_plan", inputs.sales_plan)
+        _sales_plan_assumption_editor(inputs.sales_plan, inputs.sales_plan_frequency)
         _assumption_editor("Cost pools", "cost_pools", cost_pool_df)
         _assumption_editor("Other income monthly", "other_income", other_income_df)
         _assumption_editor("CAPEX schedule", "capex", capex_df)
