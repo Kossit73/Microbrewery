@@ -84,21 +84,21 @@ def _build_sample_assumptions(
             {
                 "sku_id": 1,
                 "name": "Pale Ale 330ml",
-                "direct_cost_per_unit": 2.10,
+                "direct_cost_per_unit": 0.0,
                 "markup_pct": 0.65,
                 "relative_opex_weight": 1.0,
             },
             {
                 "sku_id": 2,
                 "name": "Pilsner 500ml",
-                "direct_cost_per_unit": 2.60,
+                "direct_cost_per_unit": 0.0,
                 "markup_pct": 0.60,
                 "relative_opex_weight": 1.1,
             },
             {
                 "sku_id": 3,
                 "name": "Hazy IPA 440ml",
-                "direct_cost_per_unit": 2.85,
+                "direct_cost_per_unit": 0.0,
                 "markup_pct": 0.72,
                 "relative_opex_weight": 1.25,
             },
@@ -1605,6 +1605,7 @@ def main() -> None:
 
         _assumption_editor("Model config assumptions", "config", config_df)
         _assumption_editor("Dividend assumptions", "dividend", dividend_df)
+        st.caption("`direct_cost_per_unit` is derived from direct cost pools. Use `direct_cost_per_unit_override` only for explicit manual overrides.")
         _assumption_editor("SKUs", "skus", inputs.skus)
         _assumption_editor("Channels", "channels", inputs.channels)
         _sales_plan_assumption_editor(inputs.sales_plan, inputs.sales_plan_frequency)

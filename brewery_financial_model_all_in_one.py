@@ -176,7 +176,8 @@ class ModelInputs:
     """
     Required inputs:
     - skus: DataFrame with at minimum:
-        sku_id (unique), name, direct_cost_per_unit, markup_pct, relative_opex_weight (optional)
+        sku_id (unique), name, markup_pct, relative_opex_weight (optional)
+      direct_cost_per_unit is derived from direct cost pools unless explicit override is provided.
     - channels: DataFrame with at minimum:
         channel (unique), price_factor
     - sales_plan: DataFrame with columns:
@@ -236,11 +237,15 @@ class MicrobreweryFinancialModel:
         channels = self.inputs.channels.copy()
         sales = self.inputs.sales_plan.copy()
 
-        required_sku_cols = {"sku_id", "name", "direct_cost_per_unit", "markup_pct"}
+        required_sku_cols = {"sku_id", "name", "markup_pct"}
         missing = required_sku_cols - set(skus.columns)
         if missing:
             raise ValueError(f"skus is missing columns: {sorted(missing)}")
 
+        if "direct_cost_per_unit" not in skus.columns:
+            skus["direct_cost_per_unit"] = 0.0
+        if "direct_cost_per_unit_override" not in skus.columns:
+            skus["direct_cost_per_unit_override"] = np.nan
         if "relative_opex_weight" not in skus.columns:
             skus["relative_opex_weight"] = 1.0
         else:
@@ -263,15 +268,20 @@ class MicrobreweryFinancialModel:
         sales["units"] = pd.to_numeric(sales["units"], errors="coerce")
 
         # Enforce numeric columns to avoid object-dtype arithmetic TypeErrors.
-        sku_numeric_cols = ["direct_cost_per_unit", "markup_pct", "relative_opex_weight"]
+        sku_numeric_cols = ["direct_cost_per_unit", "direct_cost_per_unit_override", "markup_pct", "relative_opex_weight"]
         for col in sku_numeric_cols:
             skus[col] = pd.to_numeric(skus[col], errors="coerce")
+        skus["direct_cost_per_unit_override"] = skus["direct_cost_per_unit_override"].where(
+            skus["direct_cost_per_unit_override"].notna(),
+            np.nan,
+        )
         channels["price_factor"] = pd.to_numeric(channels["price_factor"], errors="coerce")
 
-        if skus[sku_numeric_cols].isna().any().any():
-            bad_rows = skus.loc[skus[sku_numeric_cols].isna().any(axis=1), ["sku_id", "name"]].to_dict("records")
+        required_numeric = ["direct_cost_per_unit", "markup_pct", "relative_opex_weight"]
+        if skus[required_numeric].isna().any().any():
+            bad_rows = skus.loc[skus[required_numeric].isna().any(axis=1), ["sku_id", "name"]].to_dict("records")
             raise ValueError(
-                "skus has non-numeric values in direct_cost_per_unit/markup_pct/relative_opex_weight "
+                "skus has non-numeric values in direct_cost_per_unit/direct_cost_per_unit_override/markup_pct/relative_opex_weight "
                 f"for rows: {bad_rows}"
             )
         if channels["price_factor"].isna().any():
@@ -391,7 +401,12 @@ class MicrobreweryFinancialModel:
         cols: List[Tuple[int, str]] = []
         data: List[np.ndarray] = []
         for sku_id, row in skus.iterrows():
-            base_price = float(row["direct_cost_per_unit"]) * (1.0 + float(row["markup_pct"]))
+            base_direct_cost = float(row.get("direct_cost_per_unit_override", np.nan))
+            if not np.isfinite(base_direct_cost) or base_direct_cost <= 0:
+                base_direct_cost = float(row.get("direct_cost_per_unit", 0.0))
+            if not np.isfinite(base_direct_cost) or base_direct_cost <= 0:
+                base_direct_cost = 1.0
+            base_price = base_direct_cost * (1.0 + float(row["markup_pct"]))
             for ch, ch_row in channels.iterrows():
                 cols.append((sku_id, ch))
                 data.append(np.full(len(idx), base_price * float(ch_row["price_factor"])))
@@ -490,6 +505,46 @@ class MicrobreweryFinancialModel:
 
     def _direct_cost_pool_monthly(self, idx: pd.DatetimeIndex, units_wide: pd.DataFrame, revenue_wide: pd.DataFrame) -> pd.DataFrame:
         return self._cost_pool_monthly_by_type(idx, units_wide, revenue_wide, "direct")
+
+    def _allocate_monthly_pool_to_sku(
+        self,
+        idx: pd.DatetimeIndex,
+        units_wide: pd.DataFrame,
+        pool_monthly: pd.DataFrame,
+    ) -> pd.DataFrame:
+        sku_index = self.inputs.skus["sku_id"]
+        if pool_monthly.empty or units_wide.empty:
+            return pd.DataFrame(0.0, index=idx, columns=sku_index)
+        sku_units = units_wide.T.groupby(level=0).sum().T.reindex(idx).fillna(0.0)
+        sku_units = sku_units.reindex(columns=sku_index, fill_value=0.0)
+        weights = self.inputs.skus.set_index("sku_id")["relative_opex_weight"].reindex(sku_index).fillna(1.0)
+        weighted = sku_units.mul(weights, axis=1)
+        denom = weighted.sum(axis=1).replace(0.0, np.nan)
+        shares = weighted.div(denom, axis=0).fillna(0.0)
+        total_pool = pool_monthly.sum(axis=1).reindex(idx).fillna(0.0)
+        return shares.mul(total_pool, axis=0)
+
+    def _derived_direct_cost_per_unit_by_sku(self, idx: pd.DatetimeIndex, units_wide: pd.DataFrame) -> pd.Series:
+        skus = self.inputs.skus.set_index("sku_id")
+        revenue_proxy = self._estimated_revenue_wide_from_units(idx, units_wide)
+        direct_pool_monthly = self._direct_cost_pool_monthly(idx, units_wide, revenue_proxy)
+        allocated = self._allocate_monthly_pool_to_sku(idx, units_wide, direct_pool_monthly)
+
+        basis_m = int(np.clip(self.cfg.pricing_cost_basis_month, 0, len(idx) - 1))
+        basis_date = idx[basis_m]
+        if units_wide.empty:
+            units_sku = pd.Series(0.0, index=skus.index)
+        else:
+            units_sku = units_wide.loc[basis_date].groupby(level=0).sum().reindex(skus.index).fillna(0.0)
+        per_unit = allocated.loc[basis_date].reindex(skus.index).fillna(0.0) / units_sku.replace(0.0, np.nan)
+        per_unit = per_unit.fillna(0.0)
+        overrides = pd.to_numeric(skus.get("direct_cost_per_unit_override"), errors="coerce")
+        per_unit = per_unit.where(~overrides.notna(), overrides)
+        per_unit = per_unit.fillna(0.0).rename("direct_cost_per_unit")
+        self.inputs.skus = self.inputs.skus.set_index("sku_id")
+        self.inputs.skus["direct_cost_per_unit"] = per_unit
+        self.inputs.skus = self.inputs.skus.reset_index()
+        return per_unit
 
     # ---------- pricing ----------
     @staticmethod
@@ -591,7 +646,8 @@ class MicrobreweryFinancialModel:
         opex_per_unit = alloc / units_sku.replace(0.0, np.nan)
         opex_per_unit = opex_per_unit.fillna(0.0)
 
-        direct_cost_basis = skus["direct_cost_per_unit"] * cost_index.loc[basis_date]
+        derived_direct_cost_per_unit = self._derived_direct_cost_per_unit_by_sku(idx, units_wide)
+        direct_cost_basis = derived_direct_cost_per_unit * cost_index.loc[basis_date]
         total_cost_basis = direct_cost_basis + opex_per_unit
         base_price = total_cost_basis * (1.0 + skus["markup_pct"])
 
@@ -896,6 +952,7 @@ class MicrobreweryFinancialModel:
 
         # Direct costs
         skus = self.inputs.skus.set_index("sku_id")
+        derived_direct_cost_per_unit = self._derived_direct_cost_per_unit_by_sku(idx, units_wide)
         if units_wide.empty:
             direct_costs = pd.Series(0.0, index=idx, name="direct_costs")
         else:
@@ -904,7 +961,7 @@ class MicrobreweryFinancialModel:
             for sku_id, row in skus.iterrows():
                 for channel in self.inputs.channels["channel"].tolist():
                     cost_cols.append((sku_id, channel))
-                    series = float(row["direct_cost_per_unit"]) * cost_idx.values
+                    series = float(derived_direct_cost_per_unit.get(sku_id, 0.0)) * cost_idx.values
                     cost_data.append(series)
             costs_wide = pd.DataFrame(
                 np.array(cost_data).T,
@@ -914,11 +971,6 @@ class MicrobreweryFinancialModel:
 
             direct_costs_wide = units_wide.mul(costs_wide, fill_value=0.0)
             direct_costs = direct_costs_wide.sum(axis=1).rename("direct_costs")
-
-        # Add direct cost pools (unit/fixed/step/blended) on top of SKU base direct costs.
-        direct_pool_monthly = self._direct_cost_pool_monthly(idx, units_wide, revenue_wide)
-        if not direct_pool_monthly.empty:
-            direct_costs = (direct_costs + (direct_pool_monthly.sum(axis=1) * cost_idx)).rename("direct_costs")
 
         gross_profit = (revenue - direct_costs).rename("gross_profit")
 
@@ -1218,8 +1270,8 @@ def main() -> None:
     # ----------------------------
     skus = pd.DataFrame(
         [
-            {"sku_id": 1, "name": "Pale Ale 330ml", "direct_cost_per_unit": 2.10, "markup_pct": 0.65, "relative_opex_weight": 1.0},
-            {"sku_id": 2, "name": "Pilsner 500ml", "direct_cost_per_unit": 2.60, "markup_pct": 0.60, "relative_opex_weight": 1.1},
+            {"sku_id": 1, "name": "Pale Ale 330ml", "direct_cost_per_unit": 0.0, "markup_pct": 0.65, "relative_opex_weight": 1.0},
+            {"sku_id": 2, "name": "Pilsner 500ml", "direct_cost_per_unit": 0.0, "markup_pct": 0.60, "relative_opex_weight": 1.1},
         ]
     )
 

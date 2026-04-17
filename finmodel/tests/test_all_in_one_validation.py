@@ -243,3 +243,66 @@ def test_all_in_one_handles_missing_sku_and_channel_columns_in_driver_xs_paths()
 
     result = model.run()
     assert "opex" in result.monthly.columns
+
+
+def test_all_in_one_derives_direct_cost_per_unit_from_direct_pools():
+    skus = pd.DataFrame(
+        [
+            {
+                "sku_id": 1,
+                "name": "Test SKU",
+                "markup_pct": 0.65,
+                "relative_opex_weight": 1.0,
+            }
+        ]
+    )
+    channels = pd.DataFrame([{"channel": "Retail", "price_factor": 1.0}])
+    sales = pd.DataFrame([{"date": "2025-01-01", "sku_id": 1, "channel": "Retail", "units": 100.0}])
+
+    model = MicrobreweryFinancialModel(
+        ModelConfig(start_date="2025-01-01", months=1, pricing_cost_basis_month=0, cost_inflation_annual=0.0),
+        DividendPolicy(enabled=False),
+        ModelInputs(
+            skus=skus,
+            channels=channels,
+            sales_plan=sales,
+            cost_pools=[
+                CostPoolInput(name="Direct Variable Pool", cost_type="direct", behavior="variable", allocation_driver="units", unit_variable_cost=2.0),
+            ],
+        ),
+    )
+
+    result = model.run()
+    assert result.monthly["direct_costs"].tolist() == [200.0]
+
+
+def test_all_in_one_allows_direct_cost_override():
+    skus = pd.DataFrame(
+        [
+            {
+                "sku_id": 1,
+                "name": "Test SKU",
+                "markup_pct": 0.65,
+                "relative_opex_weight": 1.0,
+                "direct_cost_per_unit_override": 3.0,
+            }
+        ]
+    )
+    channels = pd.DataFrame([{"channel": "Retail", "price_factor": 1.0}])
+    sales = pd.DataFrame([{"date": "2025-01-01", "sku_id": 1, "channel": "Retail", "units": 100.0}])
+
+    model = MicrobreweryFinancialModel(
+        ModelConfig(start_date="2025-01-01", months=1, pricing_cost_basis_month=0, cost_inflation_annual=0.0),
+        DividendPolicy(enabled=False),
+        ModelInputs(
+            skus=skus,
+            channels=channels,
+            sales_plan=sales,
+            cost_pools=[
+                CostPoolInput(name="Direct Variable Pool", cost_type="direct", behavior="variable", allocation_driver="units", unit_variable_cost=2.0),
+            ],
+        ),
+    )
+
+    result = model.run()
+    assert result.monthly["direct_costs"].tolist() == [300.0]
