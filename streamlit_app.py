@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import replace
 import io
 import json
+from pathlib import Path
 import urllib.parse
 import urllib.request
 from typing import Tuple
@@ -31,6 +32,28 @@ from brewery_financial_model_all_in_one import (
     ModelInputs,
     phase_growth_series,
 )
+
+
+MODEL_CHANGE_SUMMARY_PATH = Path(__file__).resolve().parent / "docs" / "MODEL_CHANGE_SUMMARY.md"
+
+
+def _load_model_change_summary() -> str:
+    if MODEL_CHANGE_SUMMARY_PATH.exists():
+        return MODEL_CHANGE_SUMMARY_PATH.read_text(encoding="utf-8")
+    return (
+        "## Model Change Summary\n\n"
+        "The detailed summary document is not available in this environment. "
+        "Please ensure `docs/MODEL_CHANGE_SUMMARY.md` exists in the repository."
+    )
+
+
+def _about_methodology_panel() -> None:
+    st.subheader("About / Methodology")
+    st.caption(
+        "This panel explains recent model architecture changes, allocation methodology, "
+        "assumptions, limitations, and validation checks."
+    )
+    st.markdown(_load_model_change_summary())
 
 
 def _build_sample_assumptions(
@@ -1144,11 +1167,12 @@ def main() -> None:
         "assumptions, and download the resulting statements."
     )
 
-    tab_assumptions, tab_results, tab_key_analytics, tab_ai_decision = st.tabs([
+    tab_assumptions, tab_results, tab_key_analytics, tab_ai_decision, tab_about_methodology = st.tabs([
         "Core Assumptions",
         "Results",
         "Key Analytics",
         "AI Decision Making",
+        "About / Methodology",
     ])
 
     with tab_assumptions:
@@ -1276,6 +1300,9 @@ def main() -> None:
 
     with tab_ai_decision:
         _ai_decision_making_page(result, inputs, cfg, div)
+
+    with tab_about_methodology:
+        _about_methodology_panel()
 
     with tab_assumptions:
         st.divider()
