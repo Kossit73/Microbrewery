@@ -90,6 +90,7 @@ class SKUOpexAllocation:
     total_allocated_opex: float
     opex_per_unit: float
     opex_per_liter: float
+    opex_per_case: float
     by_pool: Dict[str, float] = field(default_factory=dict)
 
 
@@ -100,6 +101,7 @@ class OpexAllocationSummary:
     total_allocated_opex: float
     reconciliation_gap: float
     by_pool_totals: Dict[str, float] = field(default_factory=dict)
+    by_driver_type_totals: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass

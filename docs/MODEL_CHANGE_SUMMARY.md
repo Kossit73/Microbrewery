@@ -48,6 +48,9 @@ These include driver mappings and blended/step logic where applicable.
 - `allocate_opex()`
 - `opex_metrics_by_sku_and_year()`
 - `reconcile_opex_allocation()`
+- `opex_by_pool_view()`
+- `opex_by_driver_type_view()`
+- `opex_by_product_view()`
 
 Default pool generation is wired into model flow when custom pools are not provided.
 

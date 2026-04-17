@@ -113,6 +113,9 @@ contexts = model.opex_contexts_by_sku_and_year()
 allocation_report = model.allocate_opex()
 metrics = model.opex_metrics_by_sku_and_year()
 recon = model.reconcile_opex_allocation()
+pool_view = model.opex_by_pool_view()
+driver_view = model.opex_by_driver_type_view()
+product_view = model.opex_by_product_view()
 ```
 
 ### Cost pools and driver mappings
@@ -130,6 +133,11 @@ Blended rules are supported (for example 70% liters / 20% units / 10% complexity
 1. Build or edit `OpexCostPool` entries (driver, scope, classification, annual amounts).
 2. Add optional blended `OpexAllocationRule` weights.
 3. Pass custom pools to `model.allocate_opex(pools=...)`.
+
+### Three output views (recommended)
+- **A. OPEX by pool:** `model.opex_by_pool_view()`
+- **B. OPEX by driver type:** `model.opex_by_driver_type_view()`
+- **C. OPEX by product:** `model.opex_by_product_view()` (includes per-unit, per-liter, per-case, and fully loaded gross margin metrics).
 
 ## Making the brewery model more detailed
 

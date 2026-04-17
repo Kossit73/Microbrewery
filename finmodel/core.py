@@ -406,11 +406,25 @@ class MicrobreweryFinancialModel:
     def opex_metrics_by_sku_and_year(self) -> Dict[int, Dict[str, Dict[str, float]]]:
         report = self.allocate_opex()
         out: Dict[int, Dict[str, Dict[str, float]]] = {}
+        revenue = self.revenue_by_sku_and_year()
         for row in report.allocations:
+            sku_name = row.sku_name
+            year_revenue = float(revenue.get(sku_name, {}).get(row.year, 0.0))
+            direct_cost = 0.0
+            for sku in self.skus:
+                if sku.sku_id == row.sku_id:
+                    idx = self.year_to_index(row.year) - 1
+                    infl = (1.0 + self.general.cost_inflation) ** max(idx, 0)
+                    units = float(sku.annual_units.get(row.year, 0.0))
+                    direct_cost = units * float(sku.direct_cost_year1_per_sku) * infl
+                    break
+            fully_loaded_margin = ((year_revenue - direct_cost - row.total_allocated_opex) / year_revenue) if year_revenue > 0 else 0.0
             out.setdefault(row.sku_id, {})[row.year] = {
                 "total_allocated_opex": row.total_allocated_opex,
                 "opex_per_unit": row.opex_per_unit,
                 "opex_per_liter": row.opex_per_liter,
+                "opex_per_case": row.opex_per_case,
+                "fully_loaded_gross_margin": fully_loaded_margin,
             }
         return out
 
@@ -424,6 +438,17 @@ class MicrobreweryFinancialModel:
             }
             for s in report.summaries
         }
+
+    def opex_by_pool_view(self) -> Dict[str, Dict[str, float]]:
+        report = self.allocate_opex()
+        return {s.year: s.by_pool_totals for s in report.summaries}
+
+    def opex_by_driver_type_view(self) -> Dict[str, Dict[str, float]]:
+        report = self.allocate_opex()
+        return {s.year: s.by_driver_type_totals for s in report.summaries}
+
+    def opex_by_product_view(self) -> Dict[int, Dict[str, Dict[str, float]]]:
+        return self.opex_metrics_by_sku_and_year()
 
     def preserved_source(self) -> Dict[str, object]:
         return {"worksheets": WORKSHEETS, "raw_pdf_pages": RAW_PDF_PAGES}

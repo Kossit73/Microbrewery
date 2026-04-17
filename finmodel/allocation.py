@@ -111,6 +111,7 @@ def allocate_opex_by_drivers(years: List[str], sku_contexts: List[SKUCostContext
 
     for year in years:
         by_pool_totals: Dict[str, float] = {}
+        by_driver_type_totals: Dict[str, float] = defaultdict(float)
         for pool in pools:
             eligible = [ctx for ctx in sku_contexts if _in_scope(pool, ctx)]
             if not eligible:
@@ -120,6 +121,7 @@ def allocate_opex_by_drivers(years: List[str], sku_contexts: List[SKUCostContext
             rules = normalize_rule_weights(pool.rules or [OpexAllocationRule(driver=pool.driver_type, weight=1.0)])
             pool_amount = _pool_amount_for_year(pool, year, eligible)
             by_pool_totals[pool.name] = pool_amount
+            by_driver_type_totals[pool.driver_type.value] += pool_amount
 
             for rule in rules:
                 vectors = {ctx.sku_id: max(_driver_value(ctx, year, pool, rule), 0.0) for ctx in eligible}
@@ -142,6 +144,7 @@ def allocate_opex_by_drivers(years: List[str], sku_contexts: List[SKUCostContext
                 total_allocated_opex=total_alloc,
                 reconciliation_gap=total_pool - total_alloc,
                 by_pool_totals=by_pool_totals,
+                by_driver_type_totals=dict(by_driver_type_totals),
             )
         )
 
@@ -154,6 +157,7 @@ def allocate_opex_by_drivers(years: List[str], sku_contexts: List[SKUCostContext
             liters = float(ctx.liters_sold_by_year.get(year, 0.0))
             opex_per_unit = total / units if units > 0 else 0.0
             opex_per_liter = total / liters if liters > 0 else 0.0
+            opex_per_case = total / (units / 24.0) if units > 0 else 0.0
             allocations.append(
                 SKUOpexAllocation(
                     year=year,
@@ -162,6 +166,7 @@ def allocate_opex_by_drivers(years: List[str], sku_contexts: List[SKUCostContext
                     total_allocated_opex=total,
                     opex_per_unit=opex_per_unit,
                     opex_per_liter=opex_per_liter,
+                    opex_per_case=opex_per_case,
                     by_pool=by_pool,
                 )
             )

@@ -25,6 +25,7 @@ def test_reconciliation_matches_pool_totals_by_year():
     for s in report.summaries:
         assert math.isclose(s.total_pool_opex, s.total_allocated_opex, rel_tol=1e-9, abs_tol=1e-6)
         assert abs(s.reconciliation_gap) <= 1e-6
+        assert math.isclose(sum(s.by_driver_type_totals.values()), s.total_pool_opex, rel_tol=1e-9, abs_tol=1e-6)
 
 
 def test_active_and_inactive_sku_metrics():
@@ -38,6 +39,7 @@ def test_active_and_inactive_sku_metrics():
     active = metrics[active_id]
     assert any(v["opex_per_unit"] >= 0.0 for v in active.values())
     assert any(v["opex_per_liter"] >= 0.0 for v in active.values())
+    assert any(v["opex_per_case"] >= 0.0 for v in active.values())
 
 
 def test_family_and_channel_scope_only_target_matching_rows():
@@ -106,3 +108,14 @@ def test_blended_rule_weights_normalize_and_step_cost_logic():
     for s in report.summaries:
         assert math.isclose(s.total_pool_opex, s.total_allocated_opex, rel_tol=1e-9, abs_tol=1e-6)
         assert s.by_pool_totals["Step Pool"] in {1200.0, 1800.0}
+
+
+def test_three_output_views_are_available():
+    model = build_default_model()
+    pool_view = model.opex_by_pool_view()
+    driver_view = model.opex_by_driver_type_view()
+    product_view = model.opex_by_product_view()
+
+    assert pool_view
+    assert driver_view
+    assert product_view
