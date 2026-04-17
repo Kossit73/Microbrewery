@@ -423,6 +423,7 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
     skus = _non_empty_rows(st.session_state.get("assump_data_skus", base_inputs.skus)).copy()
     channels = _non_empty_rows(st.session_state.get("assump_data_channels", base_inputs.channels)).copy()
     sales_plan = _non_empty_rows(st.session_state.get("assump_data_sales_plan", base_inputs.sales_plan)).copy()
+    sales_plan_frequency = st.session_state.get("assump_sales_plan_frequency", base_inputs.sales_plan_frequency)
 
     cp_src = st.session_state.get("assump_data_cost_pools")
     if isinstance(cp_src, pd.DataFrame):
@@ -506,6 +507,7 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
         skus=skus,
         channels=channels,
         sales_plan=sales_plan,
+        sales_plan_frequency=str(sales_plan_frequency),
         cost_pools=cost_pools,
         other_income_monthly=other_income_monthly,
         capex_items=capex_items,
@@ -1276,6 +1278,17 @@ def main() -> None:
             format_func=lambda x: f"${x:,.0f}",
         )
 
+        current_sales_plan_frequency = str(st.session_state.get("assump_sales_plan_frequency", "monthly"))
+        sales_plan_freq_options = ["monthly", "quarterly", "yearly"]
+        if current_sales_plan_frequency not in sales_plan_freq_options:
+            current_sales_plan_frequency = "monthly"
+        st.session_state["assump_sales_plan_frequency"] = st.selectbox(
+            "Sales plan frequency",
+            options=sales_plan_freq_options,
+            index=sales_plan_freq_options.index(current_sales_plan_frequency),
+            help="How to interpret each sales-plan row before monthly calculations are run.",
+        )
+
     cfg = ModelConfig(
         start_date=f"{int(start_year)}-01-01",
         months=months,
@@ -1428,6 +1441,7 @@ def main() -> None:
         _assumption_editor("Dividend assumptions", "dividend", dividend_df)
         _assumption_editor("SKUs", "skus", inputs.skus)
         _assumption_editor("Channels", "channels", inputs.channels)
+        st.caption(f"Sales plan frequency: `{inputs.sales_plan_frequency}`")
         _assumption_editor("Sales plan", "sales_plan", inputs.sales_plan)
         _assumption_editor("Cost pools", "cost_pools", cost_pool_df)
         _assumption_editor("Other income monthly", "other_income", other_income_df)

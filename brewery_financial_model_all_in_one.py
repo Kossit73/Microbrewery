@@ -183,6 +183,7 @@ class ModelInputs:
     skus: pd.DataFrame
     channels: pd.DataFrame
     sales_plan: pd.DataFrame
+    sales_plan_frequency: Literal["monthly", "quarterly", "yearly"] = "monthly"
 
     other_income_monthly: float | pd.Series = 0.0
     cost_pools: Optional[List[CostPoolInput]] = None
@@ -268,6 +269,8 @@ class MicrobreweryFinancialModel:
         if sales["units"].isna().any():
             bad_sales = sales.loc[sales["units"].isna(), ["date", "sku_id", "channel"]].to_dict("records")
             raise ValueError(f"sales_plan has non-numeric units for rows: {bad_sales}")
+        if self.inputs.sales_plan_frequency not in {"monthly", "quarterly", "yearly"}:
+            raise ValueError("sales_plan_frequency must be one of: monthly, quarterly, yearly")
 
         # Keep normalized copies
         self.inputs.skus = skus
@@ -304,13 +307,37 @@ class MicrobreweryFinancialModel:
         return pd.Series(float(x), index=idx, name=name)
 
     # ---------- sales ----------
+    def _expand_sales_plan_to_monthly(self, idx: pd.DatetimeIndex) -> pd.DataFrame:
+        sales = self.inputs.sales_plan.copy()
+        sales["date"] = pd.to_datetime(sales["date"])
+        freq = self.inputs.sales_plan_frequency
+        if freq == "monthly":
+            return sales
+
+        rows: List[Dict[str, object]] = []
+        for _, r in sales.iterrows():
+            date = pd.to_datetime(r["date"])
+            if freq == "quarterly":
+                start = date.to_period("Q").start_time
+                months = pd.date_range(start=start, periods=3, freq="MS")
+            else:
+                start = date.to_period("Y").start_time
+                months = pd.date_range(start=start, periods=12, freq="MS")
+            months = [m for m in months if m in set(idx)]
+            if not months:
+                continue
+            portion = float(r["units"]) / len(months)
+            for m in months:
+                rows.append({"date": m, "sku_id": r["sku_id"], "channel": r["channel"], "units": portion})
+        return pd.DataFrame(rows)
+
     def _units_matrix(self, idx: pd.DatetimeIndex) -> pd.DataFrame:
         """
         Returns monthly units sold as a wide DataFrame with MultiIndex columns:
             (sku_id, channel)
         Missing combinations are filled with 0.
         """
-        sales = self.inputs.sales_plan.copy()
+        sales = self._expand_sales_plan_to_monthly(idx)
         sales = sales[sales["date"].isin(idx)].copy()
         if sales.empty:
             return pd.DataFrame(index=idx)
