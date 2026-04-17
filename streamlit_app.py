@@ -686,6 +686,53 @@ def _sales_plan_assumption_editor(base_sales_plan: pd.DataFrame, base_frequency:
     return edited_base
 
 
+def _sync_model_timeline_state(cfg: ModelConfig, base_inputs: ModelInputs) -> None:
+    timeline_sig = (str(cfg.start_date), int(cfg.months))
+    previous_sig = st.session_state.get("assump_timeline_signature")
+    if previous_sig == timeline_sig:
+        return
+
+    freq = str(st.session_state.get("assump_sales_plan_frequency", base_inputs.sales_plan_frequency))
+    if freq not in {"monthly", "quarterly", "yearly"}:
+        freq = "monthly"
+    idx = pd.date_range(cfg.start_date, periods=cfg.months, freq="MS")
+
+    canonical_key = "assump_data_sales_plan_base"
+    current_sales = st.session_state.get(canonical_key, base_inputs.sales_plan)
+    current_sales = _non_empty_rows(current_sales).copy() if isinstance(current_sales, pd.DataFrame) else base_inputs.sales_plan.copy()
+
+    monthly_current = _expand_sales_plan_to_monthly(current_sales, freq)
+    monthly_current["date"] = pd.to_datetime(monthly_current.get("date"), errors="coerce")
+    monthly_current = monthly_current[monthly_current["date"].isin(idx)].copy()
+
+    if monthly_current.empty:
+        monthly_current = _expand_sales_plan_to_monthly(base_inputs.sales_plan, base_inputs.sales_plan_frequency)
+        monthly_current = monthly_current[monthly_current["date"].isin(idx)].copy()
+
+    if not monthly_current.empty:
+        combos = monthly_current[["sku_id", "channel"]].drop_duplicates()
+        missing_rows = []
+        existing = set(zip(monthly_current["date"], monthly_current["sku_id"], monthly_current["channel"]))
+        for _, combo in combos.iterrows():
+            sku_id = combo["sku_id"]
+            channel = combo["channel"]
+            for dt in idx:
+                key = (dt, sku_id, channel)
+                if key not in existing:
+                    missing_rows.append({"date": dt, "sku_id": sku_id, "channel": channel, "units": 0.0})
+        if missing_rows:
+            monthly_current = pd.concat([monthly_current, pd.DataFrame(missing_rows)], ignore_index=True)
+        monthly_current = monthly_current.sort_values(["date", "sku_id", "channel"]).reset_index(drop=True)
+
+    canonical_sales = _compress_monthly_sales_plan(monthly_current, freq)
+    st.session_state[canonical_key] = canonical_sales.copy()
+    st.session_state["assump_data_sales_plan"] = _sales_plan_editor_view(canonical_sales, freq)
+    st.session_state["assump_saved_sales_plan"] = st.session_state["assump_data_sales_plan"].copy()
+    st.session_state["assump_work_sales_plan"] = st.session_state["assump_data_sales_plan"].copy()
+    st.session_state["assump_edit_sales_plan"] = False
+    st.session_state["assump_timeline_signature"] = timeline_sig
+
+
 def _valuation_section(result) -> None:
     st.subheader("Valuation summary")
     valuation_df = pd.DataFrame(result.valuation, index=["value"]).T
@@ -1473,8 +1520,6 @@ def main() -> None:
         row = config_table_state.iloc[0]
         cfg = replace(
             cfg,
-            start_date=str(row.get("start_date", cfg.start_date)),
-            months=int(row.get("months", cfg.months)),
             price_inflation_annual=float(row.get("price_inflation_annual", cfg.price_inflation_annual)),
             cost_inflation_annual=float(row.get("cost_inflation_annual", cfg.cost_inflation_annual)),
             tax_rate=float(row.get("tax_rate", cfg.tax_rate)),
@@ -1494,6 +1539,7 @@ def main() -> None:
         )
 
     base_inputs = _build_sample_assumptions(cfg, div)
+    _sync_model_timeline_state(cfg, base_inputs)
     inputs = _build_inputs_from_state(base_inputs)
     model = MicrobreweryFinancialModel(cfg, div, inputs)
     result = model.run()
@@ -1602,6 +1648,11 @@ def main() -> None:
                 for item in (inputs.other_income_items or [])
             ]
         )
+
+        if not st.session_state.get("assump_edit_config", False):
+            st.session_state["assump_data_config"] = config_df.copy()
+            st.session_state["assump_saved_config"] = config_df.copy()
+            st.session_state["assump_work_config"] = config_df.copy()
 
         _assumption_editor("Model config assumptions", "config", config_df)
         _assumption_editor("Dividend assumptions", "dividend", dividend_df)
