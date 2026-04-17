@@ -535,7 +535,7 @@ def _dynamic_table_editor(title: str, key: str, default_df: pd.DataFrame, label:
 def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
     skus = _non_empty_rows(st.session_state.get("assump_data_skus", base_inputs.skus)).copy()
     channels = _non_empty_rows(st.session_state.get("assump_data_channels", base_inputs.channels)).copy()
-    sales_plan = _non_empty_rows(st.session_state.get("assump_data_sales_plan", base_inputs.sales_plan)).copy()
+    sales_plan = _non_empty_rows(st.session_state.get("assump_data_sales_plan_base", base_inputs.sales_plan)).copy()
     sales_plan_frequency = st.session_state.get("assump_sales_plan_frequency", base_inputs.sales_plan_frequency)
 
     cp_src = st.session_state.get("assump_data_cost_pools")
@@ -637,6 +637,7 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
 
 
 def _sales_plan_assumption_editor(base_sales_plan: pd.DataFrame, base_frequency: str) -> pd.DataFrame:
+    canonical_key = "assump_data_sales_plan_base"
     frequency_options = {"Monthly": "monthly", "Quarterly": "quarterly", "Yearly": "yearly"}
     reverse_options = {v: k for k, v in frequency_options.items()}
 
@@ -656,27 +657,32 @@ def _sales_plan_assumption_editor(base_sales_plan: pd.DataFrame, base_frequency:
     selected_frequency = frequency_options[selected_label]
 
     previous_frequency = str(st.session_state.get("assump_prev_sales_plan_frequency", current_frequency))
-    canonical_plan = _non_empty_rows(st.session_state.get("assump_data_sales_plan", base_sales_plan)).copy()
+    if canonical_key not in st.session_state and "assump_data_sales_plan" in st.session_state:
+        st.session_state[canonical_key] = st.session_state.get("assump_data_sales_plan")
+    canonical_plan = _non_empty_rows(st.session_state.get(canonical_key, base_sales_plan)).copy()
     if canonical_plan is None:
         canonical_plan = base_sales_plan.copy()
 
     if selected_frequency != previous_frequency:
         monthly = _expand_sales_plan_to_monthly(canonical_plan, previous_frequency)
         canonical_plan = _compress_monthly_sales_plan(monthly, selected_frequency)
-        st.session_state["assump_data_sales_plan"] = canonical_plan.copy()
-        st.session_state["assump_saved_sales_plan"] = canonical_plan.copy()
-        st.session_state["assump_work_sales_plan"] = canonical_plan.copy()
+        st.session_state[canonical_key] = canonical_plan.copy()
+        st.session_state["assump_data_sales_plan"] = _sales_plan_editor_view(canonical_plan, selected_frequency)
+        st.session_state["assump_saved_sales_plan"] = st.session_state["assump_data_sales_plan"].copy()
+        st.session_state["assump_work_sales_plan"] = st.session_state["assump_data_sales_plan"].copy()
         st.session_state["assump_edit_sales_plan"] = False
 
     st.session_state["assump_sales_plan_frequency"] = selected_frequency
     st.session_state["assump_prev_sales_plan_frequency"] = selected_frequency
 
     view_df = _sales_plan_editor_view(canonical_plan, selected_frequency)
+    if not st.session_state.get("assump_edit_sales_plan", False):
+        st.session_state["assump_data_sales_plan"] = view_df.copy()
+        st.session_state["assump_saved_sales_plan"] = view_df.copy()
+        st.session_state["assump_work_sales_plan"] = view_df.copy()
     edited_view = _assumption_editor("Sales plan", "sales_plan", view_df)
     edited_base = _sales_plan_editor_view_to_base(edited_view, selected_frequency)
-    st.session_state["assump_data_sales_plan"] = edited_base.copy()
-    if not st.session_state.get("assump_edit_sales_plan", False):
-        st.session_state["assump_saved_sales_plan"] = edited_base.copy()
+    st.session_state[canonical_key] = edited_base.copy()
     return edited_base
 
 
