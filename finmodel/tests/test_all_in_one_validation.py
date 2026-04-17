@@ -306,3 +306,49 @@ def test_all_in_one_allows_direct_cost_override():
 
     result = model.run()
     assert result.monthly["direct_costs"].tolist() == [300.0]
+
+
+def test_all_in_one_sales_frequency_totals_are_consistent():
+    skus = pd.DataFrame(
+        [
+            {
+                "sku_id": 1,
+                "name": "Test SKU",
+                "markup_pct": 0.50,
+                "relative_opex_weight": 1.0,
+            }
+        ]
+    )
+    channels = pd.DataFrame([{"channel": "Retail", "price_factor": 1.0}])
+    direct_pool = [CostPoolInput(name="Direct Variable Pool", cost_type="direct", behavior="variable", allocation_driver="units", unit_variable_cost=1.0)]
+
+    monthly_sales = pd.DataFrame([{"date": f"2025-{m:02d}-01", "sku_id": 1, "channel": "Retail", "units": 100.0} for m in range(1, 13)])
+    quarterly_sales = pd.DataFrame(
+        [
+            {"date": "2025-01-01", "sku_id": 1, "channel": "Retail", "units": 300.0},
+            {"date": "2025-04-01", "sku_id": 1, "channel": "Retail", "units": 300.0},
+            {"date": "2025-07-01", "sku_id": 1, "channel": "Retail", "units": 300.0},
+            {"date": "2025-10-01", "sku_id": 1, "channel": "Retail", "units": 300.0},
+        ]
+    )
+    yearly_sales = pd.DataFrame([{"date": "2025-01-01", "sku_id": 1, "channel": "Retail", "units": 1200.0}])
+
+    def run_model(sales_plan: pd.DataFrame, freq: str):
+        model = MicrobreweryFinancialModel(
+            ModelConfig(start_date="2025-01-01", months=12, pricing_cost_basis_month=0, cost_inflation_annual=0.0, price_inflation_annual=0.0),
+            DividendPolicy(enabled=False),
+            ModelInputs(
+                skus=skus.copy(),
+                channels=channels.copy(),
+                sales_plan=sales_plan,
+                sales_plan_frequency=freq,  # type: ignore[arg-type]
+                cost_pools=direct_pool,
+            ),
+        )
+        return model.run()
+
+    monthly_result = run_model(monthly_sales, "monthly")
+    quarterly_result = run_model(quarterly_sales, "quarterly")
+    yearly_result = run_model(yearly_sales, "yearly")
+
+    assert monthly_result.monthly["revenue"].sum() == quarterly_result.monthly["revenue"].sum() == yearly_result.monthly["revenue"].sum()

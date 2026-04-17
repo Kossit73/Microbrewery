@@ -424,6 +424,44 @@ def _compress_monthly_sales_plan(monthly_df: pd.DataFrame, frequency: str) -> pd
     return out
 
 
+def _fill_monthly_sales_plan_to_timeline(
+    monthly_df: pd.DataFrame,
+    idx: pd.DatetimeIndex,
+    fallback_monthly_df: pd.DataFrame,
+) -> pd.DataFrame:
+    monthly = monthly_df.copy()
+    monthly["date"] = pd.to_datetime(monthly.get("date"), errors="coerce")
+    monthly["units"] = pd.to_numeric(monthly.get("units", 0.0), errors="coerce").fillna(0.0)
+    monthly = monthly.dropna(subset=["date"])
+    monthly = monthly[monthly["date"].isin(idx)].copy()
+
+    fallback = fallback_monthly_df.copy()
+    fallback["date"] = pd.to_datetime(fallback.get("date"), errors="coerce")
+    fallback = fallback.dropna(subset=["date"])
+    fallback = fallback[fallback["date"].isin(idx)].copy()
+
+    if monthly.empty:
+        monthly = fallback.copy()
+
+    combos = monthly[["sku_id", "channel"]].drop_duplicates() if not monthly.empty else fallback[["sku_id", "channel"]].drop_duplicates()
+    if combos.empty:
+        return pd.DataFrame(columns=["date", "sku_id", "channel", "units"])
+
+    skeleton_rows = []
+    for _, combo in combos.iterrows():
+        for dt in idx:
+            skeleton_rows.append({"date": dt, "sku_id": combo["sku_id"], "channel": combo["channel"], "units": 0.0})
+    skeleton = pd.DataFrame(skeleton_rows)
+
+    observed = (
+        monthly.groupby(["date", "sku_id", "channel"], as_index=False)["units"]
+        .sum()
+    )
+    merged = skeleton.merge(observed, on=["date", "sku_id", "channel"], how="left", suffixes=("_base", "_obs"))
+    merged["units"] = merged["units_obs"].fillna(merged["units_base"])
+    return merged[["date", "sku_id", "channel", "units"]].sort_values(["date", "sku_id", "channel"]).reset_index(drop=True)
+
+
 def _sales_plan_editor_view(sales_df: pd.DataFrame, frequency: str) -> pd.DataFrame:
     if sales_df is None or sales_df.empty:
         label = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}[frequency]
@@ -636,7 +674,7 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
     )
 
 
-def _sales_plan_assumption_editor(base_sales_plan: pd.DataFrame, base_frequency: str) -> pd.DataFrame:
+def _sales_plan_assumption_editor(base_sales_plan: pd.DataFrame, base_frequency: str, cfg: ModelConfig) -> pd.DataFrame:
     canonical_key = "assump_data_sales_plan_base"
     frequency_options = {"Monthly": "monthly", "Quarterly": "quarterly", "Yearly": "yearly"}
     reverse_options = {v: k for k, v in frequency_options.items()}
@@ -663,8 +701,12 @@ def _sales_plan_assumption_editor(base_sales_plan: pd.DataFrame, base_frequency:
     if canonical_plan is None:
         canonical_plan = base_sales_plan.copy()
 
+    idx = pd.date_range(cfg.start_date, periods=cfg.months, freq="MS")
+    fallback_monthly = _expand_sales_plan_to_monthly(base_sales_plan, base_frequency)
+
     if selected_frequency != previous_frequency:
         monthly = _expand_sales_plan_to_monthly(canonical_plan, previous_frequency)
+        monthly = _fill_monthly_sales_plan_to_timeline(monthly, idx, fallback_monthly)
         canonical_plan = _compress_monthly_sales_plan(monthly, selected_frequency)
         st.session_state[canonical_key] = canonical_plan.copy()
         st.session_state["assump_data_sales_plan"] = _sales_plan_editor_view(canonical_plan, selected_frequency)
@@ -674,6 +716,11 @@ def _sales_plan_assumption_editor(base_sales_plan: pd.DataFrame, base_frequency:
 
     st.session_state["assump_sales_plan_frequency"] = selected_frequency
     st.session_state["assump_prev_sales_plan_frequency"] = selected_frequency
+
+    monthly_for_view = _expand_sales_plan_to_monthly(canonical_plan, selected_frequency)
+    monthly_for_view = _fill_monthly_sales_plan_to_timeline(monthly_for_view, idx, fallback_monthly)
+    canonical_plan = _compress_monthly_sales_plan(monthly_for_view, selected_frequency)
+    st.session_state[canonical_key] = canonical_plan.copy()
 
     view_df = _sales_plan_editor_view(canonical_plan, selected_frequency)
     if not st.session_state.get("assump_edit_sales_plan", False):
@@ -702,27 +749,8 @@ def _sync_model_timeline_state(cfg: ModelConfig, base_inputs: ModelInputs) -> No
     current_sales = _non_empty_rows(current_sales).copy() if isinstance(current_sales, pd.DataFrame) else base_inputs.sales_plan.copy()
 
     monthly_current = _expand_sales_plan_to_monthly(current_sales, freq)
-    monthly_current["date"] = pd.to_datetime(monthly_current.get("date"), errors="coerce")
-    monthly_current = monthly_current[monthly_current["date"].isin(idx)].copy()
-
-    if monthly_current.empty:
-        monthly_current = _expand_sales_plan_to_monthly(base_inputs.sales_plan, base_inputs.sales_plan_frequency)
-        monthly_current = monthly_current[monthly_current["date"].isin(idx)].copy()
-
-    if not monthly_current.empty:
-        combos = monthly_current[["sku_id", "channel"]].drop_duplicates()
-        missing_rows = []
-        existing = set(zip(monthly_current["date"], monthly_current["sku_id"], monthly_current["channel"]))
-        for _, combo in combos.iterrows():
-            sku_id = combo["sku_id"]
-            channel = combo["channel"]
-            for dt in idx:
-                key = (dt, sku_id, channel)
-                if key not in existing:
-                    missing_rows.append({"date": dt, "sku_id": sku_id, "channel": channel, "units": 0.0})
-        if missing_rows:
-            monthly_current = pd.concat([monthly_current, pd.DataFrame(missing_rows)], ignore_index=True)
-        monthly_current = monthly_current.sort_values(["date", "sku_id", "channel"]).reset_index(drop=True)
+    fallback_monthly = _expand_sales_plan_to_monthly(base_inputs.sales_plan, base_inputs.sales_plan_frequency)
+    monthly_current = _fill_monthly_sales_plan_to_timeline(monthly_current, idx, fallback_monthly)
 
     canonical_sales = _compress_monthly_sales_plan(monthly_current, freq)
     st.session_state[canonical_key] = canonical_sales.copy()
@@ -1659,7 +1687,7 @@ def main() -> None:
         st.caption("`direct_cost_per_unit` is derived from direct cost pools. Use `direct_cost_per_unit_override` only for explicit manual overrides.")
         _assumption_editor("SKUs", "skus", inputs.skus)
         _assumption_editor("Channels", "channels", inputs.channels)
-        _sales_plan_assumption_editor(inputs.sales_plan, inputs.sales_plan_frequency)
+        _sales_plan_assumption_editor(inputs.sales_plan, inputs.sales_plan_frequency, cfg)
         _assumption_editor("Cost pools", "cost_pools", cost_pool_df)
         _assumption_editor("Other income items", "other_income", other_income_df)
         _assumption_editor("CAPEX schedule", "capex", capex_df)
