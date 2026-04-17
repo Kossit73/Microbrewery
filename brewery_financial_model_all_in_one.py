@@ -212,6 +212,8 @@ class MicrobreweryFinancialModel:
 
         if "relative_opex_weight" not in skus.columns:
             skus["relative_opex_weight"] = 1.0
+        else:
+            skus["relative_opex_weight"] = skus["relative_opex_weight"].replace("", np.nan).fillna(1.0)
 
         required_channel_cols = {"channel", "price_factor"}
         missing = required_channel_cols - set(channels.columns)
@@ -227,6 +229,26 @@ class MicrobreweryFinancialModel:
         sales["date"] = pd.to_datetime(sales["date"])
         # Make sku_id type consistent
         sales["sku_id"] = sales["sku_id"].astype(skus["sku_id"].dtype, copy=False)
+        sales["units"] = pd.to_numeric(sales["units"], errors="coerce")
+
+        # Enforce numeric columns to avoid object-dtype arithmetic TypeErrors.
+        sku_numeric_cols = ["direct_cost_per_unit", "markup_pct", "relative_opex_weight"]
+        for col in sku_numeric_cols:
+            skus[col] = pd.to_numeric(skus[col], errors="coerce")
+        channels["price_factor"] = pd.to_numeric(channels["price_factor"], errors="coerce")
+
+        if skus[sku_numeric_cols].isna().any().any():
+            bad_rows = skus.loc[skus[sku_numeric_cols].isna().any(axis=1), ["sku_id", "name"]].to_dict("records")
+            raise ValueError(
+                "skus has non-numeric values in direct_cost_per_unit/markup_pct/relative_opex_weight "
+                f"for rows: {bad_rows}"
+            )
+        if channels["price_factor"].isna().any():
+            bad_channels = channels.loc[channels["price_factor"].isna(), "channel"].tolist()
+            raise ValueError(f"channels has non-numeric price_factor for channels: {bad_channels}")
+        if sales["units"].isna().any():
+            bad_sales = sales.loc[sales["units"].isna(), ["date", "sku_id", "channel"]].to_dict("records")
+            raise ValueError(f"sales_plan has non-numeric units for rows: {bad_sales}")
 
         # Keep normalized copies
         self.inputs.skus = skus
