@@ -16,6 +16,9 @@ class OpexDriverType(str, Enum):
     CHANNEL_UNITS = "channel_units"
     STEP_CAPACITY = "step_capacity"
     EXPLICIT_WEIGHT = "explicit_weight"
+    BATCH_COUNT = "batch_count"
+    ORDER_COUNT = "order_count"
+    SHIPMENT_COUNT = "shipment_count"
 
 
 class OpexCostClassification(str, Enum):
@@ -58,6 +61,8 @@ class OpexCostPool:
     allocation_basis_weights: Dict[str, float] = field(default_factory=dict)
     rules: List[OpexAllocationRule] = field(default_factory=list)
     step_fixed_bands: List[StepFixedBand] = field(default_factory=list)
+    two_stage_family_allocation: bool = False
+    second_stage_driver: OpexDriverType = OpexDriverType.UNITS
     notes: str = ""
     trace_metadata: Dict[str, str] = field(default_factory=dict)
 

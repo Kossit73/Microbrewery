@@ -85,7 +85,64 @@ def _driver_value(ctx: SKUCostContext, year: str, pool: OpexCostPool, rule: Opex
     if rule.driver == OpexDriverType.STEP_CAPACITY:
         liters = float(ctx.liters_sold_by_year.get(year, 0.0))
         return _step_capacity_weight(liters, rule)
+    if rule.driver == OpexDriverType.BATCH_COUNT:
+        return float(ctx.batch_count_by_year.get(year, 0.0))
+    if rule.driver == OpexDriverType.ORDER_COUNT:
+        return float(ctx.order_count_by_year.get(year, 0.0))
+    if rule.driver == OpexDriverType.SHIPMENT_COUNT:
+        return float(ctx.shipment_count_by_year.get(year, 0.0))
     return 0.0
+
+
+def _allocate_rule_amount(
+    alloc_map: Dict[int, Dict[str, Dict[str, float]]],
+    eligible: List[SKUCostContext],
+    year: str,
+    pool: OpexCostPool,
+    rule: OpexAllocationRule,
+    rule_amount: float,
+) -> None:
+    if not pool.two_stage_family_allocation:
+        vectors = {ctx.sku_id: max(_driver_value(ctx, year, pool, rule), 0.0) for ctx in eligible}
+        denom = sum(vectors.values())
+        if denom <= 0.0:
+            equal = 1.0 / len(eligible)
+            for ctx in eligible:
+                alloc_map[ctx.sku_id][year][pool.name] = alloc_map[ctx.sku_id][year].get(pool.name, 0.0) + rule_amount * equal
+            return
+        for ctx in eligible:
+            share = vectors[ctx.sku_id] / denom
+            alloc_map[ctx.sku_id][year][pool.name] = alloc_map[ctx.sku_id][year].get(pool.name, 0.0) + rule_amount * share
+        return
+
+    # Two-stage: family split then SKU split inside each family.
+    families: Dict[str, List[SKUCostContext]] = defaultdict(list)
+    for ctx in eligible:
+        families[ctx.product_family].append(ctx)
+
+    family_vectors = {
+        family: sum(max(_driver_value(ctx, year, pool, rule), 0.0) for ctx in members)
+        for family, members in families.items()
+    }
+    fam_denom = sum(family_vectors.values())
+    if fam_denom <= 0.0:
+        family_shares = {family: 1.0 / len(families) for family in families}
+    else:
+        family_shares = {family: value / fam_denom for family, value in family_vectors.items()}
+
+    second_stage_rule = OpexAllocationRule(driver=pool.second_stage_driver, weight=1.0)
+    for family, members in families.items():
+        family_amount = rule_amount * family_shares[family]
+        member_vectors = {ctx.sku_id: max(_driver_value(ctx, year, pool, second_stage_rule), 0.0) for ctx in members}
+        member_denom = sum(member_vectors.values())
+        if member_denom <= 0.0:
+            equal = 1.0 / len(members)
+            for ctx in members:
+                alloc_map[ctx.sku_id][year][pool.name] = alloc_map[ctx.sku_id][year].get(pool.name, 0.0) + family_amount * equal
+            continue
+        for ctx in members:
+            share = member_vectors[ctx.sku_id] / member_denom
+            alloc_map[ctx.sku_id][year][pool.name] = alloc_map[ctx.sku_id][year].get(pool.name, 0.0) + family_amount * share
 
 
 def _pool_amount_for_year(pool: OpexCostPool, year: str, contexts: Iterable[SKUCostContext]) -> float:
@@ -124,16 +181,14 @@ def allocate_opex_by_drivers(years: List[str], sku_contexts: List[SKUCostContext
             by_driver_type_totals[pool.driver_type.value] += pool_amount
 
             for rule in rules:
-                vectors = {ctx.sku_id: max(_driver_value(ctx, year, pool, rule), 0.0) for ctx in eligible}
-                denom = sum(vectors.values())
-                if denom <= 0.0:
-                    equal = 1.0 / len(eligible)
-                    for ctx in eligible:
-                        alloc_map[ctx.sku_id][year][pool.name] = alloc_map[ctx.sku_id][year].get(pool.name, 0.0) + pool_amount * rule.weight * equal
-                    continue
-                for ctx in eligible:
-                    share = vectors[ctx.sku_id] / denom
-                    alloc_map[ctx.sku_id][year][pool.name] = alloc_map[ctx.sku_id][year].get(pool.name, 0.0) + pool_amount * rule.weight * share
+                _allocate_rule_amount(
+                    alloc_map=alloc_map,
+                    eligible=eligible,
+                    year=year,
+                    pool=pool,
+                    rule=rule,
+                    rule_amount=pool_amount * rule.weight,
+                )
 
         total_pool = sum(by_pool_totals.values())
         total_alloc = sum(sum(alloc_map[ctx.sku_id].get(year, {}).values()) for ctx in sku_contexts)

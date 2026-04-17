@@ -126,6 +126,7 @@ You can map pools to drivers such as:
 - `CHANNEL_REVENUE`, `CHANNEL_UNITS`
 - `FIXED_EQUAL`, `ACTIVE_SKU`, `COMPLEXITY`
 - `STEP_CAPACITY`, `EXPLICIT_WEIGHT`
+- `BATCH_COUNT`, `ORDER_COUNT`, `SHIPMENT_COUNT`
 
 Blended rules are supported (for example 70% liters / 20% units / 10% complexity).
 
@@ -133,6 +134,7 @@ Blended rules are supported (for example 70% liters / 20% units / 10% complexity
 1. Build or edit `OpexCostPool` entries (driver, scope, classification, annual amounts).
 2. Add optional blended `OpexAllocationRule` weights.
 3. Pass custom pools to `model.allocate_opex(pools=...)`.
+4. Optionally enable two-stage allocation (`two_stage_family_allocation=True`) to allocate to product family first, then down to SKU using `second_stage_driver`.
 
 ### Three output views (recommended)
 - **A. OPEX by pool:** `model.opex_by_pool_view()`

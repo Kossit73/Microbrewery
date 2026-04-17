@@ -119,3 +119,28 @@ def test_three_output_views_are_available():
     assert pool_view
     assert driver_view
     assert product_view
+
+
+def test_two_stage_family_allocation_and_optional_drivers():
+    model = build_default_model()
+    years = model.forecast_years()
+    contexts = model.opex_contexts_by_sku_and_year()
+
+    two_stage_pool = OpexCostPool(
+        name="Family Cert Pool",
+        category="Regulatory",
+        annual_amount_by_year={y: 3000.0 for y in years},
+        driver_type=OpexDriverType.ACTIVE_SKU,
+        two_stage_family_allocation=True,
+        second_stage_driver=OpexDriverType.BATCH_COUNT,
+    )
+    shipment_pool = OpexCostPool(
+        name="Shipment Pool",
+        category="Logistics",
+        annual_amount_by_year={y: 2000.0 for y in years},
+        driver_type=OpexDriverType.SHIPMENT_COUNT,
+    )
+    report = allocate_opex_by_drivers(years, contexts, [two_stage_pool, shipment_pool])
+    for s in report.summaries:
+        assert math.isclose(s.total_pool_opex, 5000.0, rel_tol=1e-9, abs_tol=1e-6)
+        assert math.isclose(s.total_pool_opex, s.total_allocated_opex, rel_tol=1e-9, abs_tol=1e-6)
