@@ -1038,6 +1038,80 @@ def phase_growth_series(
     return pd.Series(s, index=idx)
 
 
+def write_comprehensive_excel_report(result: ModelRunResult, writer: pd.ExcelWriter) -> None:
+    """Write a comprehensive, well-labeled Excel workbook for model outputs."""
+    # 1) Core statements
+    result.monthly.to_excel(writer, sheet_name="01_Monthly_Financials")
+    result.annual.to_excel(writer, sheet_name="02_Annual_Financials")
+    result.prices.to_excel(writer, sheet_name="03_Pricing_Matrix")
+
+    # 2) Key results dashboard
+    valuation_df = pd.DataFrame(result.valuation, index=["value"]).T
+    valuation_df.index.name = "metric"
+    valuation_df.to_excel(writer, sheet_name="00_Key_Results")
+    annual_key_cols = [c for c in ["total_revenue", "direct_costs", "gross_profit", "opex", "ebitda", "net_income", "cash", "debt_ending_balance", "fcff"] if c in result.annual.columns]
+    result.annual[annual_key_cols].to_excel(writer, sheet_name="00_Key_Results", startrow=valuation_df.shape[0] + 3)
+
+    # 3) Schedules
+    wc_cols = [c for c in ["receivables", "inventory", "other_current_assets", "payables", "other_current_liabilities", "net_working_capital", "change_in_nwc"] if c in result.monthly.columns]
+    result.monthly[wc_cols].to_excel(writer, sheet_name="04_Working_Capital")
+
+    capex_cols = [c for c in ["capex", "depreciation", "net_fixed_assets"] if c in result.monthly.columns]
+    result.monthly[capex_cols].to_excel(writer, sheet_name="05_CAPEX_Depreciation")
+
+    financing_cols = [c for c in ["debt_draw", "debt_principal_payment", "interest_expense", "equity_injection", "dividends", "cash", "debt_ending_balance"] if c in result.monthly.columns]
+    result.monthly[financing_cols].to_excel(writer, sheet_name="06_Financing_Cash")
+
+    # 4) Debt facility schedules
+    for name, df in result.debt_schedules.items():
+        df.to_excel(writer, sheet_name=f"07_Debt_{name[:22]}")
+
+    # 5) Allocation views
+    views = result.opex_allocation_views or {}
+    if "pool_view" in views:
+        views["pool_view"].to_excel(writer, sheet_name="08_OPEX_By_Pool")
+    if "driver_view" in views:
+        views["driver_view"].to_excel(writer, sheet_name="09_OPEX_By_Driver")
+    if "product_view" in views:
+        views["product_view"].to_excel(writer, sheet_name="10_OPEX_By_Product", index=False)
+    if "reconciliation_view" in views:
+        views["reconciliation_view"].to_excel(writer, sheet_name="11_OPEX_Reconciliation")
+
+    # 6) Charts data + embedded charts
+    chart_cols = [c for c in ["total_revenue", "ebitda", "net_income", "cash", "debt_ending_balance", "fcff"] if c in result.annual.columns]
+    chart_df = result.annual[chart_cols].copy()
+    chart_df.to_excel(writer, sheet_name="12_Charts_Data")
+
+    try:
+        from openpyxl.chart import LineChart, Reference
+
+        wb = writer.book
+        ws = wb["12_Charts_Data"]
+
+        if chart_df.shape[0] >= 1 and chart_df.shape[1] >= 2:
+            chart = LineChart()
+            chart.title = "Revenue / EBITDA / Net Income"
+            chart.y_axis.title = "Value"
+            chart.x_axis.title = "Year End"
+            data = Reference(ws, min_col=2, max_col=min(4, chart_df.shape[1] + 1), min_row=1, max_row=chart_df.shape[0] + 1)
+            cats = Reference(ws, min_col=1, min_row=2, max_row=chart_df.shape[0] + 1)
+            chart.add_data(data, titles_from_data=True)
+            chart.set_categories(cats)
+            ws.add_chart(chart, "I2")
+
+        if chart_df.shape[0] >= 1 and chart_df.shape[1] >= 5:
+            chart2 = LineChart()
+            chart2.title = "Cash vs Debt Ending Balance"
+            data2 = Reference(ws, min_col=5, max_col=6, min_row=1, max_row=chart_df.shape[0] + 1)
+            cats2 = Reference(ws, min_col=1, min_row=2, max_row=chart_df.shape[0] + 1)
+            chart2.add_data(data2, titles_from_data=True)
+            chart2.set_categories(cats2)
+            ws.add_chart(chart2, "I20")
+    except Exception:
+        # If charting libs are unavailable in environment, keep workbook data-rich.
+        pass
+
+
 # =============================
 # Example runner
 # =============================
@@ -1188,11 +1262,7 @@ def main() -> None:
     out_xlsx = "brewery_model_output.xlsx"
     try:
         with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
-            result.monthly.to_excel(writer, sheet_name="Monthly_Statements")
-            result.annual.to_excel(writer, sheet_name="Annual_Summary")
-            result.prices.to_excel(writer, sheet_name="Prices")
-            for name, df in result.debt_schedules.items():
-                df.to_excel(writer, sheet_name=f"Debt_{name[:25]}")
+            write_comprehensive_excel_report(result, writer)
         print(f"\nWrote: {out_xlsx}")
     except Exception as e:
         print(f"\nExcel export skipped (openpyxl missing or other error): {e}")

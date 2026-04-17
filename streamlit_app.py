@@ -32,6 +32,7 @@ from brewery_financial_model_all_in_one import (
     ModelConfig,
     ModelInputs,
     phase_growth_series,
+    write_comprehensive_excel_report,
 )
 
 def _driver_based_opex_views_section(result: ModelRunResult) -> None:
@@ -642,14 +643,10 @@ def _charts_section(result) -> None:
 def _download_section(result) -> None:
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        result.monthly.to_excel(writer, sheet_name="Monthly_Statements")
-        result.annual.to_excel(writer, sheet_name="Annual_Summary")
-        result.prices.to_excel(writer, sheet_name="Prices")
-        for name, df in result.debt_schedules.items():
-            df.to_excel(writer, sheet_name=f"Debt_{name[:25]}")
+        write_comprehensive_excel_report(result, writer)
     buffer.seek(0)
     st.download_button(
-        label="Download Excel outputs",
+        label="Download Excel output (Comprehensive Pack)",
         data=buffer,
         file_name="brewery_model_output.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
