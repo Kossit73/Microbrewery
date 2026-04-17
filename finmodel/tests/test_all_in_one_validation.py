@@ -213,3 +213,33 @@ def test_all_in_one_handles_out_of_horizon_quarterly_sales_without_keyerror():
 
     result = model.run()
     assert result.monthly["revenue"].sum() == 0.0
+
+
+def test_all_in_one_handles_missing_sku_and_channel_columns_in_driver_xs_paths():
+    skus = pd.DataFrame(
+        [
+            {"sku_id": 1, "name": "SKU 1 500ml", "direct_cost_per_unit": 2.10, "markup_pct": 0.65, "relative_opex_weight": 1.0},
+            {"sku_id": 2, "name": "SKU 2 330ml", "direct_cost_per_unit": 2.30, "markup_pct": 0.60, "relative_opex_weight": 1.2},
+        ]
+    )
+    channels = pd.DataFrame([{"channel": "Retail", "price_factor": 1.0}, {"channel": "Wholesale", "price_factor": 0.8}])
+    # Only sku_id=1 / Retail appears in sales.
+    sales = pd.DataFrame([{"date": "2025-01-01", "sku_id": 1, "channel": "Retail", "units": 100.0}])
+
+    model = MicrobreweryFinancialModel(
+        ModelConfig(start_date="2025-01-01", months=2, pricing_cost_basis_month=0),
+        DividendPolicy(enabled=False),
+        ModelInputs(
+            skus=skus,
+            channels=channels,
+            sales_plan=sales,
+            cost_pools=[
+                CostPoolInput(name="Liters Pool", cost_type="indirect", behavior="variable", allocation_driver="liters", unit_variable_cost=0.1),
+                CostPoolInput(name="Complexity Pool", cost_type="indirect", behavior="variable", allocation_driver="complexity", unit_variable_cost=0.2),
+                CostPoolInput(name="Missing Channel Pool", cost_type="indirect", behavior="variable", allocation_driver="channel_units", channel="E-Commerce", unit_variable_cost=0.3),
+            ],
+        ),
+    )
+
+    result = model.run()
+    assert "opex" in result.monthly.columns

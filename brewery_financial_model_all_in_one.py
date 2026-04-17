@@ -409,12 +409,18 @@ class MicrobreweryFinancialModel:
         revenue_wide: pd.DataFrame,
         pool: CostPoolInput,
     ) -> pd.Series:
+        sku_levels = units_wide.columns.get_level_values(0) if isinstance(units_wide.columns, pd.MultiIndex) else pd.Index([])
+        channel_levels = units_wide.columns.get_level_values(1) if isinstance(units_wide.columns, pd.MultiIndex) else pd.Index([])
+        revenue_channel_levels = revenue_wide.columns.get_level_values(1) if isinstance(revenue_wide.columns, pd.MultiIndex) else pd.Index([])
+
         if pool.allocation_driver == "units":
             return units_wide.sum(axis=1).reindex(idx).fillna(0.0) if not units_wide.empty else pd.Series(0.0, index=idx)
         if pool.allocation_driver == "liters":
             liters = pd.Series(0.0, index=idx)
             if not units_wide.empty:
                 for sku_id in self.inputs.skus["sku_id"].tolist():
+                    if sku_id not in sku_levels:
+                        continue
                     liters_per = self._liters_per_unit_from_name(str(self.inputs.skus.set_index("sku_id").loc[sku_id, "name"]))
                     sku_units = units_wide.xs(sku_id, axis=1, level=0, drop_level=False).sum(axis=1)
                     liters = liters + sku_units * liters_per
@@ -424,13 +430,13 @@ class MicrobreweryFinancialModel:
         if pool.allocation_driver == "channel_units":
             if units_wide.empty:
                 return pd.Series(0.0, index=idx)
-            if pool.channel:
+            if pool.channel and pool.channel in channel_levels:
                 return units_wide.xs(pool.channel, axis=1, level=1, drop_level=False).sum(axis=1)
             return units_wide.sum(axis=1)
         if pool.allocation_driver == "channel_revenue":
             if revenue_wide.empty:
                 return pd.Series(0.0, index=idx)
-            if pool.channel:
+            if pool.channel and pool.channel in revenue_channel_levels:
                 return revenue_wide.xs(pool.channel, axis=1, level=1, drop_level=False).sum(axis=1)
             return revenue_wide.sum(axis=1)
         if pool.allocation_driver == "active_sku":
@@ -446,6 +452,8 @@ class MicrobreweryFinancialModel:
             sku_weights = self.inputs.skus.set_index("sku_id")["relative_opex_weight"].to_dict()
             totals = pd.Series(0.0, index=idx)
             for sku_id, w in sku_weights.items():
+                if sku_id not in sku_levels:
+                    continue
                 sku_units = units_wide.xs(sku_id, axis=1, level=0, drop_level=False).sum(axis=1)
                 totals = totals + (sku_units > 0).astype(float) * float(w)
             return totals
