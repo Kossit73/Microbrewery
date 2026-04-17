@@ -31,6 +31,7 @@ from brewery_financial_model_all_in_one import (
     MicrobreweryFinancialModel,
     ModelConfig,
     ModelInputs,
+    OtherIncomeItem,
     phase_growth_series,
     write_comprehensive_excel_report,
 )
@@ -155,9 +156,12 @@ def _build_sample_assumptions(
         CostPoolInput(name="Other Expense", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=1_400.0),
         CostPoolInput(name="Contingencies", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=1_800.0),
     ]
-    other_income_monthly = pd.Series(0.0, index=idx)
-    other_income_monthly.iloc[12:] = 15_000.0
-    other_income_monthly.iloc[48:] = 22_500.0
+    other_income_items = [
+        OtherIncomeItem(other_income_name="Sponsorships", amount=15_000.0, active=True, category="Commercial"),
+        OtherIncomeItem(other_income_name="Other Income 2", amount=0.0, active=False),
+        OtherIncomeItem(other_income_name="Other Income 3", amount=0.0, active=False),
+        OtherIncomeItem(other_income_name="Other Income 4", amount=0.0, active=False),
+    ]
 
     capex_items = [
         CapexItem(name="Land (non-depreciable)", amount=875_000, capex_month=0, depreciation_years=0),
@@ -213,7 +217,7 @@ def _build_sample_assumptions(
         channels=channels,
         sales_plan=sales_plan,
         cost_pools=cost_pools,
-        other_income_monthly=other_income_monthly,
+        other_income_items=other_income_items,
         capex_items=capex_items,
         debt_facilities=debt_facilities,
         equity_injections=equity_injections,
@@ -354,6 +358,14 @@ def _non_empty_rows(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     return df.dropna(how="all").copy()
+
+
+def _coerce_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
 
 
 def _expand_sales_plan_to_monthly(sales_df: pd.DataFrame, frequency: str) -> pd.DataFrame:
@@ -548,14 +560,21 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
         cost_pools = base_inputs.cost_pools
 
     oi_src = st.session_state.get("assump_data_other_income")
-    if isinstance(oi_src, pd.DataFrame) and not oi_src.empty and "date" in oi_src.columns:
-        if len(oi_src) == 1 and str(oi_src.iloc[0]["date"]) == "all_months":
-            other_income_monthly = float(oi_src.iloc[0]["other_income_monthly"])
-        else:
-            s = pd.Series(oi_src["other_income_monthly"].values, index=pd.to_datetime(oi_src["date"]))
-            other_income_monthly = s
+    if isinstance(oi_src, pd.DataFrame):
+        oi_src = _non_empty_rows(oi_src)
+        other_income_items = [
+            OtherIncomeItem(
+                other_income_name=str(r.get("other_income_name")),
+                amount=float(r.get("amount", 0.0)),
+                active=_coerce_bool(r.get("active", True)),
+                category=None if pd.isna(r.get("category")) else str(r.get("category")),
+                notes=None if pd.isna(r.get("notes")) else str(r.get("notes")),
+            )
+            for _, r in oi_src.iterrows()
+            if pd.notna(r.get("other_income_name"))
+        ]
     else:
-        other_income_monthly = base_inputs.other_income_monthly
+        other_income_items = base_inputs.other_income_items
 
     capex_src = st.session_state.get("assump_data_capex")
     if isinstance(capex_src, pd.DataFrame):
@@ -609,7 +628,7 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
         sales_plan=sales_plan,
         sales_plan_frequency=str(sales_plan_frequency),
         cost_pools=cost_pools,
-        other_income_monthly=other_income_monthly,
+        other_income_items=other_income_items,
         capex_items=capex_items,
         debt_facilities=debt_facilities,
         equity_injections=equity_injections,
@@ -1565,9 +1584,16 @@ def main() -> None:
             ]
         )
         other_income_df = pd.DataFrame(
-            [{"date": d, "other_income_monthly": v} for d, v in inputs.other_income_monthly.items()]
-            if isinstance(inputs.other_income_monthly, pd.Series)
-            else [{"date": "all_months", "other_income_monthly": float(inputs.other_income_monthly)}]
+            [
+                {
+                    "other_income_name": item.other_income_name,
+                    "amount": item.amount,
+                    "active": "True" if item.active else "False",
+                    "category": item.category,
+                    "notes": item.notes,
+                }
+                for item in (inputs.other_income_items or [])
+            ]
         )
 
         _assumption_editor("Model config assumptions", "config", config_df)
@@ -1576,7 +1602,7 @@ def main() -> None:
         _assumption_editor("Channels", "channels", inputs.channels)
         _sales_plan_assumption_editor(inputs.sales_plan, inputs.sales_plan_frequency)
         _assumption_editor("Cost pools", "cost_pools", cost_pool_df)
-        _assumption_editor("Other income monthly", "other_income", other_income_df)
+        _assumption_editor("Other income items", "other_income", other_income_df)
         _assumption_editor("CAPEX schedule", "capex", capex_df)
         _assumption_editor("Debt facilities", "debt", debt_df)
         _assumption_editor("Equity injections", "equity", equity_df)

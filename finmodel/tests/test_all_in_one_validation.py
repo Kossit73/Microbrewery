@@ -5,7 +5,7 @@ import pandas as pd
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
-from brewery_financial_model_all_in_one import CostPoolInput, DividendPolicy, ModelConfig, ModelInputs, MicrobreweryFinancialModel
+from brewery_financial_model_all_in_one import CostPoolInput, DividendPolicy, ModelConfig, ModelInputs, MicrobreweryFinancialModel, OtherIncomeItem
 
 
 def test_all_in_one_coerces_numeric_sku_and_channel_inputs():
@@ -113,3 +113,40 @@ def test_all_in_one_supports_yearly_sales_plan_frequency():
     idx = model._timeline()
     monthly_units = model._units_matrix(idx).xs((1, "Retail"), axis=1)
     assert monthly_units.tolist() == [100.0] * 12
+
+
+def test_all_in_one_aggregates_other_income_items():
+    skus = pd.DataFrame(
+        [
+            {
+                "sku_id": 1,
+                "name": "Test SKU",
+                "direct_cost_per_unit": 2.10,
+                "markup_pct": 0.65,
+                "relative_opex_weight": 1.0,
+            }
+        ]
+    )
+    channels = pd.DataFrame([{"channel": "Retail", "price_factor": 1.0}])
+    sales = pd.DataFrame([{"date": "2025-01-01", "sku_id": 1, "channel": "Retail", "units": 100.0}])
+
+    model = MicrobreweryFinancialModel(
+        ModelConfig(start_date="2025-01-01", months=2, pricing_cost_basis_month=0, cost_inflation_annual=0.0),
+        DividendPolicy(enabled=False),
+        ModelInputs(
+            skus=skus,
+            channels=channels,
+            sales_plan=sales,
+            other_income_items=[
+                OtherIncomeItem(other_income_name="Sponsorships", amount=100.0, active=True),
+                OtherIncomeItem(other_income_name="Other Income 2", amount=50.0, active=True),
+                OtherIncomeItem(other_income_name="Other Income 3", amount=999.0, active=False),
+            ],
+            cost_pools=[
+                CostPoolInput(name="Malt", cost_type="direct", behavior="variable", allocation_driver="units", unit_variable_cost=0.5),
+            ],
+        ),
+    )
+
+    result = model.run()
+    assert result.monthly["other_income"].tolist() == [150.0, 150.0]

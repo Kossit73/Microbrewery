@@ -162,6 +162,15 @@ class CostPoolInput:
     step_increment: float = 0.0
 
 
+@dataclass(frozen=True)
+class OtherIncomeItem:
+    other_income_name: str
+    amount: float
+    active: bool = True
+    category: Optional[str] = None
+    notes: Optional[str] = None
+
+
 @dataclass
 class ModelInputs:
     """
@@ -174,7 +183,8 @@ class ModelInputs:
         date (datetime), sku_id, channel, units
 
     Optional inputs:
-    - other_income_monthly: Series indexed by date or scalar float
+    - other_income_items: list of OtherIncomeItem with monthly amounts
+    - other_income_monthly: (deprecated compatibility path) Series indexed by date or scalar float
     - cost_pools: list of CostPoolInput
     - capex_items: list of CapexItem
     - debt_facilities: list of DebtFacility
@@ -185,6 +195,7 @@ class ModelInputs:
     sales_plan: pd.DataFrame
     sales_plan_frequency: Literal["monthly", "quarterly", "yearly"] = "monthly"
 
+    other_income_items: Optional[List[OtherIncomeItem]] = None
     other_income_monthly: float | pd.Series = 0.0
     cost_pools: Optional[List[CostPoolInput]] = None
 
@@ -285,6 +296,17 @@ class MicrobreweryFinancialModel:
             self.inputs.equity_injections = {}
         if self.inputs.cost_pools is None:
             self.inputs.cost_pools = []
+        if self.inputs.other_income_items is None:
+            self.inputs.other_income_items = []
+
+    def _other_income_series(self, idx: pd.DatetimeIndex) -> pd.Series:
+        if self.inputs.other_income_items:
+            total = 0.0
+            for item in self.inputs.other_income_items:
+                if bool(item.active):
+                    total += float(item.amount)
+            return pd.Series(total, index=idx, name="other_income")
+        return self._as_monthly_series(self.inputs.other_income_monthly, idx, "other_income")
 
     # ---------- timeline ----------
     def _timeline(self) -> pd.DatetimeIndex:
@@ -847,7 +869,7 @@ class MicrobreweryFinancialModel:
         revenue_wide = units_wide.mul(prices_wide, fill_value=0.0)
         revenue = revenue_wide.sum(axis=1).rename("revenue")
 
-        other_income = self._as_monthly_series(self.inputs.other_income_monthly, idx, "other_income")
+        other_income = self._other_income_series(idx)
         other_income = (other_income * cost_idx).rename("other_income")  # default: inflate with costs
         total_revenue = (revenue + other_income).rename("total_revenue")
 
@@ -1236,8 +1258,12 @@ def main() -> None:
         CostPoolInput(name="Contingencies", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=1_800.0),
     ]
 
-    other_income_monthly = pd.Series(0.0, index=idx)
-    other_income_monthly.iloc[12:] = 15_000.0  # from month 13 onward
+    other_income_items = [
+        OtherIncomeItem(other_income_name="Sponsorships", amount=15_000.0, active=True, category="Commercial"),
+        OtherIncomeItem(other_income_name="Other Income 2", amount=0.0, active=False),
+        OtherIncomeItem(other_income_name="Other Income 3", amount=0.0, active=False),
+        OtherIncomeItem(other_income_name="Other Income 4", amount=0.0, active=False),
+    ]
 
     # ----------------------------
     # CAPEX schedule (simplified example)
@@ -1264,7 +1290,7 @@ def main() -> None:
         skus=skus,
         channels=channels,
         sales_plan=sales_plan,
-        other_income_monthly=other_income_monthly,
+        other_income_items=other_income_items,
         cost_pools=cost_pools,
         capex_items=capex_items,
         debt_facilities=debt_facilities,
