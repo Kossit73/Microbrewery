@@ -1,3 +1,4 @@
+from io import BytesIO
 from pathlib import Path
 import sys
 
@@ -5,7 +6,15 @@ import pandas as pd
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
-from brewery_financial_model_all_in_one import CostPoolInput, DividendPolicy, ModelConfig, ModelInputs, MicrobreweryFinancialModel, OtherIncomeItem
+from brewery_financial_model_all_in_one import (
+    CostPoolInput,
+    DividendPolicy,
+    ModelConfig,
+    ModelInputs,
+    MicrobreweryFinancialModel,
+    OtherIncomeItem,
+    write_comprehensive_excel_report,
+)
 
 
 def test_all_in_one_coerces_numeric_sku_and_channel_inputs():
@@ -352,3 +361,42 @@ def test_all_in_one_sales_frequency_totals_are_consistent():
     yearly_result = run_model(yearly_sales, "yearly")
 
     assert monthly_result.monthly["revenue"].sum() == quarterly_result.monthly["revenue"].sum() == yearly_result.monthly["revenue"].sum()
+
+
+def test_comprehensive_excel_report_contains_requested_sections():
+    skus = pd.DataFrame(
+        [
+            {"sku_id": 1, "name": "Test SKU", "markup_pct": 0.50, "relative_opex_weight": 1.0},
+        ]
+    )
+    channels = pd.DataFrame([{"channel": "Retail", "price_factor": 1.0}])
+    sales = pd.DataFrame([{"date": "2025-01-01", "sku_id": 1, "channel": "Retail", "units": 100.0}])
+    model = MicrobreweryFinancialModel(
+        ModelConfig(start_date="2025-01-01", months=12, pricing_cost_basis_month=0),
+        DividendPolicy(enabled=False),
+        ModelInputs(
+            skus=skus,
+            channels=channels,
+            sales_plan=sales,
+            cost_pools=[CostPoolInput(name="Direct Variable Pool", cost_type="direct", behavior="variable", allocation_driver="units", unit_variable_cost=1.0)],
+        ),
+    )
+    result = model.run()
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        write_comprehensive_excel_report(result, writer)
+    output.seek(0)
+    workbook = pd.ExcelFile(output, engine="openpyxl")
+    sheets = set(workbook.sheet_names)
+
+    expected = {
+        "Annual_Performance_IS",
+        "Annual_Position_BS",
+        "Annual_Cash_Flow",
+        "Graphs_and_Plots",
+        "Cash_vs_Debt_EndBal",
+        "Driver_OPEX_Views",
+        "Key_Analytics",
+    }
+    assert expected.issubset(sheets)

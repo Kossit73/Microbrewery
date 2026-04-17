@@ -1174,6 +1174,58 @@ def write_comprehensive_excel_report(result: ModelRunResult, writer: pd.ExcelWri
     annual_key_cols = [c for c in ["total_revenue", "direct_costs", "gross_profit", "opex", "ebitda", "net_income", "cash", "debt_ending_balance", "fcff"] if c in result.annual.columns]
     result.annual[annual_key_cols].to_excel(writer, sheet_name="00_Key_Results", startrow=valuation_df.shape[0] + 3)
 
+    # 2b) Annual statements (requested views)
+    perf_cols = [
+        "total_revenue",
+        "other_income",
+        "direct_costs",
+        "gross_profit",
+        "opex",
+        "ebitda",
+        "depreciation",
+        "ebit",
+        "interest_expense",
+        "pre_tax_income",
+        "taxes",
+        "net_income",
+    ]
+    perf_existing = [c for c in perf_cols if c in result.annual.columns]
+    result.annual[perf_existing].to_excel(writer, sheet_name="Annual_Performance_IS")
+
+    position_cols = [
+        "cash",
+        "receivables",
+        "inventory",
+        "other_current_assets",
+        "current_assets",
+        "net_fixed_assets",
+        "total_assets",
+        "payables",
+        "other_current_liabilities",
+        "current_liabilities",
+        "debt_ending_balance",
+        "total_liabilities",
+        "equity",
+    ]
+    position_existing = [c for c in position_cols if c in result.annual.columns]
+    result.annual[position_existing].to_excel(writer, sheet_name="Annual_Position_BS")
+
+    cashflow_cols = [
+        "cash_flow_from_operations",
+        "change_in_nwc",
+        "capex",
+        "cash_flow_from_investing",
+        "debt_draw",
+        "debt_principal_payment",
+        "equity_injection",
+        "dividends",
+        "cash_flow_from_financing",
+        "net_change_in_cash",
+        "fcff",
+    ]
+    cashflow_existing = [c for c in cashflow_cols if c in result.annual.columns]
+    result.annual[cashflow_existing].to_excel(writer, sheet_name="Annual_Cash_Flow")
+
     # 3) Schedules
     wc_cols = [c for c in ["receivables", "inventory", "other_current_assets", "payables", "other_current_liabilities", "net_working_capital", "change_in_nwc"] if c in result.monthly.columns]
     result.monthly[wc_cols].to_excel(writer, sheet_name="04_Working_Capital")
@@ -1199,16 +1251,61 @@ def write_comprehensive_excel_report(result: ModelRunResult, writer: pd.ExcelWri
     if "reconciliation_view" in views:
         views["reconciliation_view"].to_excel(writer, sheet_name="11_OPEX_Reconciliation")
 
+    # Consolidated driver-based OPEX views on a single sheet for quick review.
+    opex_sheet = "Driver_OPEX_Views"
+    row_ptr = 0
+    if "pool_view" in views:
+        views["pool_view"].to_excel(writer, sheet_name=opex_sheet, startrow=row_ptr)
+        row_ptr += len(views["pool_view"]) + 4
+    if "driver_view" in views:
+        views["driver_view"].to_excel(writer, sheet_name=opex_sheet, startrow=row_ptr)
+        row_ptr += len(views["driver_view"]) + 4
+    if "product_view" in views:
+        views["product_view"].to_excel(writer, sheet_name=opex_sheet, startrow=row_ptr, index=False)
+        row_ptr += len(views["product_view"]) + 4
+    if "reconciliation_view" in views:
+        views["reconciliation_view"].to_excel(writer, sheet_name=opex_sheet, startrow=row_ptr)
+
     # 6) Charts data + embedded charts
     chart_cols = [c for c in ["total_revenue", "ebitda", "net_income", "cash", "debt_ending_balance", "fcff"] if c in result.annual.columns]
     chart_df = result.annual[chart_cols].copy()
     chart_df.to_excel(writer, sheet_name="12_Charts_Data")
+    chart_df.to_excel(writer, sheet_name="Graphs_and_Plots")
+    cash_debt_cols = [c for c in ["cash", "debt_ending_balance"] if c in result.annual.columns]
+    result.annual[cash_debt_cols].to_excel(writer, sheet_name="Cash_vs_Debt_EndBal")
+
+    # 6b) Key analytics sheet
+    latest_month = result.monthly.iloc[-1] if not result.monthly.empty else pd.Series(dtype=float)
+    latest_annual = result.annual.iloc[-1] if not result.annual.empty else pd.Series(dtype=float)
+    key_analytics = pd.DataFrame(
+        [
+            {"metric": "latest_annual_revenue", "value": float(latest_annual.get("total_revenue", np.nan))},
+            {"metric": "latest_annual_ebitda", "value": float(latest_annual.get("ebitda", np.nan))},
+            {"metric": "latest_annual_net_income", "value": float(latest_annual.get("net_income", np.nan))},
+            {
+                "metric": "latest_gross_margin_pct",
+                "value": float(latest_annual.get("gross_profit", np.nan)) / max(float(latest_annual.get("total_revenue", np.nan)), 1e-9),
+            },
+            {
+                "metric": "latest_ebitda_margin_pct",
+                "value": float(latest_annual.get("ebitda", np.nan)) / max(float(latest_annual.get("total_revenue", np.nan)), 1e-9),
+            },
+            {
+                "metric": "cash_to_debt_last_month",
+                "value": float(latest_month.get("cash", np.nan)) / max(float(latest_month.get("debt_ending_balance", np.nan)), 1e-9),
+            },
+            {"metric": "latest_fcff", "value": float(latest_annual.get("fcff", np.nan))},
+        ]
+    )
+    key_analytics.to_excel(writer, sheet_name="Key_Analytics", index=False)
 
     try:
         from openpyxl.chart import LineChart, Reference
 
         wb = writer.book
         ws = wb["12_Charts_Data"]
+        ws_graph = wb["Graphs_and_Plots"]
+        ws_cash_debt = wb["Cash_vs_Debt_EndBal"]
 
         if chart_df.shape[0] >= 1 and chart_df.shape[1] >= 2:
             chart = LineChart()
@@ -1220,6 +1317,15 @@ def write_comprehensive_excel_report(result: ModelRunResult, writer: pd.ExcelWri
             chart.add_data(data, titles_from_data=True)
             chart.set_categories(cats)
             ws.add_chart(chart, "I2")
+            chart_graph = LineChart()
+            chart_graph.title = "Revenue / EBITDA / Net Income"
+            chart_graph.y_axis.title = "Value"
+            chart_graph.x_axis.title = "Year End"
+            data_graph = Reference(ws_graph, min_col=2, max_col=min(4, chart_df.shape[1] + 1), min_row=1, max_row=chart_df.shape[0] + 1)
+            cats_graph = Reference(ws_graph, min_col=1, min_row=2, max_row=chart_df.shape[0] + 1)
+            chart_graph.add_data(data_graph, titles_from_data=True)
+            chart_graph.set_categories(cats_graph)
+            ws_graph.add_chart(chart_graph, "I2")
 
         if chart_df.shape[0] >= 1 and chart_df.shape[1] >= 5:
             chart2 = LineChart()
@@ -1229,6 +1335,23 @@ def write_comprehensive_excel_report(result: ModelRunResult, writer: pd.ExcelWri
             chart2.add_data(data2, titles_from_data=True)
             chart2.set_categories(cats2)
             ws.add_chart(chart2, "I20")
+
+            chart2_graph = LineChart()
+            chart2_graph.title = "Cash vs Debt Ending Balance"
+            data2_graph = Reference(ws_graph, min_col=5, max_col=6, min_row=1, max_row=chart_df.shape[0] + 1)
+            cats2_graph = Reference(ws_graph, min_col=1, min_row=2, max_row=chart_df.shape[0] + 1)
+            chart2_graph.add_data(data2_graph, titles_from_data=True)
+            chart2_graph.set_categories(cats2_graph)
+            ws_graph.add_chart(chart2_graph, "I20")
+
+        if len(cash_debt_cols) >= 2 and result.annual.shape[0] >= 1:
+            chart3 = LineChart()
+            chart3.title = "Cash vs. Debt Ending Balance"
+            data3 = Reference(ws_cash_debt, min_col=2, max_col=3, min_row=1, max_row=result.annual.shape[0] + 1)
+            cats3 = Reference(ws_cash_debt, min_col=1, min_row=2, max_row=result.annual.shape[0] + 1)
+            chart3.add_data(data3, titles_from_data=True)
+            chart3.set_categories(cats3)
+            ws_cash_debt.add_chart(chart3, "F2")
     except Exception:
         # If charting libs are unavailable in environment, keep workbook data-rich.
         pass
