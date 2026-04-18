@@ -22,15 +22,56 @@ import streamlit as st
 
 st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
 
+from finmodel.decision_ai import DecisionSessionMemory, QuestionType, build_structured_answer, classify_question
 from brewery_financial_model_all_in_one import (
     CapexItem,
+    CostPoolInput,
     DebtFacility,
     DividendPolicy,
+    ModelRunResult,
     MicrobreweryFinancialModel,
     ModelConfig,
     ModelInputs,
+    OtherIncomeItem,
     phase_growth_series,
+    write_comprehensive_excel_report,
 )
+
+def _driver_based_opex_views_section(result: ModelRunResult) -> None:
+    """
+    Display the three OPEX output views from the driver-based allocation engine:
+      A) OPEX by pool
+      B) OPEX by driver type
+      C) OPEX by product
+    """
+    st.subheader("Driver-based OPEX Allocation Views")
+    st.caption(
+        "This section renders the new pool-driven OPEX engine outputs (management, model-control, and pricing views)."
+    )
+
+    views = result.opex_allocation_views
+    pool_view = views.get("pool_view", pd.DataFrame())
+    driver_view = views.get("driver_view", pd.DataFrame())
+    product_df = views.get("product_view", pd.DataFrame())
+    rec_df = views.get("reconciliation_view", pd.DataFrame())
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("#### A. OPEX by pool")
+        st.dataframe(pool_view, use_container_width=True)
+    with c2:
+        st.markdown("#### B. OPEX by driver type")
+        st.dataframe(driver_view, use_container_width=True)
+
+    st.markdown("#### C. OPEX by product")
+    if not product_df.empty:
+        product_df = product_df.sort_values(["sku_id", "year"])
+    st.dataframe(product_df, use_container_width=True)
+
+    st.markdown("#### Reconciliation check")
+    if not rec_df.empty:
+        rec_df["within_tolerance"] = rec_df["reconciliation_gap"].abs() <= 1e-6
+    st.dataframe(rec_df, use_container_width=True)
 
 
 def _build_sample_assumptions(
@@ -44,21 +85,21 @@ def _build_sample_assumptions(
             {
                 "sku_id": 1,
                 "name": "Pale Ale 330ml",
-                "direct_cost_per_unit": 2.10,
+                "direct_cost_per_unit": 0.0,
                 "markup_pct": 0.65,
                 "relative_opex_weight": 1.0,
             },
             {
                 "sku_id": 2,
                 "name": "Pilsner 500ml",
-                "direct_cost_per_unit": 2.60,
+                "direct_cost_per_unit": 0.0,
                 "markup_pct": 0.60,
                 "relative_opex_weight": 1.1,
             },
             {
                 "sku_id": 3,
                 "name": "Hazy IPA 440ml",
-                "direct_cost_per_unit": 2.85,
+                "direct_cost_per_unit": 0.0,
                 "markup_pct": 0.72,
                 "relative_opex_weight": 1.25,
             },
@@ -94,10 +135,34 @@ def _build_sample_assumptions(
                 rows.append({"date": date, "sku_id": sku_id, "channel": channel, "units": total_units * share})
     sales_plan = pd.DataFrame(rows)
 
-    opex_fixed_monthly = 110_000.0
-    other_income_monthly = pd.Series(0.0, index=idx)
-    other_income_monthly.iloc[12:] = 15_000.0
-    other_income_monthly.iloc[48:] = 22_500.0
+    cost_pools = [
+        CostPoolInput(name="Malt & Grain", cost_type="direct", behavior="variable", allocation_driver="liters", unit_variable_cost=0.22),
+        CostPoolInput(name="Hops & Yeast", cost_type="direct", behavior="variable", allocation_driver="liters", unit_variable_cost=0.09),
+        CostPoolInput(name="Packaging Materials", cost_type="direct", behavior="variable", allocation_driver="units", unit_variable_cost=0.14),
+        CostPoolInput(name="Production Direct Labor", cost_type="direct", behavior="step_fixed", allocation_driver="liters", fixed_monthly_cost=6_000.0, step_threshold=180_000.0, step_increment=850.0),
+        CostPoolInput(name="Brew QA Consumables", cost_type="direct", behavior="variable", allocation_driver="liters", unit_variable_cost=0.015),
+        CostPoolInput(name="Indirect Labor", cost_type="indirect", behavior="step_fixed", allocation_driver="liters", fixed_monthly_cost=22_000.0, step_threshold=250_000.0, step_increment=2_000.0),
+        CostPoolInput(name="Utilities", cost_type="indirect", behavior="variable", allocation_driver="liters", unit_variable_cost=0.035),
+        CostPoolInput(name="Supplies", cost_type="indirect", behavior="variable", allocation_driver="units", unit_variable_cost=0.015),
+        CostPoolInput(name="Marketing & Advertising", cost_type="indirect", behavior="blended", allocation_driver="channel_revenue", fixed_monthly_cost=8_500.0, unit_variable_cost=0.003),
+        CostPoolInput(name="Events & Promotion", cost_type="indirect", behavior="variable", allocation_driver="channel_units", unit_variable_cost=0.01, channel="On-Premise"),
+        CostPoolInput(name="Insurance", cost_type="indirect", behavior="fixed", allocation_driver="revenue", fixed_monthly_cost=3_000.0),
+        CostPoolInput(name="Permits & License", cost_type="indirect", behavior="blended", allocation_driver="active_sku", fixed_monthly_cost=1_250.0, unit_variable_cost=350.0),
+        CostPoolInput(name="Local Fees", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=900.0),
+        CostPoolInput(name="Transport", cost_type="indirect", behavior="variable", allocation_driver="channel_units", unit_variable_cost=0.018),
+        CostPoolInput(name="Administrative Expense", cost_type="indirect", behavior="blended", allocation_driver="active_sku", fixed_monthly_cost=9_500.0, unit_variable_cost=250.0),
+        CostPoolInput(name="Quality Control", cost_type="indirect", behavior="blended", allocation_driver="liters", fixed_monthly_cost=2_500.0, unit_variable_cost=0.01),
+        CostPoolInput(name="Certificates", cost_type="indirect", behavior="variable", allocation_driver="active_sku", unit_variable_cost=180.0),
+        CostPoolInput(name="Professional Services", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=2_200.0),
+        CostPoolInput(name="Other Expense", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=1_400.0),
+        CostPoolInput(name="Contingencies", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=1_800.0),
+    ]
+    other_income_items = [
+        OtherIncomeItem(other_income_name="Sponsorships", amount=15_000.0, active=True, category="Commercial"),
+        OtherIncomeItem(other_income_name="Other Income 2", amount=0.0, active=False),
+        OtherIncomeItem(other_income_name="Other Income 3", amount=0.0, active=False),
+        OtherIncomeItem(other_income_name="Other Income 4", amount=0.0, active=False),
+    ]
 
     capex_items = [
         CapexItem(name="Land (non-depreciable)", amount=875_000, capex_month=0, depreciation_years=0),
@@ -152,8 +217,8 @@ def _build_sample_assumptions(
         skus=skus,
         channels=channels,
         sales_plan=sales_plan,
-        opex_fixed_monthly=opex_fixed_monthly,
-        other_income_monthly=other_income_monthly,
+        cost_pools=cost_pools,
+        other_income_items=other_income_items,
         capex_items=capex_items,
         debt_facilities=debt_facilities,
         equity_injections=equity_injections,
@@ -254,7 +319,14 @@ def _assumption_editor(title: str, key: str, df: pd.DataFrame) -> pd.DataFrame:
             updated_row = {}
             for col in wdf.columns:
                 val = wdf.loc[selected_row, col]
-                if pd.api.types.is_numeric_dtype(wdf[col]):
+                col_series = wdf[col]
+                if pd.api.types.is_bool_dtype(col_series):
+                    updated_row[col] = st.checkbox(
+                        f"{col}",
+                        value=_coerce_bool(val),
+                        key=f"field_{key}_{selected_row}_{col}",
+                    )
+                elif pd.api.types.is_numeric_dtype(col_series):
                     default_val = 0.0 if pd.isna(val) else float(val)
                     updated_row[col] = st.number_input(
                         f"{col}",
@@ -270,7 +342,8 @@ def _assumption_editor(title: str, key: str, df: pd.DataFrame) -> pd.DataFrame:
 
             if st.button("Apply row changes", key=f"btn_apply_row_{key}"):
                 for col, val in updated_row.items():
-                    st.session_state[work_key].loc[selected_row, col] = val
+                    casted = _cast_value_for_dtype(st.session_state[work_key][col], val)
+                    st.session_state[work_key].at[selected_row, col] = casted
         else:
             st.info("No rows available. Use 'Add row' to create one.")
 
@@ -294,6 +367,171 @@ def _non_empty_rows(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     return df.dropna(how="all").copy()
+
+
+def _coerce_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _cast_value_for_dtype(column: pd.Series, value: object) -> object:
+    if pd.api.types.is_bool_dtype(column):
+        return _coerce_bool(value)
+    if pd.api.types.is_integer_dtype(column):
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return 0
+        return int(float(value))
+    if pd.api.types.is_float_dtype(column):
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return 0.0
+        return float(value)
+    if pd.api.types.is_datetime64_any_dtype(column):
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return pd.NaT
+        return pd.to_datetime(value, errors="coerce")
+    return value
+
+
+def _expand_sales_plan_to_monthly(sales_df: pd.DataFrame, frequency: str) -> pd.DataFrame:
+    if sales_df is None or sales_df.empty:
+        return pd.DataFrame(columns=["date", "sku_id", "channel", "units"])
+    base = sales_df.copy()
+    if "date" not in base.columns:
+        return pd.DataFrame(columns=["date", "sku_id", "channel", "units"])
+    base["date"] = pd.to_datetime(base["date"], errors="coerce")
+    base["units"] = pd.to_numeric(base.get("units", 0.0), errors="coerce").fillna(0.0)
+    base = base.dropna(subset=["date"])
+    if frequency == "monthly":
+        return base[["date", "sku_id", "channel", "units"]].copy()
+
+    rows = []
+    for _, r in base.iterrows():
+        dt = pd.to_datetime(r["date"])
+        if frequency == "quarterly":
+            start = dt.to_period("Q").start_time
+            month_points = pd.date_range(start=start, periods=3, freq="MS")
+        else:
+            start = dt.to_period("Y").start_time
+            month_points = pd.date_range(start=start, periods=12, freq="MS")
+        portion = float(r["units"]) / max(len(month_points), 1)
+        for month_dt in month_points:
+            rows.append(
+                {
+                    "date": month_dt,
+                    "sku_id": r.get("sku_id"),
+                    "channel": r.get("channel"),
+                    "units": portion,
+                }
+            )
+    return pd.DataFrame(rows, columns=["date", "sku_id", "channel", "units"])
+
+
+def _compress_monthly_sales_plan(monthly_df: pd.DataFrame, frequency: str) -> pd.DataFrame:
+    if monthly_df is None or monthly_df.empty:
+        return pd.DataFrame(columns=["date", "sku_id", "channel", "units"])
+    out = monthly_df.copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out["units"] = pd.to_numeric(out.get("units", 0.0), errors="coerce").fillna(0.0)
+    out = out.dropna(subset=["date"])
+    if frequency == "monthly":
+        out["date"] = out["date"].dt.to_period("M").dt.start_time
+    elif frequency == "quarterly":
+        out["date"] = out["date"].dt.to_period("Q").dt.start_time
+    else:
+        out["date"] = out["date"].dt.to_period("Y").dt.start_time
+    out = (
+        out.groupby(["date", "sku_id", "channel"], dropna=False, as_index=False)["units"]
+        .sum()
+        .sort_values(["date", "sku_id", "channel"])
+        .reset_index(drop=True)
+    )
+    return out
+
+
+def _fill_monthly_sales_plan_to_timeline(
+    monthly_df: pd.DataFrame,
+    idx: pd.DatetimeIndex,
+    fallback_monthly_df: pd.DataFrame,
+) -> pd.DataFrame:
+    monthly = monthly_df.copy()
+    monthly["date"] = pd.to_datetime(monthly.get("date"), errors="coerce")
+    monthly["units"] = pd.to_numeric(monthly.get("units", 0.0), errors="coerce").fillna(0.0)
+    monthly = monthly.dropna(subset=["date"])
+    monthly = monthly[monthly["date"].isin(idx)].copy()
+
+    fallback = fallback_monthly_df.copy()
+    fallback["date"] = pd.to_datetime(fallback.get("date"), errors="coerce")
+    fallback = fallback.dropna(subset=["date"])
+    fallback = fallback[fallback["date"].isin(idx)].copy()
+
+    if monthly.empty:
+        monthly = fallback.copy()
+
+    combos = monthly[["sku_id", "channel"]].drop_duplicates() if not monthly.empty else fallback[["sku_id", "channel"]].drop_duplicates()
+    if combos.empty:
+        return pd.DataFrame(columns=["date", "sku_id", "channel", "units"])
+
+    skeleton_rows = []
+    for _, combo in combos.iterrows():
+        for dt in idx:
+            skeleton_rows.append({"date": dt, "sku_id": combo["sku_id"], "channel": combo["channel"], "units": 0.0})
+    skeleton = pd.DataFrame(skeleton_rows)
+
+    observed = (
+        monthly.groupby(["date", "sku_id", "channel"], as_index=False)["units"]
+        .sum()
+    )
+    merged = skeleton.merge(observed, on=["date", "sku_id", "channel"], how="left", suffixes=("_base", "_obs"))
+    merged["units"] = merged["units_obs"].fillna(merged["units_base"])
+    return merged[["date", "sku_id", "channel", "units"]].sort_values(["date", "sku_id", "channel"]).reset_index(drop=True)
+
+
+def _sales_plan_editor_view(sales_df: pd.DataFrame, frequency: str) -> pd.DataFrame:
+    if sales_df is None or sales_df.empty:
+        label = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}[frequency]
+        return pd.DataFrame(columns=[label, "sku_id", "channel", "units"])
+    view = sales_df.copy()
+    view["date"] = pd.to_datetime(view["date"], errors="coerce")
+    if frequency == "monthly":
+        view.insert(0, "month", view["date"].dt.to_period("M").astype(str))
+        view = view.drop(columns=["date"])
+    elif frequency == "quarterly":
+        view.insert(0, "quarter", view["date"].dt.to_period("Q").astype(str).str.replace("Q", "-Q", regex=False))
+        view = view.drop(columns=["date"])
+    else:
+        view.insert(0, "year", view["date"].dt.year.astype("Int64").astype(str))
+        view = view.drop(columns=["date"])
+    return view
+
+
+def _sales_plan_editor_view_to_base(view_df: pd.DataFrame, frequency: str) -> pd.DataFrame:
+    if view_df is None or view_df.empty:
+        return pd.DataFrame(columns=["date", "sku_id", "channel", "units"])
+    out = view_df.copy()
+    safe_col = lambda name, default="": out[name] if name in out.columns else pd.Series([default] * len(out), index=out.index)
+    if frequency == "monthly":
+        out["date"] = pd.to_datetime(safe_col("month"), errors="coerce").dt.to_period("M").dt.start_time
+        out = out.drop(columns=["month"], errors="ignore")
+    elif frequency == "quarterly":
+        quarter_raw = safe_col("quarter").astype(str).str.upper().str.replace(" ", "", regex=False).str.replace("-Q", "Q", regex=False)
+        extracted = quarter_raw.str.extract(r"(?P<year>\d{4})Q(?P<q>[1-4])")
+        year = pd.to_numeric(extracted["year"], errors="coerce")
+        q = pd.to_numeric(extracted["q"], errors="coerce")
+        month = ((q - 1) * 3 + 1).astype("Int64")
+        out["date"] = pd.to_datetime(
+            year.astype("Int64").astype(str) + "-" + month.astype(str).str.zfill(2) + "-01",
+            errors="coerce",
+        )
+        out = out.drop(columns=["quarter"], errors="ignore")
+    else:
+        year_numeric = pd.to_numeric(safe_col("year"), errors="coerce")
+        out["date"] = pd.to_datetime(year_numeric.astype("Int64").astype(str) + "-01-01", errors="coerce")
+        out = out.drop(columns=["year"], errors="ignore")
+    out["units"] = pd.to_numeric(out.get("units", 0.0), errors="coerce")
+    return out[["date", "sku_id", "channel", "units"]]
 
 
 def _dynamic_table_editor(title: str, key: str, default_df: pd.DataFrame, label: str = "row") -> pd.DataFrame:
@@ -362,27 +600,47 @@ def _dynamic_table_editor(title: str, key: str, default_df: pd.DataFrame, label:
 def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
     skus = _non_empty_rows(st.session_state.get("assump_data_skus", base_inputs.skus)).copy()
     channels = _non_empty_rows(st.session_state.get("assump_data_channels", base_inputs.channels)).copy()
-    sales_plan = _non_empty_rows(st.session_state.get("assump_data_sales_plan", base_inputs.sales_plan)).copy()
+    sales_plan = _non_empty_rows(st.session_state.get("assump_data_sales_plan_base", base_inputs.sales_plan)).copy()
+    sales_plan_frequency = st.session_state.get("assump_sales_plan_frequency", base_inputs.sales_plan_frequency)
 
-    opex_src = st.session_state.get("assump_data_opex_fixed")
-    if isinstance(opex_src, pd.DataFrame) and not opex_src.empty and "date" in opex_src.columns:
-        if len(opex_src) == 1 and str(opex_src.iloc[0]["date"]) == "all_months":
-            opex_fixed_monthly = float(opex_src.iloc[0]["opex_fixed_monthly"])
-        else:
-            s = pd.Series(opex_src["opex_fixed_monthly"].values, index=pd.to_datetime(opex_src["date"]))
-            opex_fixed_monthly = s
+    cp_src = st.session_state.get("assump_data_cost_pools")
+    if isinstance(cp_src, pd.DataFrame):
+        cp_src = _non_empty_rows(cp_src)
+        cost_pools = [
+            CostPoolInput(
+                name=str(r["name"]),
+                cost_type=str(r.get("cost_type", "indirect")),
+                behavior=str(r.get("behavior", "blended")),
+                allocation_driver=str(r.get("allocation_driver", "units")),
+                scope=str(r.get("scope", "global")),
+                channel=None if pd.isna(r.get("channel")) else str(r.get("channel")),
+                unit_variable_cost=float(r.get("unit_variable_cost", 0.0)),
+                fixed_monthly_cost=float(r.get("fixed_monthly_cost", 0.0)),
+                step_threshold=float(r.get("step_threshold", 0.0)),
+                step_increment=float(r.get("step_increment", 0.0)),
+            )
+            for _, r in cp_src.iterrows()
+            if pd.notna(r.get("name"))
+        ]
     else:
-        opex_fixed_monthly = base_inputs.opex_fixed_monthly
+        cost_pools = base_inputs.cost_pools
 
     oi_src = st.session_state.get("assump_data_other_income")
-    if isinstance(oi_src, pd.DataFrame) and not oi_src.empty and "date" in oi_src.columns:
-        if len(oi_src) == 1 and str(oi_src.iloc[0]["date"]) == "all_months":
-            other_income_monthly = float(oi_src.iloc[0]["other_income_monthly"])
-        else:
-            s = pd.Series(oi_src["other_income_monthly"].values, index=pd.to_datetime(oi_src["date"]))
-            other_income_monthly = s
+    if isinstance(oi_src, pd.DataFrame):
+        oi_src = _non_empty_rows(oi_src)
+        other_income_items = [
+            OtherIncomeItem(
+                other_income_name=str(r.get("other_income_name")),
+                amount=float(r.get("amount", 0.0)),
+                active=_coerce_bool(r.get("active", True)),
+                category=None if pd.isna(r.get("category")) else str(r.get("category")),
+                notes=None if pd.isna(r.get("notes")) else str(r.get("notes")),
+            )
+            for _, r in oi_src.iterrows()
+            if pd.notna(r.get("other_income_name"))
+        ]
     else:
-        other_income_monthly = base_inputs.other_income_monthly
+        other_income_items = base_inputs.other_income_items
 
     capex_src = st.session_state.get("assump_data_capex")
     if isinstance(capex_src, pd.DataFrame):
@@ -434,12 +692,100 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
         skus=skus,
         channels=channels,
         sales_plan=sales_plan,
-        opex_fixed_monthly=opex_fixed_monthly,
-        other_income_monthly=other_income_monthly,
+        sales_plan_frequency=str(sales_plan_frequency),
+        cost_pools=cost_pools,
+        other_income_items=other_income_items,
         capex_items=capex_items,
         debt_facilities=debt_facilities,
         equity_injections=equity_injections,
     )
+
+
+def _sales_plan_assumption_editor(base_sales_plan: pd.DataFrame, base_frequency: str, cfg: ModelConfig) -> pd.DataFrame:
+    canonical_key = "assump_data_sales_plan_base"
+    frequency_options = {"Monthly": "monthly", "Quarterly": "quarterly", "Yearly": "yearly"}
+    reverse_options = {v: k for k, v in frequency_options.items()}
+
+    if "assump_sales_plan_frequency" not in st.session_state:
+        st.session_state["assump_sales_plan_frequency"] = base_frequency
+    current_frequency = str(st.session_state["assump_sales_plan_frequency"])
+    if current_frequency not in reverse_options:
+        current_frequency = "monthly"
+
+    selected_label = st.selectbox(
+        "Sales plan frequency",
+        options=list(frequency_options.keys()),
+        index=list(frequency_options.values()).index(current_frequency),
+        key="assump_sales_plan_frequency_selector",
+        help="Sales plan schedule granularity shown in the table and used by the model.",
+    )
+    selected_frequency = frequency_options[selected_label]
+
+    previous_frequency = str(st.session_state.get("assump_prev_sales_plan_frequency", current_frequency))
+    if canonical_key not in st.session_state and "assump_data_sales_plan" in st.session_state:
+        st.session_state[canonical_key] = st.session_state.get("assump_data_sales_plan")
+    canonical_plan = _non_empty_rows(st.session_state.get(canonical_key, base_sales_plan)).copy()
+    if canonical_plan is None:
+        canonical_plan = base_sales_plan.copy()
+
+    idx = pd.date_range(cfg.start_date, periods=cfg.months, freq="MS")
+    fallback_monthly = _expand_sales_plan_to_monthly(base_sales_plan, base_frequency)
+
+    if selected_frequency != previous_frequency:
+        monthly = _expand_sales_plan_to_monthly(canonical_plan, previous_frequency)
+        monthly = _fill_monthly_sales_plan_to_timeline(monthly, idx, fallback_monthly)
+        canonical_plan = _compress_monthly_sales_plan(monthly, selected_frequency)
+        st.session_state[canonical_key] = canonical_plan.copy()
+        st.session_state["assump_data_sales_plan"] = _sales_plan_editor_view(canonical_plan, selected_frequency)
+        st.session_state["assump_saved_sales_plan"] = st.session_state["assump_data_sales_plan"].copy()
+        st.session_state["assump_work_sales_plan"] = st.session_state["assump_data_sales_plan"].copy()
+        st.session_state["assump_edit_sales_plan"] = False
+
+    st.session_state["assump_sales_plan_frequency"] = selected_frequency
+    st.session_state["assump_prev_sales_plan_frequency"] = selected_frequency
+
+    monthly_for_view = _expand_sales_plan_to_monthly(canonical_plan, selected_frequency)
+    monthly_for_view = _fill_monthly_sales_plan_to_timeline(monthly_for_view, idx, fallback_monthly)
+    canonical_plan = _compress_monthly_sales_plan(monthly_for_view, selected_frequency)
+    st.session_state[canonical_key] = canonical_plan.copy()
+
+    view_df = _sales_plan_editor_view(canonical_plan, selected_frequency)
+    if not st.session_state.get("assump_edit_sales_plan", False):
+        st.session_state["assump_data_sales_plan"] = view_df.copy()
+        st.session_state["assump_saved_sales_plan"] = view_df.copy()
+        st.session_state["assump_work_sales_plan"] = view_df.copy()
+    edited_view = _assumption_editor("Sales plan", "sales_plan", view_df)
+    edited_base = _sales_plan_editor_view_to_base(edited_view, selected_frequency)
+    st.session_state[canonical_key] = edited_base.copy()
+    return edited_base
+
+
+def _sync_model_timeline_state(cfg: ModelConfig, base_inputs: ModelInputs) -> None:
+    timeline_sig = (str(cfg.start_date), int(cfg.months))
+    previous_sig = st.session_state.get("assump_timeline_signature")
+    if previous_sig == timeline_sig:
+        return
+
+    freq = str(st.session_state.get("assump_sales_plan_frequency", base_inputs.sales_plan_frequency))
+    if freq not in {"monthly", "quarterly", "yearly"}:
+        freq = "monthly"
+    idx = pd.date_range(cfg.start_date, periods=cfg.months, freq="MS")
+
+    canonical_key = "assump_data_sales_plan_base"
+    current_sales = st.session_state.get(canonical_key, base_inputs.sales_plan)
+    current_sales = _non_empty_rows(current_sales).copy() if isinstance(current_sales, pd.DataFrame) else base_inputs.sales_plan.copy()
+
+    monthly_current = _expand_sales_plan_to_monthly(current_sales, freq)
+    fallback_monthly = _expand_sales_plan_to_monthly(base_inputs.sales_plan, base_inputs.sales_plan_frequency)
+    monthly_current = _fill_monthly_sales_plan_to_timeline(monthly_current, idx, fallback_monthly)
+
+    canonical_sales = _compress_monthly_sales_plan(monthly_current, freq)
+    st.session_state[canonical_key] = canonical_sales.copy()
+    st.session_state["assump_data_sales_plan"] = _sales_plan_editor_view(canonical_sales, freq)
+    st.session_state["assump_saved_sales_plan"] = st.session_state["assump_data_sales_plan"].copy()
+    st.session_state["assump_work_sales_plan"] = st.session_state["assump_data_sales_plan"].copy()
+    st.session_state["assump_edit_sales_plan"] = False
+    st.session_state["assump_timeline_signature"] = timeline_sig
 
 
 def _valuation_section(result) -> None:
@@ -571,14 +917,10 @@ def _charts_section(result) -> None:
 def _download_section(result) -> None:
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        result.monthly.to_excel(writer, sheet_name="Monthly_Statements")
-        result.annual.to_excel(writer, sheet_name="Annual_Summary")
-        result.prices.to_excel(writer, sheet_name="Prices")
-        for name, df in result.debt_schedules.items():
-            df.to_excel(writer, sheet_name=f"Debt_{name[:25]}")
+        write_comprehensive_excel_report(result, writer)
     buffer.seek(0)
     st.download_button(
-        label="Download Excel outputs",
+        label="Download Excel output (Comprehensive Pack)",
         data=buffer,
         file_name="brewery_model_output.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -966,6 +1308,15 @@ def _internal_findings_snapshot(result, inputs: ModelInputs, cfg: ModelConfig, d
     annual = result.annual.copy()
     latest_annual = annual.iloc[-1].to_dict() if len(annual) else {}
     latest_monthly = result.monthly.iloc[-1].to_dict() if len(result.monthly) else {}
+    ratios = {}
+    if latest_annual.get("ebitda") not in [None, 0] and latest_monthly.get("debt_ending_balance") is not None:
+        ratios["debt_to_ebitda"] = float(latest_monthly.get("debt_ending_balance", 0.0)) / max(float(latest_annual.get("ebitda", 0.0)), 1e-9)
+    if latest_monthly.get("cash") is not None and latest_monthly.get("debt_ending_balance") not in [None, 0]:
+        ratios["cash_to_debt"] = float(latest_monthly.get("cash", 0.0)) / max(float(latest_monthly.get("debt_ending_balance", 0.0)), 1e-9)
+    if latest_annual.get("ebit") is not None and latest_annual.get("interest_expense") not in [None, 0]:
+        ratios["dscr"] = float(latest_annual.get("ebit", 0.0)) / max(float(latest_annual.get("interest_expense", 0.0)), 1e-9)
+    if latest_monthly.get("current_assets") is not None and latest_monthly.get("current_liabilities") not in [None, 0]:
+        ratios["current_ratio"] = float(latest_monthly.get("current_assets", 0.0)) / max(float(latest_monthly.get("current_liabilities", 0.0)), 1e-9)
     return {
         "model_governance": {
             "start_date": cfg.start_date,
@@ -994,6 +1345,9 @@ def _internal_findings_snapshot(result, inputs: ModelInputs, cfg: ModelConfig, d
         "advanced_analytics": {
             "valuation_summary": result.valuation,
         },
+        "latest_annual": latest_annual,
+        "latest_monthly": latest_monthly,
+        "ratios": ratios,
     }
 
 
@@ -1054,27 +1408,55 @@ def _live_web_headlines(query: str) -> list[dict]:
 def _ai_decision_making_page(result, inputs: ModelInputs, cfg: ModelConfig, div: DividendPolicy) -> None:
     st.subheader("AI Decision Making")
     st.caption(
-        "Unified AI intelligence engine: combines internal model intelligence with web-based best-practice comparison."
+        "Context-aware model Q&A: answers assumptions, calculations, outputs, schedules, logic, dependencies, and scenario follow-ups."
     )
+    if "decision_memory" not in st.session_state:
+        st.session_state["decision_memory"] = DecisionSessionMemory()
+    memory: DecisionSessionMemory = st.session_state["decision_memory"]
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("Clear Q&A context"):
+            st.session_state["decision_memory"] = DecisionSessionMemory()
+            memory = st.session_state["decision_memory"]
+            st.success("Conversation context was cleared.")
+    with c2:
+        st.caption(f"Questions in context: {len(memory.turns)}")
+
     question = st.text_area("Ask a decision question", placeholder="Example: Is our dividend policy and DSCR resilient under downside scenarios?")
     run = st.button("Analyze question")
     if not run or not question.strip():
+        if memory.turns:
+            st.markdown("### Previous Q&A context")
+            for i, turn in enumerate(memory.turns[-5:], start=max(1, len(memory.turns) - 4)):
+                st.markdown(f"**Q{i}:** {turn.question}")
+                st.markdown(f"**A{i}:** {turn.answer}")
         return
 
     internal = _internal_findings_snapshot(result, inputs, cfg, div)
-    curated_sources = _best_practice_sources_by_topic(question)
+    qtype = classify_question(question, memory)
+    benchmark_query_map = {
+        QuestionType.VALUATION: "craft beverage EV EBITDA multiples lower middle market",
+        QuestionType.PROFITABILITY: "beverage industry EBITDA margin benchmark",
+        QuestionType.LIQUIDITY: "small business current ratio benchmark debt liquidity",
+        QuestionType.LEVERAGE: "Debt EBITDA covenant range DSCR benchmark",
+        QuestionType.GROWTH: "beverage market revenue growth benchmark",
+        QuestionType.PRICING: "beverage pricing power gross margin benchmark",
+        QuestionType.EFFICIENCY: "beverage COGS opex benchmark",
+        QuestionType.RISK: "brewery downside scenario debt coverage benchmark",
+    }
+    benchmark_query = benchmark_query_map.get(qtype, question)
+    curated_sources = _best_practice_sources_by_topic(f"{question} {benchmark_query}")
     live_sources = []
     live_error = None
     try:
-        live_sources = _live_web_headlines(question)
+        live_sources = _live_web_headlines(benchmark_query)
     except Exception as e:
         live_error = str(e)
 
-    st.markdown("### Executive answer")
-    st.write(
-        "Based on internal model outputs and benchmark guidance, your question requires balancing profitability, "
-        "cash resilience, and governance controls. The recommendation below highlights where current settings are robust versus where safeguards should be tightened."
-    )
+    st.markdown("### Decision answer")
+    turn = build_structured_answer(question, internal, memory, web_sources=live_sources)
+    st.markdown(turn.answer)
 
     st.markdown("### Internal model findings")
     mg = internal.get("model_governance", {})
@@ -1105,7 +1487,7 @@ def _ai_decision_making_page(result, inputs: ModelInputs, cfg: ModelConfig, div:
             f"annual IRR **{va.get('equity_irr_annual', 0):.2%}**, and MOIC **{va.get('equity_moic', 0):,.2f}x**."
         )
 
-    st.markdown("### Web-based best-practice comparison")
+    st.markdown("### Web-based benchmark references")
     st.markdown("**Curated authoritative references**")
     for s in curated_sources:
         st.markdown(f"- [{s['name']}]({s['url']})")
@@ -1128,6 +1510,13 @@ def _ai_decision_making_page(result, inputs: ModelInputs, cfg: ModelConfig, div:
         "1. Formalize benchmark hurdles (DSCR, leverage, runway) as hard controls.\n"
         "2. Tie dividend activation to downside-case resilience, not base case only.\n"
         "3. Add periodic benchmark refresh against external references shown below."
+    )
+
+    st.markdown("### Conversation continuity")
+    st.markdown(
+        f"- Question type detected: **{turn.question_type.value}**\n"
+        f"- Topic tags: **{', '.join(turn.topics)}**\n"
+        f"- Context window size: **{len(memory.turns)} turn(s)**"
     )
 
     st.markdown("### Sources")
@@ -1233,8 +1622,6 @@ def main() -> None:
         row = config_table_state.iloc[0]
         cfg = replace(
             cfg,
-            start_date=str(row.get("start_date", cfg.start_date)),
-            months=int(row.get("months", cfg.months)),
             price_inflation_annual=float(row.get("price_inflation_annual", cfg.price_inflation_annual)),
             cost_inflation_annual=float(row.get("cost_inflation_annual", cfg.cost_inflation_annual)),
             tax_rate=float(row.get("tax_rate", cfg.tax_rate)),
@@ -1254,6 +1641,7 @@ def main() -> None:
         )
 
     base_inputs = _build_sample_assumptions(cfg, div)
+    _sync_model_timeline_state(cfg, base_inputs)
     inputs = _build_inputs_from_state(base_inputs)
     model = MicrobreweryFinancialModel(cfg, div, inputs)
     result = model.run()
@@ -1263,6 +1651,7 @@ def main() -> None:
         _statement_section(result)
         _charts_section(result)
         _schedules_section(result)
+        _driver_based_opex_views_section(result)
         _download_section(result)
 
         st.caption(
@@ -1332,24 +1721,49 @@ def main() -> None:
                 }
             ]
         )
-        opex_df = pd.DataFrame(
-            [{"date": d, "opex_fixed_monthly": v} for d, v in inputs.opex_fixed_monthly.items()]
-            if isinstance(inputs.opex_fixed_monthly, pd.Series)
-            else [{"date": "all_months", "opex_fixed_monthly": float(inputs.opex_fixed_monthly)}]
+        cost_pool_df = pd.DataFrame(
+            [
+                {
+                    "name": p.name,
+                    "cost_type": p.cost_type,
+                    "behavior": p.behavior,
+                    "allocation_driver": p.allocation_driver,
+                    "scope": p.scope,
+                    "channel": p.channel,
+                    "unit_variable_cost": p.unit_variable_cost,
+                    "fixed_monthly_cost": p.fixed_monthly_cost,
+                    "step_threshold": p.step_threshold,
+                    "step_increment": p.step_increment,
+                }
+                for p in (inputs.cost_pools or [])
+            ]
         )
         other_income_df = pd.DataFrame(
-            [{"date": d, "other_income_monthly": v} for d, v in inputs.other_income_monthly.items()]
-            if isinstance(inputs.other_income_monthly, pd.Series)
-            else [{"date": "all_months", "other_income_monthly": float(inputs.other_income_monthly)}]
+            [
+                {
+                    "other_income_name": item.other_income_name,
+                    "amount": item.amount,
+                    "active": "True" if item.active else "False",
+                    "category": item.category,
+                    "notes": item.notes,
+                }
+                for item in (inputs.other_income_items or [])
+            ]
         )
+
+        if not st.session_state.get("assump_edit_config", False):
+            st.session_state["assump_data_config"] = config_df.copy()
+            st.session_state["assump_saved_config"] = config_df.copy()
+            st.session_state["assump_work_config"] = config_df.copy()
 
         _assumption_editor("Model config assumptions", "config", config_df)
         _assumption_editor("Dividend assumptions", "dividend", dividend_df)
+        st.caption("`direct_cost_per_unit` is derived from direct cost pools. Use `direct_cost_per_unit_override` only for explicit manual overrides.")
         _assumption_editor("SKUs", "skus", inputs.skus)
         _assumption_editor("Channels", "channels", inputs.channels)
-        _assumption_editor("Sales plan", "sales_plan", inputs.sales_plan)
-        _assumption_editor("OPEX fixed monthly", "opex_fixed", opex_df)
-        _assumption_editor("Other income monthly", "other_income", other_income_df)
+        _sales_plan_assumption_editor(inputs.sales_plan, inputs.sales_plan_frequency, cfg)
+        _assumption_editor("Cost pools", "cost_pools", cost_pool_df)
+        _assumption_editor("Other income items", "other_income", other_income_df)
         _assumption_editor("CAPEX schedule", "capex", capex_df)
         _assumption_editor("Debt facilities", "debt", debt_df)
         _assumption_editor("Equity injections", "equity", equity_df)

@@ -35,10 +35,14 @@ Notes:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Dict, Iterable, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from finmodel.allocation import allocate_opex_by_drivers
+from finmodel.opex_defaults import build_default_opex_cost_pools
+from finmodel.opex_schemas import OpexCostPool, SKUCostContext
 
 
 # =============================
@@ -144,20 +148,45 @@ class CapexItem:
     depreciation_years: float = 0.0  # 0 => non-depreciable (e.g., land)
 
 
+@dataclass(frozen=True)
+class CostPoolInput:
+    name: str
+    cost_type: Literal["direct", "indirect"] = "indirect"
+    behavior: Literal["variable", "fixed", "step_fixed", "blended"] = "blended"
+    allocation_driver: Literal["units", "liters", "revenue", "channel_units", "channel_revenue", "active_sku", "complexity"] = "units"
+    scope: Literal["global", "family", "channel", "sku"] = "global"
+    channel: Optional[str] = None
+    unit_variable_cost: float = 0.0
+    fixed_monthly_cost: float = 0.0
+    step_threshold: float = 0.0
+    step_increment: float = 0.0
+
+
+@dataclass(frozen=True)
+class OtherIncomeItem:
+    other_income_name: str
+    amount: float
+    active: bool = True
+    category: Optional[str] = None
+    notes: Optional[str] = None
+
+
 @dataclass
 class ModelInputs:
     """
     Required inputs:
     - skus: DataFrame with at minimum:
-        sku_id (unique), name, direct_cost_per_unit, markup_pct, relative_opex_weight (optional)
+        sku_id (unique), name, markup_pct, relative_opex_weight (optional)
+      direct_cost_per_unit is derived from direct cost pools unless explicit override is provided.
     - channels: DataFrame with at minimum:
         channel (unique), price_factor
     - sales_plan: DataFrame with columns:
         date (datetime), sku_id, channel, units
 
     Optional inputs:
-    - opex_fixed_monthly: Series indexed by date (monthly) or scalar float
-    - other_income_monthly: Series indexed by date or scalar float
+    - other_income_items: list of OtherIncomeItem with monthly amounts
+    - other_income_monthly: (deprecated compatibility path) Series indexed by date or scalar float
+    - cost_pools: list of CostPoolInput
     - capex_items: list of CapexItem
     - debt_facilities: list of DebtFacility
     - equity_injections: dict month -> amount (positive cash-in)
@@ -165,9 +194,11 @@ class ModelInputs:
     skus: pd.DataFrame
     channels: pd.DataFrame
     sales_plan: pd.DataFrame
+    sales_plan_frequency: Literal["monthly", "quarterly", "yearly"] = "monthly"
 
-    opex_fixed_monthly: float | pd.Series = 0.0
+    other_income_items: Optional[List[OtherIncomeItem]] = None
     other_income_monthly: float | pd.Series = 0.0
+    cost_pools: Optional[List[CostPoolInput]] = None
 
     capex_items: Optional[List[CapexItem]] = None
     debt_facilities: Optional[List[DebtFacility]] = None
@@ -181,6 +212,7 @@ class ModelRunResult:
     prices: pd.DataFrame
     debt_schedules: Dict[str, pd.DataFrame]
     valuation: Dict[str, float]
+    opex_allocation_views: Dict[str, pd.DataFrame]
 
 
 # =============================
@@ -205,13 +237,19 @@ class MicrobreweryFinancialModel:
         channels = self.inputs.channels.copy()
         sales = self.inputs.sales_plan.copy()
 
-        required_sku_cols = {"sku_id", "name", "direct_cost_per_unit", "markup_pct"}
+        required_sku_cols = {"sku_id", "name", "markup_pct"}
         missing = required_sku_cols - set(skus.columns)
         if missing:
             raise ValueError(f"skus is missing columns: {sorted(missing)}")
 
+        if "direct_cost_per_unit" not in skus.columns:
+            skus["direct_cost_per_unit"] = 0.0
+        if "direct_cost_per_unit_override" not in skus.columns:
+            skus["direct_cost_per_unit_override"] = np.nan
         if "relative_opex_weight" not in skus.columns:
             skus["relative_opex_weight"] = 1.0
+        else:
+            skus["relative_opex_weight"] = skus["relative_opex_weight"].replace("", np.nan).fillna(1.0)
 
         required_channel_cols = {"channel", "price_factor"}
         missing = required_channel_cols - set(channels.columns)
@@ -227,6 +265,33 @@ class MicrobreweryFinancialModel:
         sales["date"] = pd.to_datetime(sales["date"])
         # Make sku_id type consistent
         sales["sku_id"] = sales["sku_id"].astype(skus["sku_id"].dtype, copy=False)
+        sales["units"] = pd.to_numeric(sales["units"], errors="coerce")
+
+        # Enforce numeric columns to avoid object-dtype arithmetic TypeErrors.
+        sku_numeric_cols = ["direct_cost_per_unit", "direct_cost_per_unit_override", "markup_pct", "relative_opex_weight"]
+        for col in sku_numeric_cols:
+            skus[col] = pd.to_numeric(skus[col], errors="coerce")
+        skus["direct_cost_per_unit_override"] = skus["direct_cost_per_unit_override"].where(
+            skus["direct_cost_per_unit_override"].notna(),
+            np.nan,
+        )
+        channels["price_factor"] = pd.to_numeric(channels["price_factor"], errors="coerce")
+
+        required_numeric = ["direct_cost_per_unit", "markup_pct", "relative_opex_weight"]
+        if skus[required_numeric].isna().any().any():
+            bad_rows = skus.loc[skus[required_numeric].isna().any(axis=1), ["sku_id", "name"]].to_dict("records")
+            raise ValueError(
+                "skus has non-numeric values in direct_cost_per_unit/direct_cost_per_unit_override/markup_pct/relative_opex_weight "
+                f"for rows: {bad_rows}"
+            )
+        if channels["price_factor"].isna().any():
+            bad_channels = channels.loc[channels["price_factor"].isna(), "channel"].tolist()
+            raise ValueError(f"channels has non-numeric price_factor for channels: {bad_channels}")
+        if sales["units"].isna().any():
+            bad_sales = sales.loc[sales["units"].isna(), ["date", "sku_id", "channel"]].to_dict("records")
+            raise ValueError(f"sales_plan has non-numeric units for rows: {bad_sales}")
+        if self.inputs.sales_plan_frequency not in {"monthly", "quarterly", "yearly"}:
+            raise ValueError("sales_plan_frequency must be one of: monthly, quarterly, yearly")
 
         # Keep normalized copies
         self.inputs.skus = skus
@@ -239,6 +304,19 @@ class MicrobreweryFinancialModel:
             self.inputs.debt_facilities = []
         if self.inputs.equity_injections is None:
             self.inputs.equity_injections = {}
+        if self.inputs.cost_pools is None:
+            self.inputs.cost_pools = []
+        if self.inputs.other_income_items is None:
+            self.inputs.other_income_items = []
+
+    def _other_income_series(self, idx: pd.DatetimeIndex) -> pd.Series:
+        if self.inputs.other_income_items:
+            total = 0.0
+            for item in self.inputs.other_income_items:
+                if bool(item.active):
+                    total += float(item.amount)
+            return pd.Series(total, index=idx, name="other_income")
+        return self._as_monthly_series(self.inputs.other_income_monthly, idx, "other_income")
 
     # ---------- timeline ----------
     def _timeline(self) -> pd.DatetimeIndex:
@@ -261,16 +339,46 @@ class MicrobreweryFinancialModel:
         return pd.Series(float(x), index=idx, name=name)
 
     # ---------- sales ----------
+    def _expand_sales_plan_to_monthly(self, idx: pd.DatetimeIndex) -> pd.DataFrame:
+        sales = self.inputs.sales_plan.copy()
+        sales["date"] = pd.to_datetime(sales["date"], errors="coerce")
+        sales = sales.dropna(subset=["date"])
+        freq = self.inputs.sales_plan_frequency
+        if freq == "monthly":
+            return sales
+
+        rows: List[Dict[str, object]] = []
+        for _, r in sales.iterrows():
+            date = pd.to_datetime(r["date"], errors="coerce")
+            if pd.isna(date):
+                continue
+            if freq == "quarterly":
+                start = date.to_period("Q").start_time
+                months = pd.date_range(start=start, periods=3, freq="MS")
+            else:
+                start = date.to_period("Y").start_time
+                months = pd.date_range(start=start, periods=12, freq="MS")
+            months = [m for m in months if m in set(idx)]
+            if not months:
+                continue
+            portion = float(r["units"]) / len(months)
+            for m in months:
+                rows.append({"date": m, "sku_id": r["sku_id"], "channel": r["channel"], "units": portion})
+        return pd.DataFrame(rows, columns=["date", "sku_id", "channel", "units"])
+
     def _units_matrix(self, idx: pd.DatetimeIndex) -> pd.DataFrame:
         """
         Returns monthly units sold as a wide DataFrame with MultiIndex columns:
             (sku_id, channel)
         Missing combinations are filled with 0.
         """
-        sales = self.inputs.sales_plan.copy()
+        sales = self._expand_sales_plan_to_monthly(idx)
         sales = sales[sales["date"].isin(idx)].copy()
         if sales.empty:
-            return pd.DataFrame(index=idx)
+            return pd.DataFrame(
+                index=idx,
+                columns=pd.MultiIndex.from_tuples([], names=["sku_id", "channel"]),
+            )
 
         wide = (
             sales.pivot_table(
@@ -285,7 +393,221 @@ class MicrobreweryFinancialModel:
         )
         return wide.sort_index(axis=1)
 
+    def _estimated_revenue_wide_from_units(self, idx: pd.DatetimeIndex, units_wide: pd.DataFrame) -> pd.DataFrame:
+        if units_wide.empty:
+            return pd.DataFrame(index=idx)
+        skus = self.inputs.skus.set_index("sku_id")
+        channels = self.inputs.channels.set_index("channel")
+        cols: List[Tuple[int, str]] = []
+        data: List[np.ndarray] = []
+        for sku_id, row in skus.iterrows():
+            base_direct_cost = float(row.get("direct_cost_per_unit_override", np.nan))
+            if not np.isfinite(base_direct_cost) or base_direct_cost <= 0:
+                base_direct_cost = float(row.get("direct_cost_per_unit", 0.0))
+            if not np.isfinite(base_direct_cost) or base_direct_cost <= 0:
+                base_direct_cost = 1.0
+            base_price = base_direct_cost * (1.0 + float(row["markup_pct"]))
+            for ch, ch_row in channels.iterrows():
+                cols.append((sku_id, ch))
+                data.append(np.full(len(idx), base_price * float(ch_row["price_factor"])))
+        price_proxy = pd.DataFrame(
+            np.array(data).T,
+            index=idx,
+            columns=pd.MultiIndex.from_tuples(cols, names=["sku_id", "channel"]),
+        ).sort_index(axis=1)
+        return units_wide.mul(price_proxy, fill_value=0.0)
+
+    def _pool_driver_series(
+        self,
+        idx: pd.DatetimeIndex,
+        units_wide: pd.DataFrame,
+        revenue_wide: pd.DataFrame,
+        pool: CostPoolInput,
+    ) -> pd.Series:
+        sku_levels = units_wide.columns.get_level_values(0) if isinstance(units_wide.columns, pd.MultiIndex) else pd.Index([])
+        channel_levels = units_wide.columns.get_level_values(1) if isinstance(units_wide.columns, pd.MultiIndex) else pd.Index([])
+        revenue_channel_levels = revenue_wide.columns.get_level_values(1) if isinstance(revenue_wide.columns, pd.MultiIndex) else pd.Index([])
+
+        if pool.allocation_driver == "units":
+            return units_wide.sum(axis=1).reindex(idx).fillna(0.0) if not units_wide.empty else pd.Series(0.0, index=idx)
+        if pool.allocation_driver == "liters":
+            liters = pd.Series(0.0, index=idx)
+            if not units_wide.empty:
+                for sku_id in self.inputs.skus["sku_id"].tolist():
+                    if sku_id not in sku_levels:
+                        continue
+                    liters_per = self._liters_per_unit_from_name(str(self.inputs.skus.set_index("sku_id").loc[sku_id, "name"]))
+                    sku_units = units_wide.xs(sku_id, axis=1, level=0, drop_level=False).sum(axis=1)
+                    liters = liters + sku_units * liters_per
+            return liters
+        if pool.allocation_driver == "revenue":
+            return revenue_wide.sum(axis=1).reindex(idx).fillna(0.0) if not revenue_wide.empty else pd.Series(0.0, index=idx)
+        if pool.allocation_driver == "channel_units":
+            if units_wide.empty:
+                return pd.Series(0.0, index=idx)
+            if pool.channel and pool.channel in channel_levels:
+                return units_wide.xs(pool.channel, axis=1, level=1, drop_level=False).sum(axis=1)
+            return units_wide.sum(axis=1)
+        if pool.allocation_driver == "channel_revenue":
+            if revenue_wide.empty:
+                return pd.Series(0.0, index=idx)
+            if pool.channel and pool.channel in revenue_channel_levels:
+                return revenue_wide.xs(pool.channel, axis=1, level=1, drop_level=False).sum(axis=1)
+            return revenue_wide.sum(axis=1)
+        if pool.allocation_driver == "active_sku":
+            if units_wide.empty:
+                return pd.Series(0.0, index=idx)
+            # pandas>=3 removed axis=1 on DataFrame.groupby; group columns through transpose.
+            sku_units = units_wide.T.groupby(level=0).sum().T
+            active = (sku_units > 0).sum(axis=1)
+            return active.astype(float)
+        if pool.allocation_driver == "complexity":
+            if units_wide.empty:
+                return pd.Series(0.0, index=idx)
+            sku_weights = self.inputs.skus.set_index("sku_id")["relative_opex_weight"].to_dict()
+            totals = pd.Series(0.0, index=idx)
+            for sku_id, w in sku_weights.items():
+                if sku_id not in sku_levels:
+                    continue
+                sku_units = units_wide.xs(sku_id, axis=1, level=0, drop_level=False).sum(axis=1)
+                totals = totals + (sku_units > 0).astype(float) * float(w)
+            return totals
+        return pd.Series(0.0, index=idx)
+
+    def _cost_pool_monthly_by_type(
+        self,
+        idx: pd.DatetimeIndex,
+        units_wide: pd.DataFrame,
+        revenue_wide: pd.DataFrame,
+        cost_type: Literal["direct", "indirect"],
+    ) -> pd.DataFrame:
+        pools = [p for p in (self.inputs.cost_pools or []) if p.cost_type == cost_type]
+        data: Dict[str, pd.Series] = {}
+        for pool in pools:
+            driver = self._pool_driver_series(idx, units_wide, revenue_wide, pool)
+            variable_component = float(pool.unit_variable_cost) * driver
+            fixed_component = pd.Series(float(pool.fixed_monthly_cost), index=idx)
+            if pool.behavior == "variable":
+                total = variable_component
+            elif pool.behavior == "fixed":
+                total = fixed_component
+            elif pool.behavior == "step_fixed":
+                steps = np.floor(driver / max(float(pool.step_threshold), 1.0))
+                total = fixed_component + steps * float(pool.step_increment)
+            else:
+                steps = np.floor(driver / max(float(pool.step_threshold), 1.0)) if float(pool.step_threshold) > 0 else 0.0
+                total = fixed_component + variable_component + (steps * float(pool.step_increment))
+            data[pool.name] = total.astype(float)
+        return pd.DataFrame(data, index=idx)
+
+    def _indirect_cost_pool_monthly(self, idx: pd.DatetimeIndex, units_wide: pd.DataFrame, revenue_wide: pd.DataFrame) -> pd.DataFrame:
+        return self._cost_pool_monthly_by_type(idx, units_wide, revenue_wide, "indirect")
+
+    def _direct_cost_pool_monthly(self, idx: pd.DatetimeIndex, units_wide: pd.DataFrame, revenue_wide: pd.DataFrame) -> pd.DataFrame:
+        return self._cost_pool_monthly_by_type(idx, units_wide, revenue_wide, "direct")
+
+    def _allocate_monthly_pool_to_sku(
+        self,
+        idx: pd.DatetimeIndex,
+        units_wide: pd.DataFrame,
+        pool_monthly: pd.DataFrame,
+    ) -> pd.DataFrame:
+        sku_index = self.inputs.skus["sku_id"]
+        if pool_monthly.empty or units_wide.empty:
+            return pd.DataFrame(0.0, index=idx, columns=sku_index)
+        sku_units = units_wide.T.groupby(level=0).sum().T.reindex(idx).fillna(0.0)
+        sku_units = sku_units.reindex(columns=sku_index, fill_value=0.0)
+        weights = self.inputs.skus.set_index("sku_id")["relative_opex_weight"].reindex(sku_index).fillna(1.0)
+        weighted = sku_units.mul(weights, axis=1)
+        denom = weighted.sum(axis=1).replace(0.0, np.nan)
+        shares = weighted.div(denom, axis=0).fillna(0.0)
+        total_pool = pool_monthly.sum(axis=1).reindex(idx).fillna(0.0)
+        return shares.mul(total_pool, axis=0)
+
+    def _derived_direct_cost_per_unit_by_sku(self, idx: pd.DatetimeIndex, units_wide: pd.DataFrame) -> pd.Series:
+        skus = self.inputs.skus.set_index("sku_id")
+        revenue_proxy = self._estimated_revenue_wide_from_units(idx, units_wide)
+        direct_pool_monthly = self._direct_cost_pool_monthly(idx, units_wide, revenue_proxy)
+        allocated = self._allocate_monthly_pool_to_sku(idx, units_wide, direct_pool_monthly)
+
+        basis_m = int(np.clip(self.cfg.pricing_cost_basis_month, 0, len(idx) - 1))
+        basis_date = idx[basis_m]
+        if units_wide.empty:
+            units_sku = pd.Series(0.0, index=skus.index)
+        else:
+            units_sku = units_wide.loc[basis_date].groupby(level=0).sum().reindex(skus.index).fillna(0.0)
+        per_unit = allocated.loc[basis_date].reindex(skus.index).fillna(0.0) / units_sku.replace(0.0, np.nan)
+        per_unit = per_unit.fillna(0.0)
+        overrides = pd.to_numeric(skus.get("direct_cost_per_unit_override"), errors="coerce")
+        per_unit = per_unit.where(~overrides.notna(), overrides)
+        per_unit = per_unit.fillna(0.0).rename("direct_cost_per_unit")
+        self.inputs.skus = self.inputs.skus.set_index("sku_id")
+        self.inputs.skus["direct_cost_per_unit"] = per_unit
+        self.inputs.skus = self.inputs.skus.reset_index()
+        return per_unit
+
     # ---------- pricing ----------
+    @staticmethod
+    def _liters_per_unit_from_name(sku_name: str) -> float:
+        text = str(sku_name).lower()
+        m_ml = re.search(r"(\\d+(?:\\.\\d+)?)\\s*ml", text)
+        if m_ml:
+            return float(m_ml.group(1)) / 1000.0
+        m_l = re.search(r"(\\d+(?:\\.\\d+)?)\\s*l", text)
+        if m_l:
+            return float(m_l.group(1))
+        if "keg" in text:
+            return 20.0
+        return 0.5
+
+    def _allocate_basis_opex_by_pool(
+        self,
+        basis_date: pd.Timestamp,
+        units_wide: pd.DataFrame,
+        channels: pd.DataFrame,
+        skus: pd.DataFrame,
+        opex_basis: float,
+    ) -> pd.Series:
+        units_row = units_wide.loc[basis_date] if not units_wide.empty else pd.Series(dtype=float)
+        channel_price_factor = channels.set_index("channel")["price_factor"].to_dict()
+
+        contexts: List[SKUCostContext] = []
+        for sku_id, row in skus.iterrows():
+            channel_units = {}
+            for ch in channels["channel"].tolist():
+                channel_units[ch] = float(units_row.get((sku_id, ch), 0.0))
+            total_units = float(sum(channel_units.values()))
+            liters_per_unit = self._liters_per_unit_from_name(str(row.get("name", "")))
+            estimated_base_unit_price = float(row["direct_cost_per_unit"]) * (1.0 + float(row["markup_pct"]))
+            channel_revenue = {
+                ch: channel_units[ch] * estimated_base_unit_price * float(channel_price_factor.get(ch, 1.0))
+                for ch in channel_units
+            }
+            contexts.append(
+                SKUCostContext(
+                    sku_id=int(sku_id),
+                    sku_name=str(row.get("name", f"SKU {sku_id}")),
+                    product_family=str(row.get("product_family", "Core")),
+                    package_type=str(row.get("package_type", "Standard")),
+                    package_size=str(row.get("package_size", "Standard")),
+                    active=total_units > 0.0,
+                    units_sold_by_year={"Basis": total_units},
+                    liters_sold_by_year={"Basis": total_units * liters_per_unit},
+                    revenue_by_year={"Basis": float(sum(channel_revenue.values()))},
+                    revenue_by_channel_by_year={"Basis": channel_revenue},
+                    units_by_channel_by_year={"Basis": channel_units},
+                    complexity_score=float(row.get("relative_opex_weight", 1.0)),
+                    batch_count_by_year={"Basis": (total_units * liters_per_unit) / 500.0},
+                    order_count_by_year={"Basis": total_units / 1000.0},
+                    shipment_count_by_year={"Basis": total_units / 1200.0},
+                )
+            )
+
+        pools = build_default_opex_cost_pools({"Basis": float(max(opex_basis, 0.0))})
+        report = allocate_opex_by_drivers(["Basis"], contexts, pools)
+        allocated = {a.sku_id: a.total_allocated_opex for a in report.allocations if a.year == "Basis"}
+        return pd.Series(allocated, index=skus.index).fillna(0.0)
+
     def _base_cost_plus_price_by_sku(self, idx: pd.DatetimeIndex, units_wide: pd.DataFrame) -> pd.Series:
         """
         Compute a base (month-0) cost-plus price for each SKU using a cost basis month:
@@ -308,21 +630,24 @@ class MicrobreweryFinancialModel:
             units_sku = units_wide.loc[basis_date].groupby(level=0).sum()
         units_sku = units_sku.reindex(skus.index).fillna(0.0)
 
-        # OPEX cash in basis month
-        opex_fixed = self._as_monthly_series(self.inputs.opex_fixed_monthly, idx, "opex_fixed")
-        opex_basis = float(opex_fixed.loc[basis_date] * cost_index.loc[basis_date])
+        # OPEX cash in basis month from indirect cost pools (no monthly lump assumption).
+        revenue_proxy = self._estimated_revenue_wide_from_units(idx, units_wide)
+        pool_monthly = self._indirect_cost_pool_monthly(idx, units_wide, revenue_proxy)
+        opex_basis = float(pool_monthly.sum(axis=1).reindex(idx).fillna(0.0).loc[basis_date] * cost_index.loc[basis_date])
 
-        # Allocate fixed OPEX to SKUs proportional to (units * relative_weight)
-        weights = units_sku * skus["relative_opex_weight"]
-        denom = float(weights.sum())
-        alloc = pd.Series(0.0, index=skus.index)
-        if denom > 0:
-            alloc = opex_basis * weights / denom
-
+        # Allocate OPEX via cost-pool allocator (no lump-style weighted-smear).
+        alloc = self._allocate_basis_opex_by_pool(
+            basis_date=basis_date,
+            units_wide=units_wide,
+            channels=self.inputs.channels,
+            skus=skus,
+            opex_basis=opex_basis,
+        )
         opex_per_unit = alloc / units_sku.replace(0.0, np.nan)
         opex_per_unit = opex_per_unit.fillna(0.0)
 
-        direct_cost_basis = skus["direct_cost_per_unit"] * cost_index.loc[basis_date]
+        derived_direct_cost_per_unit = self._derived_direct_cost_per_unit_by_sku(idx, units_wide)
+        direct_cost_basis = derived_direct_cost_per_unit * cost_index.loc[basis_date]
         total_cost_basis = direct_cost_basis + opex_per_unit
         base_price = total_cost_basis * (1.0 + skus["markup_pct"])
 
@@ -500,6 +825,106 @@ class MicrobreweryFinancialModel:
             schedules[fac.name] = self._debt_schedule_one(idx, fac)
         return schedules
 
+    def _annual_opex_allocation_views(
+        self,
+        idx: pd.DatetimeIndex,
+        units_wide: pd.DataFrame,
+        revenue_wide: pd.DataFrame,
+        opex_series: pd.Series,
+    ) -> Dict[str, pd.DataFrame]:
+        skus = self.inputs.skus.set_index("sku_id")
+        channels = self.inputs.channels["channel"].tolist()
+        year_labels = sorted(idx.year.unique())
+        year_keys = {y: f"Year {i + 1}" for i, y in enumerate(year_labels)}
+
+        annual_opex = {}
+        for y in year_labels:
+            annual_opex[year_keys[y]] = float(opex_series[idx.year == y].sum())
+
+        contexts: List[SKUCostContext] = []
+        for sku_id, row in skus.iterrows():
+            units_by_year = {}
+            liters_by_year = {}
+            revenue_by_year = {}
+            revenue_ch_by_year: Dict[str, Dict[str, float]] = {}
+            units_ch_by_year: Dict[str, Dict[str, float]] = {}
+            batch_by_year = {}
+            order_by_year = {}
+            ship_by_year = {}
+            liters_per_unit = self._liters_per_unit_from_name(str(row.get("name", "")))
+            for y in year_labels:
+                key = year_keys[y]
+                mask = idx.year == y
+                units_year = units_wide.loc[mask] if not units_wide.empty else pd.DataFrame(index=idx[mask])
+                rev_year = revenue_wide.loc[mask] if not revenue_wide.empty else pd.DataFrame(index=idx[mask])
+                ch_units = {ch: float(units_year.get((sku_id, ch), pd.Series(dtype=float)).sum()) for ch in channels}
+                ch_revenue = {ch: float(rev_year.get((sku_id, ch), pd.Series(dtype=float)).sum()) for ch in channels}
+                total_units = float(sum(ch_units.values()))
+                total_revenue = float(sum(ch_revenue.values()))
+                units_by_year[key] = total_units
+                liters_by_year[key] = total_units * liters_per_unit
+                revenue_by_year[key] = total_revenue
+                units_ch_by_year[key] = ch_units
+                revenue_ch_by_year[key] = ch_revenue
+                batch_by_year[key] = (total_units * liters_per_unit) / 500.0
+                order_by_year[key] = total_units / 1000.0
+                ship_by_year[key] = total_units / 1200.0
+
+            contexts.append(
+                SKUCostContext(
+                    sku_id=int(sku_id),
+                    sku_name=str(row.get("name", f"SKU {sku_id}")),
+                    product_family=str(row.get("product_family", "Core")),
+                    package_type=str(row.get("package_type", "Standard")),
+                    package_size=str(row.get("package_size", "Standard")),
+                    active=any(v > 0.0 for v in units_by_year.values()),
+                    units_sold_by_year=units_by_year,
+                    liters_sold_by_year=liters_by_year,
+                    revenue_by_year=revenue_by_year,
+                    revenue_by_channel_by_year=revenue_ch_by_year,
+                    units_by_channel_by_year=units_ch_by_year,
+                    complexity_score=float(row.get("relative_opex_weight", 1.0)),
+                    batch_count_by_year=batch_by_year,
+                    order_count_by_year=order_by_year,
+                    shipment_count_by_year=ship_by_year,
+                )
+            )
+
+        pools: List[OpexCostPool] = build_default_opex_cost_pools(annual_opex)
+        report = allocate_opex_by_drivers(list(annual_opex.keys()), contexts, pools)
+        pool_view = pd.DataFrame({s.year: s.by_pool_totals for s in report.summaries}).T
+        driver_view = pd.DataFrame({s.year: s.by_driver_type_totals for s in report.summaries}).T
+        rec_view = pd.DataFrame(
+            {
+                s.year: {
+                    "total_pool_opex": s.total_pool_opex,
+                    "total_allocated_opex": s.total_allocated_opex,
+                    "reconciliation_gap": s.reconciliation_gap,
+                }
+                for s in report.summaries
+            }
+        ).T
+        product_view = pd.DataFrame(
+            [
+                {
+                    "year": a.year,
+                    "sku_id": a.sku_id,
+                    "sku_name": a.sku_name,
+                    "total_allocated_opex": a.total_allocated_opex,
+                    "opex_per_unit": a.opex_per_unit,
+                    "opex_per_liter": a.opex_per_liter,
+                    "opex_per_case": a.opex_per_case,
+                }
+                for a in report.allocations
+            ]
+        )
+        return {
+            "pool_view": pool_view,
+            "driver_view": driver_view,
+            "product_view": product_view,
+            "reconciliation_view": rec_view,
+        }
+
     # ---------- Run model ----------
     def run(self) -> ModelRunResult:
         idx = self._timeline()
@@ -510,16 +935,24 @@ class MicrobreweryFinancialModel:
         # Units, prices, revenue
         units_wide = self._units_matrix(idx)
         prices_wide = self._prices_matrix(idx, units_wide)
+        if isinstance(units_wide.columns, pd.MultiIndex):
+            units_wide.columns = units_wide.columns.set_names(["sku_id", "channel"])
+        if isinstance(prices_wide.columns, pd.MultiIndex):
+            prices_wide.columns = prices_wide.columns.set_names(["sku_id", "channel"])
 
-        revenue_wide = units_wide.mul(prices_wide, fill_value=0.0)
+        if units_wide.empty:
+            revenue_wide = pd.DataFrame(index=idx, columns=units_wide.columns)
+        else:
+            revenue_wide = units_wide.mul(prices_wide, fill_value=0.0)
         revenue = revenue_wide.sum(axis=1).rename("revenue")
 
-        other_income = self._as_monthly_series(self.inputs.other_income_monthly, idx, "other_income")
+        other_income = self._other_income_series(idx)
         other_income = (other_income * cost_idx).rename("other_income")  # default: inflate with costs
         total_revenue = (revenue + other_income).rename("total_revenue")
 
         # Direct costs
         skus = self.inputs.skus.set_index("sku_id")
+        derived_direct_cost_per_unit = self._derived_direct_cost_per_unit_by_sku(idx, units_wide)
         if units_wide.empty:
             direct_costs = pd.Series(0.0, index=idx, name="direct_costs")
         else:
@@ -528,7 +961,7 @@ class MicrobreweryFinancialModel:
             for sku_id, row in skus.iterrows():
                 for channel in self.inputs.channels["channel"].tolist():
                     cost_cols.append((sku_id, channel))
-                    series = float(row["direct_cost_per_unit"]) * cost_idx.values
+                    series = float(derived_direct_cost_per_unit.get(sku_id, 0.0)) * cost_idx.values
                     cost_data.append(series)
             costs_wide = pd.DataFrame(
                 np.array(cost_data).T,
@@ -541,9 +974,9 @@ class MicrobreweryFinancialModel:
 
         gross_profit = (revenue - direct_costs).rename("gross_profit")
 
-        # OPEX
-        opex_fixed = self._as_monthly_series(self.inputs.opex_fixed_monthly, idx, "opex_fixed")
-        opex = (opex_fixed * cost_idx).rename("opex")
+        # Indirect operating costs from explicit cost pools (no lump-sum monthly OPEX input).
+        pool_monthly = self._indirect_cost_pool_monthly(idx, units_wide, revenue_wide)
+        opex = (pool_monthly.sum(axis=1) * cost_idx).rename("opex")
 
         ebitda = (total_revenue - direct_costs - opex).rename("ebitda")
 
@@ -680,12 +1113,20 @@ class MicrobreweryFinancialModel:
 
         annual = monthly.resample("YE").sum(numeric_only=True).rename_axis("year_end")
 
+        opex_allocation_views = self._annual_opex_allocation_views(
+            idx=idx,
+            units_wide=units_wide,
+            revenue_wide=revenue_wide,
+            opex_series=opex,
+        )
+
         return ModelRunResult(
             monthly=monthly,
             annual=annual,
             prices=prices_wide,
             debt_schedules=debt_schedules,
             valuation=valuation,
+            opex_allocation_views=opex_allocation_views,
         )
 
 
@@ -717,6 +1158,280 @@ def phase_growth_series(
         if cap_units is not None:
             u = min(u, float(cap_units))
     return pd.Series(s, index=idx)
+
+
+def write_comprehensive_excel_report(result: ModelRunResult, writer: pd.ExcelWriter) -> None:
+    """Write a comprehensive, presentation-ready Excel workbook for model outputs."""
+    # 1) Core statements
+    result.monthly.to_excel(writer, sheet_name="01_Monthly_Financials")
+    result.annual.to_excel(writer, sheet_name="02_Annual_Financials")
+    result.prices.to_excel(writer, sheet_name="03_Pricing_Matrix")
+
+    # 2) Key results dashboard
+    valuation_df = pd.DataFrame(result.valuation, index=["value"]).T
+    valuation_df.index.name = "metric"
+    valuation_df.to_excel(writer, sheet_name="00_Key_Results")
+    annual_key_cols = [c for c in ["total_revenue", "direct_costs", "gross_profit", "opex", "ebitda", "net_income", "cash", "debt_ending_balance", "fcff"] if c in result.annual.columns]
+    result.annual[annual_key_cols].to_excel(writer, sheet_name="00_Key_Results", startrow=valuation_df.shape[0] + 3)
+
+    # 2b) Annual statements (requested views)
+    perf_cols = [
+        "total_revenue",
+        "other_income",
+        "direct_costs",
+        "gross_profit",
+        "opex",
+        "ebitda",
+        "depreciation",
+        "ebit",
+        "interest_expense",
+        "pre_tax_income",
+        "taxes",
+        "net_income",
+    ]
+    perf_existing = [c for c in perf_cols if c in result.annual.columns]
+    result.annual[perf_existing].to_excel(writer, sheet_name="Annual_Performance_IS")
+
+    position_cols = [
+        "cash",
+        "receivables",
+        "inventory",
+        "other_current_assets",
+        "current_assets",
+        "net_fixed_assets",
+        "total_assets",
+        "payables",
+        "other_current_liabilities",
+        "current_liabilities",
+        "debt_ending_balance",
+        "total_liabilities",
+        "equity",
+    ]
+    position_existing = [c for c in position_cols if c in result.annual.columns]
+    result.annual[position_existing].to_excel(writer, sheet_name="Annual_Position_BS")
+
+    cashflow_cols = [
+        "cash_flow_from_operations",
+        "change_in_nwc",
+        "capex",
+        "cash_flow_from_investing",
+        "debt_draw",
+        "debt_principal_payment",
+        "equity_injection",
+        "dividends",
+        "cash_flow_from_financing",
+        "net_change_in_cash",
+        "fcff",
+    ]
+    cashflow_existing = [c for c in cashflow_cols if c in result.annual.columns]
+    result.annual[cashflow_existing].to_excel(writer, sheet_name="Annual_Cash_Flow")
+
+    # 3) Schedules
+    wc_cols = [c for c in ["receivables", "inventory", "other_current_assets", "payables", "other_current_liabilities", "net_working_capital", "change_in_nwc"] if c in result.monthly.columns]
+    result.monthly[wc_cols].to_excel(writer, sheet_name="04_Working_Capital")
+
+    capex_cols = [c for c in ["capex", "depreciation", "net_fixed_assets"] if c in result.monthly.columns]
+    result.monthly[capex_cols].to_excel(writer, sheet_name="05_CAPEX_Depreciation")
+
+    financing_cols = [c for c in ["debt_draw", "debt_principal_payment", "interest_expense", "equity_injection", "dividends", "cash", "debt_ending_balance"] if c in result.monthly.columns]
+    result.monthly[financing_cols].to_excel(writer, sheet_name="06_Financing_Cash")
+
+    # 4) Debt facility schedules
+    for name, df in result.debt_schedules.items():
+        df.to_excel(writer, sheet_name=f"07_Debt_{name[:22]}")
+
+    # 5) Allocation views
+    views = result.opex_allocation_views or {}
+    if "pool_view" in views:
+        views["pool_view"].to_excel(writer, sheet_name="08_OPEX_By_Pool")
+    if "driver_view" in views:
+        views["driver_view"].to_excel(writer, sheet_name="09_OPEX_By_Driver")
+    if "product_view" in views:
+        views["product_view"].to_excel(writer, sheet_name="10_OPEX_By_Product", index=False)
+    if "reconciliation_view" in views:
+        views["reconciliation_view"].to_excel(writer, sheet_name="11_OPEX_Reconciliation")
+
+    # Consolidated driver-based OPEX views on a single sheet for quick review.
+    opex_sheet = "Driver_OPEX_Views"
+    row_ptr = 0
+    if "pool_view" in views:
+        views["pool_view"].to_excel(writer, sheet_name=opex_sheet, startrow=row_ptr)
+        row_ptr += len(views["pool_view"]) + 4
+    if "driver_view" in views:
+        views["driver_view"].to_excel(writer, sheet_name=opex_sheet, startrow=row_ptr)
+        row_ptr += len(views["driver_view"]) + 4
+    if "product_view" in views:
+        views["product_view"].to_excel(writer, sheet_name=opex_sheet, startrow=row_ptr, index=False)
+        row_ptr += len(views["product_view"]) + 4
+    if "reconciliation_view" in views:
+        views["reconciliation_view"].to_excel(writer, sheet_name=opex_sheet, startrow=row_ptr)
+
+    # 6) Charts data + embedded charts
+    chart_cols = [c for c in ["total_revenue", "ebitda", "net_income", "cash", "debt_ending_balance", "fcff"] if c in result.annual.columns]
+    chart_df = result.annual[chart_cols].copy()
+    chart_df.to_excel(writer, sheet_name="12_Charts_Data")
+    chart_df.to_excel(writer, sheet_name="Graphs_and_Plots")
+    cash_debt_cols = [c for c in ["cash", "debt_ending_balance"] if c in result.annual.columns]
+    result.annual[cash_debt_cols].to_excel(writer, sheet_name="Cash_vs_Debt_EndBal")
+
+    # 6b) Key analytics sheet
+    latest_month = result.monthly.iloc[-1] if not result.monthly.empty else pd.Series(dtype=float)
+    latest_annual = result.annual.iloc[-1] if not result.annual.empty else pd.Series(dtype=float)
+    key_analytics = pd.DataFrame(
+        [
+            {"metric": "latest_annual_revenue", "value": float(latest_annual.get("total_revenue", np.nan))},
+            {"metric": "latest_annual_ebitda", "value": float(latest_annual.get("ebitda", np.nan))},
+            {"metric": "latest_annual_net_income", "value": float(latest_annual.get("net_income", np.nan))},
+            {
+                "metric": "latest_gross_margin_pct",
+                "value": float(latest_annual.get("gross_profit", np.nan)) / max(float(latest_annual.get("total_revenue", np.nan)), 1e-9),
+            },
+            {
+                "metric": "latest_ebitda_margin_pct",
+                "value": float(latest_annual.get("ebitda", np.nan)) / max(float(latest_annual.get("total_revenue", np.nan)), 1e-9),
+            },
+            {
+                "metric": "cash_to_debt_last_month",
+                "value": float(latest_month.get("cash", np.nan)) / max(float(latest_month.get("debt_ending_balance", np.nan)), 1e-9),
+            },
+            {"metric": "latest_fcff", "value": float(latest_annual.get("fcff", np.nan))},
+        ]
+    )
+    key_analytics.to_excel(writer, sheet_name="Key_Analytics", index=False)
+
+    try:
+        from openpyxl.chart import BarChart, LineChart, Reference
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.utils import get_column_letter
+
+        wb = writer.book
+        accent = "1F4E78"
+        dark = "0E2A47"
+        light = "EAF0F6"
+        border_color = "C5CFDA"
+        thin = Side(border_style="thin", color=border_color)
+
+        def _style_sheet(ws, title: str) -> None:
+            max_col = max(ws.max_column, 1)
+            ws.insert_rows(1)
+            ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max_col)
+            banner = ws.cell(row=1, column=1, value=title)
+            banner.font = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
+            banner.fill = PatternFill(fill_type="solid", fgColor=dark)
+            banner.alignment = Alignment(horizontal="left", vertical="center")
+            ws.row_dimensions[1].height = 24
+
+            for cell in ws[2]:
+                cell.font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+                cell.fill = PatternFill(fill_type="solid", fgColor=accent)
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            ws.row_dimensions[2].height = 22
+
+            for r in range(3, ws.max_row + 1):
+                fill = PatternFill(fill_type="solid", fgColor=light if r % 2 == 0 else "FFFFFF")
+                for c in range(1, ws.max_column + 1):
+                    cell = ws.cell(row=r, column=c)
+                    cell.fill = fill
+                    cell.font = Font(name="Calibri", size=10, color="1C1C1C")
+                    cell.alignment = Alignment(horizontal="right" if c > 1 else "left", vertical="center")
+                    cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+            for col_idx in range(1, ws.max_column + 1):
+                letter = get_column_letter(col_idx)
+                sample_values = [str(ws.cell(row=r, column=col_idx).value or "") for r in range(1, min(ws.max_row, 80) + 1)]
+                width = min(max(len(max(sample_values, key=len)) + 2, 12), 40)
+                ws.column_dimensions[letter].width = width
+
+            ws.freeze_panes = "A3"
+            ws.sheet_view.showGridLines = False
+            ws.auto_filter.ref = f"A2:{get_column_letter(ws.max_column)}{ws.max_row}"
+
+        chart_next_row: dict[str, int] = {}
+
+        def _add_chart_below(ws, title: str, data_cols: list[str], chart_type: str = "line") -> None:
+            headers = [ws.cell(row=2, column=c).value for c in range(1, ws.max_column + 1)]
+            header_map = {str(h): idx + 1 for idx, h in enumerate(headers) if h is not None}
+            cols = [header_map[c] for c in data_cols if c in header_map]
+            if len(cols) < 1 or ws.max_row < 4:
+                return
+            cat_col = 1
+            chart = LineChart() if chart_type == "line" else BarChart()
+            chart.title = title
+            chart.style = 10
+            chart.height = 7
+            chart.width = 14
+            chart.y_axis.title = "Value"
+            chart.x_axis.title = "Period"
+            data_ref = Reference(ws, min_col=min(cols), max_col=max(cols), min_row=2, max_row=ws.max_row)
+            cat_ref = Reference(ws, min_col=cat_col, min_row=3, max_row=ws.max_row)
+            chart.add_data(data_ref, titles_from_data=True)
+            chart.set_categories(cat_ref)
+            base_anchor = ws.max_row + 3
+            chart_anchor_row = max(base_anchor, chart_next_row.get(ws.title, base_anchor))
+            ws.cell(row=chart_anchor_row - 1, column=1, value=f"{title} — Visual")
+            ws.cell(row=chart_anchor_row - 1, column=1).font = Font(name="Calibri", size=11, bold=True, color=dark)
+            ws.add_chart(chart, f"A{chart_anchor_row}")
+            chart_next_row[ws.title] = chart_anchor_row + 16
+
+        # Style workbook tabs with clear hierarchy.
+        sheet_titles = {
+            "00_Key_Results": "Executive Summary & Key Results",
+            "01_Monthly_Financials": "Monthly Financial Statements",
+            "02_Annual_Financials": "Annual Financial Statements",
+            "03_Pricing_Matrix": "Pricing Matrix",
+            "04_Working_Capital": "Working Capital Schedule",
+            "05_CAPEX_Depreciation": "CAPEX & Depreciation Schedule",
+            "06_Financing_Cash": "Financing & Cash Schedule",
+            "08_OPEX_By_Pool": "OPEX Allocation by Cost Pool",
+            "09_OPEX_By_Driver": "OPEX Allocation by Driver",
+            "10_OPEX_By_Product": "OPEX Allocation by Product",
+            "11_OPEX_Reconciliation": "OPEX Reconciliation",
+            "12_Charts_Data": "Charts Data",
+            "Annual_Performance_IS": "Annual Performance (Income Statement)",
+            "Annual_Position_BS": "Annual Position (Balance Sheet)",
+            "Annual_Cash_Flow": "Annual Cash Flow",
+            "Driver_OPEX_Views": "Driver-based OPEX Review",
+            "Graphs_and_Plots": "Graphs and Plots",
+            "Cash_vs_Debt_EndBal": "Cash vs Debt Ending Balance",
+            "Key_Analytics": "Key Analytics Dashboard",
+        }
+        for name, title in sheet_titles.items():
+            if name in wb.sheetnames:
+                _style_sheet(wb[name], title)
+
+        for debt_sheet in [s for s in wb.sheetnames if s.startswith("07_Debt_")]:
+            _style_sheet(wb[debt_sheet], debt_sheet.replace("07_Debt_", "Debt Facility: "))
+
+        # Place visuals directly below major output tables.
+        _add_chart_below(wb["01_Monthly_Financials"], "Monthly Revenue / EBITDA / Net Income", ["total_revenue", "ebitda", "net_income"], "line")
+        _add_chart_below(wb["02_Annual_Financials"], "Annual Revenue / EBITDA / Net Income", ["total_revenue", "ebitda", "net_income"], "line")
+        _add_chart_below(wb["04_Working_Capital"], "Working Capital Bridge", ["net_working_capital", "change_in_nwc"], "line")
+        _add_chart_below(wb["05_CAPEX_Depreciation"], "CAPEX vs Depreciation", ["capex", "depreciation"], "bar")
+        _add_chart_below(wb["06_Financing_Cash"], "Cash vs Debt", ["cash", "debt_ending_balance"], "line")
+        if "Annual_Performance_IS" in wb.sheetnames:
+            _add_chart_below(wb["Annual_Performance_IS"], "Income Statement Trend", ["total_revenue", "gross_profit", "ebitda", "net_income"], "line")
+        if "Annual_Position_BS" in wb.sheetnames:
+            _add_chart_below(wb["Annual_Position_BS"], "Balance Sheet Composition", ["cash", "total_assets", "total_liabilities", "equity"], "bar")
+        if "Annual_Cash_Flow" in wb.sheetnames:
+            _add_chart_below(wb["Annual_Cash_Flow"], "Cash Flow Components", ["cash_flow_from_operations", "cash_flow_from_investing", "cash_flow_from_financing", "fcff"], "bar")
+        if "08_OPEX_By_Pool" in wb.sheetnames:
+            _add_chart_below(wb["08_OPEX_By_Pool"], "OPEX by Pool", ["allocated_opex"], "bar")
+        if "09_OPEX_By_Driver" in wb.sheetnames:
+            _add_chart_below(wb["09_OPEX_By_Driver"], "OPEX by Driver", ["allocated_opex"], "bar")
+        if "11_OPEX_Reconciliation" in wb.sheetnames:
+            _add_chart_below(wb["11_OPEX_Reconciliation"], "Reconciliation Gap by Year", ["reconciliation_gap"], "bar")
+        if "Cash_vs_Debt_EndBal" in wb.sheetnames:
+            _add_chart_below(wb["Cash_vs_Debt_EndBal"], "Cash vs Debt Ending Balance", ["cash", "debt_ending_balance"], "line")
+        if "Key_Analytics" in wb.sheetnames:
+            _add_chart_below(wb["Key_Analytics"], "Key Analytics Snapshot", ["value"], "bar")
+        if "Graphs_and_Plots" in wb.sheetnames:
+            _add_chart_below(wb["Graphs_and_Plots"], "Revenue / EBITDA / Net Income", ["total_revenue", "ebitda", "net_income"], "line")
+            _add_chart_below(wb["Graphs_and_Plots"], "Cash / Debt / FCFF", ["cash", "debt_ending_balance", "fcff"], "line")
+
+    except Exception:
+        # If style/chart libs are unavailable, workbook remains complete with data.
+        pass
 
 
 # =============================
@@ -755,8 +1470,8 @@ def main() -> None:
     # ----------------------------
     skus = pd.DataFrame(
         [
-            {"sku_id": 1, "name": "Pale Ale 330ml", "direct_cost_per_unit": 2.10, "markup_pct": 0.65, "relative_opex_weight": 1.0},
-            {"sku_id": 2, "name": "Pilsner 500ml", "direct_cost_per_unit": 2.60, "markup_pct": 0.60, "relative_opex_weight": 1.1},
+            {"sku_id": 1, "name": "Pale Ale 330ml", "direct_cost_per_unit": 0.0, "markup_pct": 0.65, "relative_opex_weight": 1.0},
+            {"sku_id": 2, "name": "Pilsner 500ml", "direct_cost_per_unit": 0.0, "markup_pct": 0.60, "relative_opex_weight": 1.1},
         ]
     )
 
@@ -791,12 +1506,37 @@ def main() -> None:
     sales_plan = pd.DataFrame(rows)
 
     # ----------------------------
-    # OPEX and other income (monthly)
+    # Cost pools and other income (monthly)
     # ----------------------------
-    opex_fixed_monthly = 110_000.0
+    cost_pools = [
+        CostPoolInput(name="Malt & Grain", cost_type="direct", behavior="variable", allocation_driver="liters", unit_variable_cost=0.22),
+        CostPoolInput(name="Hops & Yeast", cost_type="direct", behavior="variable", allocation_driver="liters", unit_variable_cost=0.09),
+        CostPoolInput(name="Packaging Materials", cost_type="direct", behavior="variable", allocation_driver="units", unit_variable_cost=0.14),
+        CostPoolInput(name="Production Direct Labor", cost_type="direct", behavior="step_fixed", allocation_driver="liters", fixed_monthly_cost=6_000.0, step_threshold=180_000.0, step_increment=850.0),
+        CostPoolInput(name="Brew QA Consumables", cost_type="direct", behavior="variable", allocation_driver="liters", unit_variable_cost=0.015),
+        CostPoolInput(name="Indirect Labor", cost_type="indirect", behavior="step_fixed", allocation_driver="liters", fixed_monthly_cost=22_000.0, step_threshold=250_000.0, step_increment=2_000.0),
+        CostPoolInput(name="Utilities", cost_type="indirect", behavior="variable", allocation_driver="liters", unit_variable_cost=0.035),
+        CostPoolInput(name="Supplies", cost_type="indirect", behavior="variable", allocation_driver="units", unit_variable_cost=0.015),
+        CostPoolInput(name="Marketing & Advertising", cost_type="indirect", behavior="blended", allocation_driver="channel_revenue", fixed_monthly_cost=8_500.0, unit_variable_cost=0.003, channel=None),
+        CostPoolInput(name="Events & Promotion", cost_type="indirect", behavior="variable", allocation_driver="channel_units", unit_variable_cost=0.01, channel="On-Premise"),
+        CostPoolInput(name="Insurance", cost_type="indirect", behavior="fixed", allocation_driver="revenue", fixed_monthly_cost=3_000.0),
+        CostPoolInput(name="Permits & License", cost_type="indirect", behavior="blended", allocation_driver="active_sku", fixed_monthly_cost=1_250.0, unit_variable_cost=350.0),
+        CostPoolInput(name="Local Fees", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=900.0),
+        CostPoolInput(name="Transport", cost_type="indirect", behavior="variable", allocation_driver="channel_units", unit_variable_cost=0.018),
+        CostPoolInput(name="Administrative Expense", cost_type="indirect", behavior="blended", allocation_driver="active_sku", fixed_monthly_cost=9_500.0, unit_variable_cost=250.0),
+        CostPoolInput(name="Quality Control", cost_type="indirect", behavior="blended", allocation_driver="liters", fixed_monthly_cost=2_500.0, unit_variable_cost=0.01),
+        CostPoolInput(name="Certificates", cost_type="indirect", behavior="variable", allocation_driver="active_sku", unit_variable_cost=180.0),
+        CostPoolInput(name="Professional Services", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=2_200.0),
+        CostPoolInput(name="Other Expense", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=1_400.0),
+        CostPoolInput(name="Contingencies", cost_type="indirect", behavior="fixed", allocation_driver="units", fixed_monthly_cost=1_800.0),
+    ]
 
-    other_income_monthly = pd.Series(0.0, index=idx)
-    other_income_monthly.iloc[12:] = 15_000.0  # from month 13 onward
+    other_income_items = [
+        OtherIncomeItem(other_income_name="Sponsorships", amount=15_000.0, active=True, category="Commercial"),
+        OtherIncomeItem(other_income_name="Other Income 2", amount=0.0, active=False),
+        OtherIncomeItem(other_income_name="Other Income 3", amount=0.0, active=False),
+        OtherIncomeItem(other_income_name="Other Income 4", amount=0.0, active=False),
+    ]
 
     # ----------------------------
     # CAPEX schedule (simplified example)
@@ -823,8 +1563,8 @@ def main() -> None:
         skus=skus,
         channels=channels,
         sales_plan=sales_plan,
-        opex_fixed_monthly=opex_fixed_monthly,
-        other_income_monthly=other_income_monthly,
+        other_income_items=other_income_items,
+        cost_pools=cost_pools,
         capex_items=capex_items,
         debt_facilities=debt_facilities,
         equity_injections=equity_injections,
@@ -848,11 +1588,7 @@ def main() -> None:
     out_xlsx = "brewery_model_output.xlsx"
     try:
         with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
-            result.monthly.to_excel(writer, sheet_name="Monthly_Statements")
-            result.annual.to_excel(writer, sheet_name="Annual_Summary")
-            result.prices.to_excel(writer, sheet_name="Prices")
-            for name, df in result.debt_schedules.items():
-                df.to_excel(writer, sheet_name=f"Debt_{name[:25]}")
+            write_comprehensive_excel_report(result, writer)
         print(f"\nWrote: {out_xlsx}")
     except Exception as e:
         print(f"\nExcel export skipped (openpyxl missing or other error): {e}")

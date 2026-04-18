@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "microbrewery-model"
+version = "0.1.0"
+description = "Driver-based microbrewery financial modeling toolkit"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "pandas",
+]
+
+[tool.setuptools]
+packages = ["finmodel", "finmodel.data", "finmodel.tests"]

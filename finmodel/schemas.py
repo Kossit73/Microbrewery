@@ -19,6 +19,18 @@ from .microbrewery_dataclasses import (
     WACCConfig,
     WorkingCapitalAssumptions,
 )
+from .opex_schemas import (
+    OpexAllocationReport,
+    OpexAllocationRule,
+    OpexAllocationSummary,
+    OpexCostClassification,
+    OpexCostPool,
+    OpexDriverType,
+    SKUCostContext,
+    SKUOpexAllocation,
+    StepCapacityBand,
+    StepFixedBand,
+)
 
 __all__ = [
     "PackagingSize",
@@ -39,4 +51,14 @@ __all__ = [
     "EventTourLine",
     "InvestorRound",
     "FinancialResults",
+    "OpexDriverType",
+    "OpexCostClassification",
+    "StepCapacityBand",
+    "StepFixedBand",
+    "OpexAllocationRule",
+    "OpexCostPool",
+    "SKUCostContext",
+    "SKUOpexAllocation",
+    "OpexAllocationSummary",
+    "OpexAllocationReport",
 ]

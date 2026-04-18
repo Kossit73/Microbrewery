@@ -94,6 +94,60 @@ Use the horizontal tab bar to adjust key assumptions (WACC, exit multiple, infla
 
 This repository now includes the `finmodel` package that implements a modular valuation toolkit (DCF/rNPV, scenarios, forecasts, Monte Carlo, and ML multiples). See `docs/ARCHITECTURE.md` for class-level details.
 
+## Driver-based OPEX allocation (new)
+
+Flat OPEX-per-SKU rates are convenient but usually not investor-grade because they hide the operational drivers of cost (volume, complexity, channel mix, and scale steps). The package now supports driver-based OPEX pools that allocate to SKUs by year and reconcile back to total OPEX.
+
+### Why this is better than flat OPEX-per-SKU
+- Captures scale behavior (fixed, variable, step-fixed pools).
+- Supports targeted scope (family/channel/SKU-specific pools).
+- Produces traceable per-SKU unit costs (`opex_per_unit`, `opex_per_liter`) and pool breakdowns.
+- Reconciles allocations to total OPEX by year for auditability.
+
+### Core API
+```python
+from finmodel import build_default_model
+
+model = build_default_model()
+contexts = model.opex_contexts_by_sku_and_year()
+allocation_report = model.allocate_opex()
+metrics = model.opex_metrics_by_sku_and_year()
+recon = model.reconcile_opex_allocation()
+pool_view = model.opex_by_pool_view()
+driver_view = model.opex_by_driver_type_view()
+product_view = model.opex_by_product_view()
+direct_costs = model.allocate_direct_costs()
+indirect_costs = model.allocate_indirect_costs()
+total_costs = model.allocate_total_unit_costs()
+unit_metrics = model.unit_cost_metrics_by_sku_and_year()
+cost_recon = model.reconcile_cost_allocations()
+```
+
+### Cost pools and driver mappings
+Default pools include: Indirect Labor, Utilities, Supplies, Marketing & Advertising, Events & Promotion, Insurance, Permits & License, Local Fees, Transport, Administrative Expense, Quality Control, Certificates, Professional Services, Other Expense, and Contingencies.
+
+You can map pools to drivers such as:
+- `LITERS`, `UNITS`, `REVENUE`
+- `CHANNEL_REVENUE`, `CHANNEL_UNITS`
+- `FIXED_EQUAL`, `ACTIVE_SKU`, `COMPLEXITY`
+- `STEP_CAPACITY`, `EXPLICIT_WEIGHT`
+- `BATCH_COUNT`, `ORDER_COUNT`, `SHIPMENT_COUNT`
+
+`CostPoolInput` supports both `cost_type="direct"` and `cost_type="indirect"` so the same pool framework can model direct unit economics and indirect overheads.
+
+Blended rules are supported (for example 70% liters / 20% units / 10% complexity).
+
+### Customizing pools
+1. Build or edit `OpexCostPool` entries (driver, scope, classification, annual amounts).
+2. Add optional blended `OpexAllocationRule` weights.
+3. Pass custom pools to `model.allocate_opex(pools=...)`.
+4. Optionally enable two-stage allocation (`two_stage_family_allocation=True`) to allocate to product family first, then down to SKU using `second_stage_driver`.
+
+### Three output views (recommended)
+- **A. OPEX by pool:** `model.opex_by_pool_view()`
+- **B. OPEX by driver type:** `model.opex_by_driver_type_view()`
+- **C. OPEX by product:** `model.opex_by_product_view()` (includes per-unit, per-liter, per-case, and fully loaded gross margin metrics).
+
 ## Making the brewery model more detailed
 
 For a prioritized checklist of granular features to add (e.g., seasonality, SKU-level BOMs, payroll plans, covenants, and sensitivity dashboards), see `docs/MODEL_ENHANCEMENTS.md`. Start with the **Critical missing schedules and assumptions** section to surface the biggest gaps.
