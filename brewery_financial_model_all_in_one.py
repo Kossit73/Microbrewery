@@ -1161,7 +1161,7 @@ def phase_growth_series(
 
 
 def write_comprehensive_excel_report(result: ModelRunResult, writer: pd.ExcelWriter) -> None:
-    """Write a comprehensive, well-labeled Excel workbook for model outputs."""
+    """Write a comprehensive, presentation-ready Excel workbook for model outputs."""
     # 1) Core statements
     result.monthly.to_excel(writer, sheet_name="01_Monthly_Financials")
     result.annual.to_excel(writer, sheet_name="02_Annual_Financials")
@@ -1300,60 +1300,137 @@ def write_comprehensive_excel_report(result: ModelRunResult, writer: pd.ExcelWri
     key_analytics.to_excel(writer, sheet_name="Key_Analytics", index=False)
 
     try:
-        from openpyxl.chart import LineChart, Reference
+        from openpyxl.chart import BarChart, LineChart, Reference
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.utils import get_column_letter
 
         wb = writer.book
-        ws = wb["12_Charts_Data"]
-        ws_graph = wb["Graphs_and_Plots"]
-        ws_cash_debt = wb["Cash_vs_Debt_EndBal"]
+        accent = "1F4E78"
+        dark = "0E2A47"
+        light = "EAF0F6"
+        border_color = "C5CFDA"
+        thin = Side(border_style="thin", color=border_color)
 
-        if chart_df.shape[0] >= 1 and chart_df.shape[1] >= 2:
-            chart = LineChart()
-            chart.title = "Revenue / EBITDA / Net Income"
+        def _style_sheet(ws, title: str) -> None:
+            max_col = max(ws.max_column, 1)
+            ws.insert_rows(1)
+            ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max_col)
+            banner = ws.cell(row=1, column=1, value=title)
+            banner.font = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
+            banner.fill = PatternFill(fill_type="solid", fgColor=dark)
+            banner.alignment = Alignment(horizontal="left", vertical="center")
+            ws.row_dimensions[1].height = 24
+
+            for cell in ws[2]:
+                cell.font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+                cell.fill = PatternFill(fill_type="solid", fgColor=accent)
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            ws.row_dimensions[2].height = 22
+
+            for r in range(3, ws.max_row + 1):
+                fill = PatternFill(fill_type="solid", fgColor=light if r % 2 == 0 else "FFFFFF")
+                for c in range(1, ws.max_column + 1):
+                    cell = ws.cell(row=r, column=c)
+                    cell.fill = fill
+                    cell.font = Font(name="Calibri", size=10, color="1C1C1C")
+                    cell.alignment = Alignment(horizontal="right" if c > 1 else "left", vertical="center")
+                    cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+            for col_idx in range(1, ws.max_column + 1):
+                letter = get_column_letter(col_idx)
+                sample_values = [str(ws.cell(row=r, column=col_idx).value or "") for r in range(1, min(ws.max_row, 80) + 1)]
+                width = min(max(len(max(sample_values, key=len)) + 2, 12), 40)
+                ws.column_dimensions[letter].width = width
+
+            ws.freeze_panes = "A3"
+            ws.sheet_view.showGridLines = False
+            ws.auto_filter.ref = f"A2:{get_column_letter(ws.max_column)}{ws.max_row}"
+
+        chart_next_row: dict[str, int] = {}
+
+        def _add_chart_below(ws, title: str, data_cols: list[str], chart_type: str = "line") -> None:
+            headers = [ws.cell(row=2, column=c).value for c in range(1, ws.max_column + 1)]
+            header_map = {str(h): idx + 1 for idx, h in enumerate(headers) if h is not None}
+            cols = [header_map[c] for c in data_cols if c in header_map]
+            if len(cols) < 1 or ws.max_row < 4:
+                return
+            cat_col = 1
+            chart = LineChart() if chart_type == "line" else BarChart()
+            chart.title = title
+            chart.style = 10
+            chart.height = 7
+            chart.width = 14
             chart.y_axis.title = "Value"
-            chart.x_axis.title = "Year End"
-            data = Reference(ws, min_col=2, max_col=min(4, chart_df.shape[1] + 1), min_row=1, max_row=chart_df.shape[0] + 1)
-            cats = Reference(ws, min_col=1, min_row=2, max_row=chart_df.shape[0] + 1)
-            chart.add_data(data, titles_from_data=True)
-            chart.set_categories(cats)
-            ws.add_chart(chart, "I2")
-            chart_graph = LineChart()
-            chart_graph.title = "Revenue / EBITDA / Net Income"
-            chart_graph.y_axis.title = "Value"
-            chart_graph.x_axis.title = "Year End"
-            data_graph = Reference(ws_graph, min_col=2, max_col=min(4, chart_df.shape[1] + 1), min_row=1, max_row=chart_df.shape[0] + 1)
-            cats_graph = Reference(ws_graph, min_col=1, min_row=2, max_row=chart_df.shape[0] + 1)
-            chart_graph.add_data(data_graph, titles_from_data=True)
-            chart_graph.set_categories(cats_graph)
-            ws_graph.add_chart(chart_graph, "I2")
+            chart.x_axis.title = "Period"
+            data_ref = Reference(ws, min_col=min(cols), max_col=max(cols), min_row=2, max_row=ws.max_row)
+            cat_ref = Reference(ws, min_col=cat_col, min_row=3, max_row=ws.max_row)
+            chart.add_data(data_ref, titles_from_data=True)
+            chart.set_categories(cat_ref)
+            base_anchor = ws.max_row + 3
+            chart_anchor_row = max(base_anchor, chart_next_row.get(ws.title, base_anchor))
+            ws.cell(row=chart_anchor_row - 1, column=1, value=f"{title} — Visual")
+            ws.cell(row=chart_anchor_row - 1, column=1).font = Font(name="Calibri", size=11, bold=True, color=dark)
+            ws.add_chart(chart, f"A{chart_anchor_row}")
+            chart_next_row[ws.title] = chart_anchor_row + 16
 
-        if chart_df.shape[0] >= 1 and chart_df.shape[1] >= 5:
-            chart2 = LineChart()
-            chart2.title = "Cash vs Debt Ending Balance"
-            data2 = Reference(ws, min_col=5, max_col=6, min_row=1, max_row=chart_df.shape[0] + 1)
-            cats2 = Reference(ws, min_col=1, min_row=2, max_row=chart_df.shape[0] + 1)
-            chart2.add_data(data2, titles_from_data=True)
-            chart2.set_categories(cats2)
-            ws.add_chart(chart2, "I20")
+        # Style workbook tabs with clear hierarchy.
+        sheet_titles = {
+            "00_Key_Results": "Executive Summary & Key Results",
+            "01_Monthly_Financials": "Monthly Financial Statements",
+            "02_Annual_Financials": "Annual Financial Statements",
+            "03_Pricing_Matrix": "Pricing Matrix",
+            "04_Working_Capital": "Working Capital Schedule",
+            "05_CAPEX_Depreciation": "CAPEX & Depreciation Schedule",
+            "06_Financing_Cash": "Financing & Cash Schedule",
+            "08_OPEX_By_Pool": "OPEX Allocation by Cost Pool",
+            "09_OPEX_By_Driver": "OPEX Allocation by Driver",
+            "10_OPEX_By_Product": "OPEX Allocation by Product",
+            "11_OPEX_Reconciliation": "OPEX Reconciliation",
+            "12_Charts_Data": "Charts Data",
+            "Annual_Performance_IS": "Annual Performance (Income Statement)",
+            "Annual_Position_BS": "Annual Position (Balance Sheet)",
+            "Annual_Cash_Flow": "Annual Cash Flow",
+            "Driver_OPEX_Views": "Driver-based OPEX Review",
+            "Graphs_and_Plots": "Graphs and Plots",
+            "Cash_vs_Debt_EndBal": "Cash vs Debt Ending Balance",
+            "Key_Analytics": "Key Analytics Dashboard",
+        }
+        for name, title in sheet_titles.items():
+            if name in wb.sheetnames:
+                _style_sheet(wb[name], title)
 
-            chart2_graph = LineChart()
-            chart2_graph.title = "Cash vs Debt Ending Balance"
-            data2_graph = Reference(ws_graph, min_col=5, max_col=6, min_row=1, max_row=chart_df.shape[0] + 1)
-            cats2_graph = Reference(ws_graph, min_col=1, min_row=2, max_row=chart_df.shape[0] + 1)
-            chart2_graph.add_data(data2_graph, titles_from_data=True)
-            chart2_graph.set_categories(cats2_graph)
-            ws_graph.add_chart(chart2_graph, "I20")
+        for debt_sheet in [s for s in wb.sheetnames if s.startswith("07_Debt_")]:
+            _style_sheet(wb[debt_sheet], debt_sheet.replace("07_Debt_", "Debt Facility: "))
 
-        if len(cash_debt_cols) >= 2 and result.annual.shape[0] >= 1:
-            chart3 = LineChart()
-            chart3.title = "Cash vs. Debt Ending Balance"
-            data3 = Reference(ws_cash_debt, min_col=2, max_col=3, min_row=1, max_row=result.annual.shape[0] + 1)
-            cats3 = Reference(ws_cash_debt, min_col=1, min_row=2, max_row=result.annual.shape[0] + 1)
-            chart3.add_data(data3, titles_from_data=True)
-            chart3.set_categories(cats3)
-            ws_cash_debt.add_chart(chart3, "F2")
+        # Place visuals directly below major output tables.
+        _add_chart_below(wb["01_Monthly_Financials"], "Monthly Revenue / EBITDA / Net Income", ["total_revenue", "ebitda", "net_income"], "line")
+        _add_chart_below(wb["02_Annual_Financials"], "Annual Revenue / EBITDA / Net Income", ["total_revenue", "ebitda", "net_income"], "line")
+        _add_chart_below(wb["04_Working_Capital"], "Working Capital Bridge", ["net_working_capital", "change_in_nwc"], "line")
+        _add_chart_below(wb["05_CAPEX_Depreciation"], "CAPEX vs Depreciation", ["capex", "depreciation"], "bar")
+        _add_chart_below(wb["06_Financing_Cash"], "Cash vs Debt", ["cash", "debt_ending_balance"], "line")
+        if "Annual_Performance_IS" in wb.sheetnames:
+            _add_chart_below(wb["Annual_Performance_IS"], "Income Statement Trend", ["total_revenue", "gross_profit", "ebitda", "net_income"], "line")
+        if "Annual_Position_BS" in wb.sheetnames:
+            _add_chart_below(wb["Annual_Position_BS"], "Balance Sheet Composition", ["cash", "total_assets", "total_liabilities", "equity"], "bar")
+        if "Annual_Cash_Flow" in wb.sheetnames:
+            _add_chart_below(wb["Annual_Cash_Flow"], "Cash Flow Components", ["cash_flow_from_operations", "cash_flow_from_investing", "cash_flow_from_financing", "fcff"], "bar")
+        if "08_OPEX_By_Pool" in wb.sheetnames:
+            _add_chart_below(wb["08_OPEX_By_Pool"], "OPEX by Pool", ["allocated_opex"], "bar")
+        if "09_OPEX_By_Driver" in wb.sheetnames:
+            _add_chart_below(wb["09_OPEX_By_Driver"], "OPEX by Driver", ["allocated_opex"], "bar")
+        if "11_OPEX_Reconciliation" in wb.sheetnames:
+            _add_chart_below(wb["11_OPEX_Reconciliation"], "Reconciliation Gap by Year", ["reconciliation_gap"], "bar")
+        if "Cash_vs_Debt_EndBal" in wb.sheetnames:
+            _add_chart_below(wb["Cash_vs_Debt_EndBal"], "Cash vs Debt Ending Balance", ["cash", "debt_ending_balance"], "line")
+        if "Key_Analytics" in wb.sheetnames:
+            _add_chart_below(wb["Key_Analytics"], "Key Analytics Snapshot", ["value"], "bar")
+        if "Graphs_and_Plots" in wb.sheetnames:
+            _add_chart_below(wb["Graphs_and_Plots"], "Revenue / EBITDA / Net Income", ["total_revenue", "ebitda", "net_income"], "line")
+            _add_chart_below(wb["Graphs_and_Plots"], "Cash / Debt / FCFF", ["cash", "debt_ending_balance", "fcff"], "line")
+
     except Exception:
-        # If charting libs are unavailable in environment, keep workbook data-rich.
+        # If style/chart libs are unavailable, workbook remains complete with data.
         pass
 
 
