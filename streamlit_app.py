@@ -319,7 +319,14 @@ def _assumption_editor(title: str, key: str, df: pd.DataFrame) -> pd.DataFrame:
             updated_row = {}
             for col in wdf.columns:
                 val = wdf.loc[selected_row, col]
-                if pd.api.types.is_numeric_dtype(wdf[col]):
+                col_series = wdf[col]
+                if pd.api.types.is_bool_dtype(col_series):
+                    updated_row[col] = st.checkbox(
+                        f"{col}",
+                        value=_coerce_bool(val),
+                        key=f"field_{key}_{selected_row}_{col}",
+                    )
+                elif pd.api.types.is_numeric_dtype(col_series):
                     default_val = 0.0 if pd.isna(val) else float(val)
                     updated_row[col] = st.number_input(
                         f"{col}",
@@ -335,7 +342,8 @@ def _assumption_editor(title: str, key: str, df: pd.DataFrame) -> pd.DataFrame:
 
             if st.button("Apply row changes", key=f"btn_apply_row_{key}"):
                 for col, val in updated_row.items():
-                    st.session_state[work_key].loc[selected_row, col] = val
+                    casted = _cast_value_for_dtype(st.session_state[work_key][col], val)
+                    st.session_state[work_key].at[selected_row, col] = casted
         else:
             st.info("No rows available. Use 'Add row' to create one.")
 
@@ -367,6 +375,24 @@ def _coerce_bool(value: object) -> bool:
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _cast_value_for_dtype(column: pd.Series, value: object) -> object:
+    if pd.api.types.is_bool_dtype(column):
+        return _coerce_bool(value)
+    if pd.api.types.is_integer_dtype(column):
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return 0
+        return int(float(value))
+    if pd.api.types.is_float_dtype(column):
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return 0.0
+        return float(value)
+    if pd.api.types.is_datetime64_any_dtype(column):
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return pd.NaT
+        return pd.to_datetime(value, errors="coerce")
+    return value
 
 
 def _expand_sales_plan_to_monthly(sales_df: pd.DataFrame, frequency: str) -> pd.DataFrame:
