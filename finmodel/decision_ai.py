@@ -6,15 +6,27 @@ from typing import Any, Dict, List
 
 
 class QuestionType(str, Enum):
-    ASSUMPTIONS = "assumptions"
-    CALCULATIONS = "calculations"
-    OUTPUTS = "outputs"
-    SCHEDULES = "schedules"
-    LOGIC = "logic"
-    DEPENDENCIES = "dependencies"
-    SCENARIOS = "scenarios"
+    VALUATION = "valuation"
+    PROFITABILITY = "profitability"
+    LIQUIDITY = "liquidity"
+    LEVERAGE = "leverage"
+    GROWTH = "growth"
+    PRICING = "pricing"
+    EFFICIENCY = "efficiency"
+    RISK = "risk"
     FOLLOW_UP = "follow_up"
     GENERAL = "general"
+
+
+@dataclass
+class ExternalBenchmark:
+    metric: str
+    low: float
+    high: float
+    unit: str
+    interpretation: str
+    source_name: str
+    source_url: str
 
 
 @dataclass
@@ -23,6 +35,7 @@ class DecisionTurn:
     answer: str
     question_type: QuestionType
     topics: List[str] = field(default_factory=list)
+    conclusion: str = ""
 
 
 @dataclass
@@ -37,34 +50,24 @@ class DecisionSessionMemory:
 
 
 _KEYWORDS: Dict[QuestionType, List[str]] = {
-    QuestionType.ASSUMPTIONS: ["assumption", "assume", "wacc", "tax", "inflation", "input"],
-    QuestionType.CALCULATIONS: ["calculate", "formula", "how is", "computed", "derive", "math"],
-    QuestionType.OUTPUTS: ["output", "result", "kpi", "metric", "valuation", "report"],
-    QuestionType.SCHEDULES: ["schedule", "timeline", "monthly", "quarterly", "yearly", "forecast"],
-    QuestionType.LOGIC: ["logic", "rule", "why", "decision", "allocation", "driver", "flow"],
-    QuestionType.DEPENDENCIES: ["dependency", "dependencies", "depends", "linked", "relationship", "impact"],
-    QuestionType.SCENARIOS: ["scenario", "stress", "downside", "upside", "sensitivity", "what if"],
+    QuestionType.VALUATION: ["valuation", "ev/ebitda", "multiple", "irr", "moic", "dcf"],
+    QuestionType.PROFITABILITY: ["profit", "ebitda", "margin", "gross", "net income"],
+    QuestionType.LIQUIDITY: ["cash", "runway", "liquidity", "working capital", "current ratio"],
+    QuestionType.LEVERAGE: ["debt", "leverage", "dscr", "coverage", "covenant"],
+    QuestionType.GROWTH: ["growth", "cagr", "expand", "volume", "revenue growth"],
+    QuestionType.PRICING: ["price", "pricing", "markup", "premium", "discount"],
+    QuestionType.EFFICIENCY: ["efficiency", "cost", "opex", "utilization", "productivity"],
+    QuestionType.RISK: ["risk", "stress", "downside", "scenario", "sensitivity"],
 }
 
-_FOLLOW_UP_HINTS = {
-    "follow up",
-    "follow-up",
-    "that",
-    "those",
-    "it",
-    "same",
-    "previous",
-    "earlier",
-    "also",
-    "what about",
-    "and if",
-}
+_FOLLOW_UP_HINTS = {"follow up", "follow-up", "that", "those", "same", "previous", "earlier", "also", "what about", "and if"}
 
 
 def classify_question(question: str, memory: DecisionSessionMemory | None = None) -> QuestionType:
     q = question.lower().strip()
     if memory and memory.turns and any(hint in q for hint in _FOLLOW_UP_HINTS):
-        return QuestionType.FOLLOW_UP
+        prev = memory.last_turn()
+        return prev.question_type if prev else QuestionType.FOLLOW_UP
     for qtype, keywords in _KEYWORDS.items():
         if any(k in q for k in keywords):
             return qtype
@@ -75,12 +78,13 @@ def detect_topics(question: str) -> List[str]:
     q = question.lower()
     topics: List[str] = []
     topic_keywords = {
-        "revenue": ["revenue", "sales", "price", "volume"],
-        "profitability": ["ebitda", "margin", "net income", "profit"],
-        "cash_and_debt": ["cash", "debt", "dscr", "liquidity"],
-        "opex_allocation": ["opex", "allocation", "driver", "pool"],
-        "valuation": ["valuation", "dcf", "irr", "moic", "terminal"],
-        "schedule": ["monthly", "quarterly", "yearly", "schedule"],
+        "revenue": ["revenue", "sales", "volume"],
+        "profitability": ["ebitda", "gross", "net income", "margin"],
+        "liquidity": ["cash", "liquidity", "runway", "working capital"],
+        "leverage": ["debt", "leverage", "coverage", "dscr"],
+        "valuation": ["valuation", "dcf", "irr", "moic", "multiple"],
+        "pricing": ["price", "pricing", "markup"],
+        "opex": ["opex", "cost", "allocation", "driver"],
     }
     for topic, keys in topic_keywords.items():
         if any(k in q for k in keys):
@@ -88,52 +92,152 @@ def detect_topics(question: str) -> List[str]:
     return topics or ["general"]
 
 
-def _latest_metrics(snapshot: Dict[str, Any]) -> Dict[str, float]:
+def _safe(v: Any) -> float:
+    try:
+        if v is None:
+            return 0.0
+        return float(v)
+    except Exception:
+        return 0.0
+
+
+def _internal_metrics(snapshot: Dict[str, Any]) -> Dict[str, float]:
     prod = snapshot.get("production_and_revenues", {})
     fin = snapshot.get("financial_statements", {})
     val = snapshot.get("advanced_analytics", {}).get("valuation_summary", {})
+    annual = snapshot.get("latest_annual", {})
+
+    revenue = _safe(prod.get("latest_total_revenue"))
+    ebitda = _safe(prod.get("latest_ebitda"))
+    net_income = _safe(fin.get("latest_net_income"))
+    cash = _safe(fin.get("latest_cash"))
+    debt = _safe(fin.get("latest_debt_balance"))
+    enterprise_value = _safe(val.get("enterprise_value_dcf"))
+
     return {
-        "revenue": float(prod.get("latest_total_revenue") or 0.0),
-        "ebitda": float(prod.get("latest_ebitda") or 0.0),
-        "net_income": float(fin.get("latest_net_income") or 0.0),
-        "cash": float(fin.get("latest_cash") or 0.0),
-        "debt": float(fin.get("latest_debt_balance") or 0.0),
-        "irr": float(val.get("equity_irr_annual") or 0.0),
+        "revenue": revenue,
+        "ebitda": ebitda,
+        "net_income": net_income,
+        "cash": cash,
+        "debt": debt,
+        "ebitda_margin": ebitda / revenue if abs(revenue) > 1e-9 else 0.0,
+        "net_margin": net_income / revenue if abs(revenue) > 1e-9 else 0.0,
+        "debt_to_ebitda": debt / ebitda if abs(ebitda) > 1e-9 else 0.0,
+        "cash_to_debt": cash / debt if abs(debt) > 1e-9 else 0.0,
+        "ev_to_ebitda": enterprise_value / ebitda if abs(ebitda) > 1e-9 else 0.0,
+        "revenue_growth": _safe(annual.get("revenue_growth")),
+        "irr": _safe(val.get("equity_irr_annual")),
+        "moic": _safe(val.get("equity_moic")),
     }
 
 
-def build_contextual_answer(question: str, snapshot: Dict[str, Any], memory: DecisionSessionMemory) -> DecisionTurn:
+def benchmark_catalog(question_type: QuestionType) -> List[ExternalBenchmark]:
+    if question_type == QuestionType.VALUATION:
+        return [
+            ExternalBenchmark("EV/EBITDA", 8.0, 14.0, "x", "Small-cap food & beverage valuation band", "NYU Damodaran Data", "https://pages.stern.nyu.edu/~adamodar/"),
+            ExternalBenchmark("Target Equity IRR", 0.20, 0.35, "%", "Lower-middle-market sponsor target returns", "Investopedia LBO overview", "https://www.investopedia.com/terms/l/leveragedbuyout.asp"),
+        ]
+    if question_type == QuestionType.PROFITABILITY:
+        return [
+            ExternalBenchmark("EBITDA margin", 0.10, 0.25, "%", "Typical healthy beverage margin range", "CSI Market Beverage Industry", "https://csimarket.com/Industry/industry_Profitability_Ratios.php?ind=503"),
+            ExternalBenchmark("Net margin", 0.03, 0.12, "%", "Indicative packaged beverage net margin range", "CSI Market Beverage Industry", "https://csimarket.com/Industry/industry_Profitability_Ratios.php?ind=503"),
+        ]
+    if question_type == QuestionType.LIQUIDITY:
+        return [
+            ExternalBenchmark("Current ratio", 1.2, 2.0, "x", "Typical operating comfort range", "CFI Current Ratio", "https://corporatefinanceinstitute.com/resources/accounting/current-ratio-formula/"),
+            ExternalBenchmark("Cash to debt", 0.25, 1.00, "x", "Liquidity cushion range", "S&P Global (credit metrics overview)", "https://www.spglobal.com/ratings/"),
+        ]
+    if question_type == QuestionType.LEVERAGE:
+        return [
+            ExternalBenchmark("Debt/EBITDA", 2.0, 4.5, "x", "Common leverage covenant zone", "CFI Debt/EBITDA", "https://corporatefinanceinstitute.com/resources/knowledge/finance/debt-ebitda-ratio/"),
+            ExternalBenchmark("DSCR", 1.20, 2.00, "x", "Common minimum lender coverage", "SBA lending guidance", "https://www.sba.gov/funding-programs/loans"),
+        ]
+    if question_type == QuestionType.GROWTH:
+        return [
+            ExternalBenchmark("Revenue growth", 0.04, 0.12, "%", "Typical mature FMCG growth reference", "World Bank + OECD industry context", "https://data.worldbank.org/"),
+        ]
+    return []
+
+
+def _compare(metric_name: str, value: float, bench: ExternalBenchmark) -> str:
+    if value < bench.low:
+        return f"below benchmark ({value:.2f}{bench.unit} vs {bench.low:.2f}-{bench.high:.2f}{bench.unit})"
+    if value > bench.high:
+        return f"above benchmark ({value:.2f}{bench.unit} vs {bench.low:.2f}-{bench.high:.2f}{bench.unit})"
+    return f"within benchmark ({value:.2f}{bench.unit} vs {bench.low:.2f}-{bench.high:.2f}{bench.unit})"
+
+
+def build_structured_answer(question: str, snapshot: Dict[str, Any], memory: DecisionSessionMemory, web_sources: List[dict] | None = None) -> DecisionTurn:
     qtype = classify_question(question, memory)
     topics = detect_topics(question)
-    metrics = _latest_metrics(snapshot)
+    metrics = _internal_metrics(snapshot)
+    benches = benchmark_catalog(qtype)
+    web_sources = web_sources or []
 
-    previous_ref = ""
-    if qtype == QuestionType.FOLLOW_UP and memory.last_turn():
-        prev = memory.last_turn()
-        previous_ref = (
-            f"This follows your previous question on {', '.join(prev.topics)}. "
-            "I am keeping the same model configuration unless you request a change. "
-        )
+    prev_line = ""
+    if memory.last_turn() and classify_question(question, memory) == memory.last_turn().question_type:
+        prev_line = "Follow-up context retained from prior question; assumptions unchanged unless edited. "
 
-    base = (
-        f"{previous_ref}Given the current model outputs: revenue {metrics['revenue']:,.2f}, "
-        f"EBITDA {metrics['ebitda']:,.2f}, net income {metrics['net_income']:,.2f}, "
-        f"cash {metrics['cash']:,.2f}, and debt {metrics['debt']:,.2f}. "
+    direct_answer = "The model appears broadly reasonable, with benchmark-adjusted caveats highlighted below."
+    if qtype == QuestionType.VALUATION and metrics["ev_to_ebitda"] > 0:
+        if metrics["ev_to_ebitda"] > 14:
+            direct_answer = "The valuation looks aggressive versus market norms."
+        elif metrics["ev_to_ebitda"] < 8:
+            direct_answer = "The valuation looks conservative versus market norms."
+        else:
+            direct_answer = "The valuation appears within a plausible market range."
+
+    internal_line = (
+        f"Model outputs: revenue {metrics['revenue']:,.2f}, EBITDA {metrics['ebitda']:,.2f} "
+        f"(margin {metrics['ebitda_margin']:.2%}), net income {metrics['net_income']:,.2f} "
+        f"(margin {metrics['net_margin']:.2%}), cash {metrics['cash']:,.2f}, debt {metrics['debt']:,.2f}, "
+        f"debt/EBITDA {metrics['debt_to_ebitda']:.2f}x, cash/debt {metrics['cash_to_debt']:.2f}x, "
+        f"EV/EBITDA {metrics['ev_to_ebitda']:.2f}x, IRR {metrics['irr']:.2%}, MOIC {metrics['moic']:.2f}x."
     )
 
-    guidance_map = {
-        QuestionType.ASSUMPTIONS: "I will anchor the answer to core assumptions (WACC, tax, inflation, policy thresholds) and identify which assumptions drive the result most.",
-        QuestionType.CALCULATIONS: "I will walk through the calculation chain and formulas linking assumptions to outputs, including intermediate schedules.",
-        QuestionType.OUTPUTS: "I will interpret reported outputs and relate them to operating, financing, and valuation implications.",
-        QuestionType.SCHEDULES: "I will explain the monthly-to-annual schedule flow and where each output is sourced.",
-        QuestionType.LOGIC: "I will describe decision rules and model logic, including driver-based allocation behavior and control points.",
-        QuestionType.DEPENDENCIES: "I will map dependencies across drivers, statements, and valuation so second-order impacts are explicit.",
-        QuestionType.SCENARIOS: "I will frame this as scenario analysis and compare base vs changed assumptions in a traceable way.",
-        QuestionType.FOLLOW_UP: "I will build directly on earlier answers and preserve continuity with prior assumptions and edits.",
-        QuestionType.GENERAL: "I will provide a structured model-aware answer and flag any assumptions that should be confirmed.",
+    metric_map = {
+        "EV/EBITDA": metrics["ev_to_ebitda"],
+        "Target Equity IRR": metrics["irr"],
+        "EBITDA margin": metrics["ebitda_margin"],
+        "Net margin": metrics["net_margin"],
+        "Current ratio": _safe(snapshot.get("ratios", {}).get("current_ratio", 0.0)),
+        "Cash to debt": metrics["cash_to_debt"],
+        "Debt/EBITDA": metrics["debt_to_ebitda"],
+        "DSCR": _safe(snapshot.get("ratios", {}).get("dscr", 0.0)),
+        "Revenue growth": metrics["revenue_growth"],
     }
 
-    answer = f"{base}{guidance_map[qtype]}\n\nQuestion focus: {', '.join(topics)}."
-    turn = DecisionTurn(question=question, answer=answer, question_type=qtype, topics=topics)
+    benchmark_lines = []
+    comparison_lines = []
+    for b in benches:
+        benchmark_lines.append(f"{b.metric}: {b.low:.2f}-{b.high:.2f}{b.unit} ({b.interpretation}).")
+        comparison_lines.append(f"{b.metric} is {_compare(b.metric, metric_map.get(b.metric, 0.0), b)}.")
+
+    if not benchmark_lines:
+        benchmark_lines.append("No strong benchmark range was mapped to this question type; use supplementary web references.")
+
+    recommendation = "Prioritize sensitivity testing on the top two assumptions driving this gap before making capital decisions."
+    if qtype in {QuestionType.LIQUIDITY, QuestionType.LEVERAGE}:
+        recommendation = "Stress-test downside cash conversion and covenant headroom; set explicit trigger thresholds for debt draw, dividends, and capex pacing."
+    elif qtype == QuestionType.PROFITABILITY:
+        recommendation = "Validate gross-to-EBITDA bridge by channel and SKU, then test price/mix and direct-cost inflation to confirm margin durability."
+    elif qtype == QuestionType.VALUATION:
+        recommendation = "Triangulate valuation with both EV/EBITDA and return hurdles; re-run cases with tighter exit multiple and slower growth assumptions."
+
+    sources = [f"Internal model snapshot (latest run)."]
+    sources.extend([f"{b.source_name}: {b.source_url}" for b in benches])
+    sources.extend([f"Live web search: {w.get('title', 'source')} - {w.get('url', '')}" for w in web_sources[:5]])
+
+    answer = (
+        f"1) Direct answer\n{direct_answer}\n\n"
+        f"2) Internal model analysis\n{prev_line}{internal_line}\n\n"
+        f"3) External benchmark analysis\n" + "\n".join(f"- {x}" for x in benchmark_lines) + "\n\n"
+        f"4) Comparison and interpretation\n" + "\n".join(f"- {x}" for x in comparison_lines) + "\n\n"
+        f"5) Decision-quality recommendation\n{recommendation}\n\n"
+        f"6) Sources\n" + "\n".join(f"- {s}" for s in sources)
+    )
+
+    conclusion = comparison_lines[0] if comparison_lines else direct_answer
+    turn = DecisionTurn(question=question, answer=answer, question_type=qtype, topics=topics, conclusion=conclusion)
     memory.remember(turn)
     return turn

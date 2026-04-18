@@ -22,7 +22,7 @@ import streamlit as st
 
 st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
 
-from finmodel.decision_ai import DecisionSessionMemory, build_contextual_answer
+from finmodel.decision_ai import DecisionSessionMemory, QuestionType, build_structured_answer, classify_question
 from brewery_financial_model_all_in_one import (
     CapexItem,
     CostPoolInput,
@@ -1308,6 +1308,15 @@ def _internal_findings_snapshot(result, inputs: ModelInputs, cfg: ModelConfig, d
     annual = result.annual.copy()
     latest_annual = annual.iloc[-1].to_dict() if len(annual) else {}
     latest_monthly = result.monthly.iloc[-1].to_dict() if len(result.monthly) else {}
+    ratios = {}
+    if latest_annual.get("ebitda") not in [None, 0] and latest_monthly.get("debt_ending_balance") is not None:
+        ratios["debt_to_ebitda"] = float(latest_monthly.get("debt_ending_balance", 0.0)) / max(float(latest_annual.get("ebitda", 0.0)), 1e-9)
+    if latest_monthly.get("cash") is not None and latest_monthly.get("debt_ending_balance") not in [None, 0]:
+        ratios["cash_to_debt"] = float(latest_monthly.get("cash", 0.0)) / max(float(latest_monthly.get("debt_ending_balance", 0.0)), 1e-9)
+    if latest_annual.get("ebit") is not None and latest_annual.get("interest_expense") not in [None, 0]:
+        ratios["dscr"] = float(latest_annual.get("ebit", 0.0)) / max(float(latest_annual.get("interest_expense", 0.0)), 1e-9)
+    if latest_monthly.get("current_assets") is not None and latest_monthly.get("current_liabilities") not in [None, 0]:
+        ratios["current_ratio"] = float(latest_monthly.get("current_assets", 0.0)) / max(float(latest_monthly.get("current_liabilities", 0.0)), 1e-9)
     return {
         "model_governance": {
             "start_date": cfg.start_date,
@@ -1336,6 +1345,9 @@ def _internal_findings_snapshot(result, inputs: ModelInputs, cfg: ModelConfig, d
         "advanced_analytics": {
             "valuation_summary": result.valuation,
         },
+        "latest_annual": latest_annual,
+        "latest_monthly": latest_monthly,
+        "ratios": ratios,
     }
 
 
@@ -1422,17 +1434,29 @@ def _ai_decision_making_page(result, inputs: ModelInputs, cfg: ModelConfig, div:
         return
 
     internal = _internal_findings_snapshot(result, inputs, cfg, div)
-    curated_sources = _best_practice_sources_by_topic(question)
+    qtype = classify_question(question, memory)
+    benchmark_query_map = {
+        QuestionType.VALUATION: "craft beverage EV EBITDA multiples lower middle market",
+        QuestionType.PROFITABILITY: "beverage industry EBITDA margin benchmark",
+        QuestionType.LIQUIDITY: "small business current ratio benchmark debt liquidity",
+        QuestionType.LEVERAGE: "Debt EBITDA covenant range DSCR benchmark",
+        QuestionType.GROWTH: "beverage market revenue growth benchmark",
+        QuestionType.PRICING: "beverage pricing power gross margin benchmark",
+        QuestionType.EFFICIENCY: "beverage COGS opex benchmark",
+        QuestionType.RISK: "brewery downside scenario debt coverage benchmark",
+    }
+    benchmark_query = benchmark_query_map.get(qtype, question)
+    curated_sources = _best_practice_sources_by_topic(f"{question} {benchmark_query}")
     live_sources = []
     live_error = None
     try:
-        live_sources = _live_web_headlines(question)
+        live_sources = _live_web_headlines(benchmark_query)
     except Exception as e:
         live_error = str(e)
 
-    st.markdown("### Executive answer")
-    turn = build_contextual_answer(question, internal, memory)
-    st.write(turn.answer)
+    st.markdown("### Decision answer")
+    turn = build_structured_answer(question, internal, memory, web_sources=live_sources)
+    st.markdown(turn.answer)
 
     st.markdown("### Internal model findings")
     mg = internal.get("model_governance", {})
@@ -1463,7 +1487,7 @@ def _ai_decision_making_page(result, inputs: ModelInputs, cfg: ModelConfig, div:
             f"annual IRR **{va.get('equity_irr_annual', 0):.2%}**, and MOIC **{va.get('equity_moic', 0):,.2f}x**."
         )
 
-    st.markdown("### Web-based best-practice comparison")
+    st.markdown("### Web-based benchmark references")
     st.markdown("**Curated authoritative references**")
     for s in curated_sources:
         st.markdown(f"- [{s['name']}]({s['url']})")
