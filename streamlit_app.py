@@ -22,6 +22,7 @@ import streamlit as st
 
 st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
 
+from finmodel.decision_ai import DecisionSessionMemory, build_contextual_answer
 from brewery_financial_model_all_in_one import (
     CapexItem,
     CostPoolInput,
@@ -1369,11 +1370,29 @@ def _live_web_headlines(query: str) -> list[dict]:
 def _ai_decision_making_page(result, inputs: ModelInputs, cfg: ModelConfig, div: DividendPolicy) -> None:
     st.subheader("AI Decision Making")
     st.caption(
-        "Unified AI intelligence engine: combines internal model intelligence with web-based best-practice comparison."
+        "Context-aware model Q&A: answers assumptions, calculations, outputs, schedules, logic, dependencies, and scenario follow-ups."
     )
+    if "decision_memory" not in st.session_state:
+        st.session_state["decision_memory"] = DecisionSessionMemory()
+    memory: DecisionSessionMemory = st.session_state["decision_memory"]
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("Clear Q&A context"):
+            st.session_state["decision_memory"] = DecisionSessionMemory()
+            memory = st.session_state["decision_memory"]
+            st.success("Conversation context was cleared.")
+    with c2:
+        st.caption(f"Questions in context: {len(memory.turns)}")
+
     question = st.text_area("Ask a decision question", placeholder="Example: Is our dividend policy and DSCR resilient under downside scenarios?")
     run = st.button("Analyze question")
     if not run or not question.strip():
+        if memory.turns:
+            st.markdown("### Previous Q&A context")
+            for i, turn in enumerate(memory.turns[-5:], start=max(1, len(memory.turns) - 4)):
+                st.markdown(f"**Q{i}:** {turn.question}")
+                st.markdown(f"**A{i}:** {turn.answer}")
         return
 
     internal = _internal_findings_snapshot(result, inputs, cfg, div)
@@ -1386,10 +1405,8 @@ def _ai_decision_making_page(result, inputs: ModelInputs, cfg: ModelConfig, div:
         live_error = str(e)
 
     st.markdown("### Executive answer")
-    st.write(
-        "Based on internal model outputs and benchmark guidance, your question requires balancing profitability, "
-        "cash resilience, and governance controls. The recommendation below highlights where current settings are robust versus where safeguards should be tightened."
-    )
+    turn = build_contextual_answer(question, internal, memory)
+    st.write(turn.answer)
 
     st.markdown("### Internal model findings")
     mg = internal.get("model_governance", {})
@@ -1443,6 +1460,13 @@ def _ai_decision_making_page(result, inputs: ModelInputs, cfg: ModelConfig, div:
         "1. Formalize benchmark hurdles (DSCR, leverage, runway) as hard controls.\n"
         "2. Tie dividend activation to downside-case resilience, not base case only.\n"
         "3. Add periodic benchmark refresh against external references shown below."
+    )
+
+    st.markdown("### Conversation continuity")
+    st.markdown(
+        f"- Question type detected: **{turn.question_type.value}**\n"
+        f"- Topic tags: **{', '.join(turn.topics)}**\n"
+        f"- Context window size: **{len(memory.turns)} turn(s)**"
     )
 
     st.markdown("### Sources")
