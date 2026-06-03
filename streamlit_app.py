@@ -19,6 +19,9 @@ from typing import Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
 
@@ -36,6 +39,271 @@ from brewery_financial_model_all_in_one import (
     phase_growth_series,
     write_comprehensive_excel_report,
 )
+
+
+def _inject_app_theme() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --shell-ink: #0f172a;
+            --shell-muted: #475569;
+            --shell-line: rgba(15, 23, 42, 0.10);
+            --shell-panel: rgba(255, 255, 255, 0.86);
+            --shell-brand: #8f3d22;
+            --shell-brand-soft: #fff0e8;
+            --shell-accent: #174c43;
+        }
+        .stApp {
+            background:
+                radial-gradient(circle at top left, rgba(248, 192, 138, 0.28), transparent 34%),
+                radial-gradient(circle at top right, rgba(102, 180, 155, 0.18), transparent 30%),
+                linear-gradient(180deg, #f7efe8 0%, #f3f5f9 52%, #eef3f0 100%);
+        }
+        .block-container {
+            padding-top: 1.35rem;
+            padding-bottom: 3rem;
+            max-width: 1380px;
+        }
+        .designer-hero {
+            position: relative;
+            overflow: hidden;
+            margin: 0 0 1.2rem 0;
+            padding: 1.7rem 1.8rem;
+            border: 1px solid rgba(143, 61, 34, 0.14);
+            border-radius: 28px;
+            background:
+                linear-gradient(135deg, rgba(255, 240, 232, 0.95), rgba(255, 255, 255, 0.94)),
+                linear-gradient(135deg, rgba(143, 61, 34, 0.06), rgba(23, 76, 67, 0.08));
+            box-shadow: 0 24px 48px rgba(15, 23, 42, 0.08);
+        }
+        .designer-hero::after {
+            content: "";
+            position: absolute;
+            inset: auto -4rem -4rem auto;
+            width: 15rem;
+            height: 15rem;
+            border-radius: 999px;
+            background: radial-gradient(circle, rgba(143, 61, 34, 0.14), transparent 72%);
+        }
+        .designer-kicker {
+            margin: 0 0 0.45rem 0;
+            font-size: 0.78rem;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            color: var(--shell-brand);
+            font-weight: 700;
+        }
+        .designer-title {
+            margin: 0;
+            font-size: clamp(2rem, 2.8vw, 3.15rem);
+            line-height: 1.02;
+            color: var(--shell-ink);
+            font-weight: 800;
+        }
+        .designer-copy {
+            max-width: 52rem;
+            margin: 0.65rem 0 0 0;
+            color: var(--shell-muted);
+            font-size: 1rem;
+            line-height: 1.6;
+        }
+        .designer-badges {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.55rem;
+            margin-top: 1rem;
+        }
+        .designer-badge {
+            padding: 0.42rem 0.78rem;
+            border-radius: 999px;
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            background: rgba(255, 255, 255, 0.92);
+            color: var(--shell-accent);
+            font-size: 0.82rem;
+            font-weight: 700;
+        }
+        div[data-baseweb="tab-list"] {
+            gap: 0.55rem;
+            margin-bottom: 1rem;
+        }
+        div[data-baseweb="tab-list"] button {
+            min-height: 3rem;
+            border-radius: 999px;
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            background: rgba(255, 255, 255, 0.7);
+            color: var(--shell-muted);
+            padding: 0.25rem 1rem;
+        }
+        div[data-baseweb="tab-list"] button[aria-selected="true"] {
+            background: linear-gradient(135deg, #8f3d22, #174c43);
+            color: white;
+            border-color: transparent;
+            box-shadow: 0 12px 24px rgba(23, 76, 67, 0.18);
+        }
+        div[data-testid="stMetric"],
+        div[data-testid="stDataFrame"],
+        div[data-testid="stExpander"] {
+            border-radius: 20px;
+        }
+        div[data-testid="stMetric"] {
+            border: 1px solid var(--shell-line);
+            background: var(--shell-panel);
+            padding: 0.6rem 0.7rem;
+            box-shadow: 0 12px 28px rgba(15, 23, 42, 0.05);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_model_hero() -> None:
+    badges = "".join(
+        f'<span class="designer-badge">{label}</span>'
+        for label in (
+            "Investor-ready workbook",
+            "Operating model",
+            "Scenario-led valuation",
+            "Driver-based OPEX",
+        )
+    )
+    st.markdown(
+        f"""
+        <section class="designer-hero">
+            <p class="designer-kicker">Craft brewery planning suite</p>
+            <h1 class="designer-title">Microbrewery Financial Model</h1>
+            <p class="designer-copy">
+                Review production, channels, pricing, debt, and valuation in one polished workspace,
+                then export a lender-friendly workbook instead of a raw data dump.
+            </p>
+            <div class="designer-badges">{badges}</div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _format_dashboard_value(value: object) -> object:
+    if isinstance(value, (int, float, np.floating)) and np.isfinite(value):
+        abs_value = abs(float(value))
+        if abs_value >= 1_000_000:
+            return f"${value / 1_000_000:,.2f}M"
+        if abs_value >= 1_000:
+            return f"${value / 1_000:,.1f}K"
+        return f"${value:,.0f}"
+    return value
+
+
+def _style_workbook_sheet(ws, *, accent: str, accent_soft: str, is_overview: bool = False) -> None:
+    ws.sheet_view.showGridLines = False
+    if is_overview:
+        ws.freeze_panes = "A6"
+    elif ws.max_row > 1:
+        ws.freeze_panes = "A2"
+        header_fill = PatternFill("solid", fgColor=accent)
+        header_font = Font(color="FFFFFF", bold=True)
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.auto_filter.ref = ws.dimensions
+        for row in range(2, min(ws.max_row, 120) + 1):
+            if row % 2 == 0:
+                for cell in ws[row]:
+                    cell.fill = PatternFill("solid", fgColor=accent_soft)
+    for col_idx in range(1, ws.max_column + 1):
+        max_length = 0
+        for row_idx in range(1, min(ws.max_row, 80) + 1):
+            value = ws.cell(row=row_idx, column=col_idx).value
+            if value is None:
+                continue
+            max_length = max(max_length, len(str(value)))
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_length + 2, 14), 34)
+
+
+def _extract_workbook_summary(result) -> list[tuple[str, object]]:
+    summary: list[tuple[str, object]] = []
+    annual = result.annual.copy() if isinstance(result.annual, pd.DataFrame) else pd.DataFrame()
+    if not annual.empty:
+        latest = annual.iloc[-1]
+        for label, key in (
+            ("Latest Revenue", "total_revenue"),
+            ("Latest EBITDA", "ebitda"),
+            ("Latest Net Income", "net_income"),
+            ("Latest FCFF", "fcff"),
+        ):
+            if key in latest.index and pd.notna(latest[key]):
+                summary.append((label, _format_dashboard_value(float(latest[key]))))
+    for label, key in (
+        ("NPV", "npv"),
+        ("IRR", "irr"),
+        ("Terminal Value", "terminal_value"),
+    ):
+        value = result.valuation.get(key)
+        if value is None:
+            continue
+        if "irr" in key:
+            summary.append((label, f"{float(value):.1%}"))
+        else:
+            summary.append((label, _format_dashboard_value(float(value))))
+    summary.append(("Sheets Included", len(result.debt_schedules) + 4))
+    return summary[:8]
+
+
+def _build_professional_excel_output(result) -> bytes:
+    raw_buffer = io.BytesIO()
+    with pd.ExcelWriter(raw_buffer, engine="openpyxl") as writer:
+        write_comprehensive_excel_report(result, writer)
+    raw_buffer.seek(0)
+
+    workbook = load_workbook(raw_buffer)
+    accent = "8F3D22"
+    accent_soft = "FCE9DF"
+    ink = "0F172A"
+
+    if "Overview" in workbook.sheetnames:
+        del workbook["Overview"]
+    overview = workbook.create_sheet("Overview", 0)
+    overview["A1"] = "Microbrewery Financial Model"
+    overview["A1"].font = Font(size=20, bold=True, color=ink)
+    overview["A2"] = "Executive workbook with valuation snapshot, detailed statements, and operating schedules."
+    overview["A2"].font = Font(size=11, color="475569")
+    overview["A4"] = "Executive Snapshot"
+    overview["A4"].font = Font(size=12, bold=True, color=accent)
+    overview["A5"] = "Metric"
+    overview["B5"] = "Value"
+    for cell in overview[5]:
+        cell.fill = PatternFill("solid", fgColor=accent)
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    for row_idx, (label, value) in enumerate(_extract_workbook_summary(result), start=6):
+        overview.cell(row=row_idx, column=1, value=label)
+        overview.cell(row=row_idx, column=2, value=value)
+    overview["D4"] = "Design Notes"
+    overview["D4"].font = Font(size=12, bold=True, color=accent)
+    notes = [
+        "Use the assumptions tab to change timing, pricing, debt, or payout policy.",
+        "Results sheets provide monthly and annual statements for investor review.",
+        "The workbook is formatted for management, lender, and board distribution.",
+    ]
+    for row_idx, note in enumerate(notes, start=5):
+        overview.cell(row=row_idx, column=4, value=f"• {note}")
+    overview.column_dimensions["A"].width = 26
+    overview.column_dimensions["B"].width = 18
+    overview.column_dimensions["D"].width = 58
+
+    for sheet in workbook.worksheets:
+        _style_workbook_sheet(
+            sheet,
+            accent=accent,
+            accent_soft=accent_soft,
+            is_overview=sheet.title == "Overview",
+        )
+
+    final_buffer = io.BytesIO()
+    workbook.save(final_buffer)
+    return final_buffer.getvalue()
 
 def _driver_based_opex_views_section(result: ModelRunResult) -> None:
     """
@@ -915,10 +1183,7 @@ def _charts_section(result) -> None:
 
 
 def _download_section(result) -> None:
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        write_comprehensive_excel_report(result, writer)
-    buffer.seek(0)
+    buffer = _build_professional_excel_output(result)
     st.download_button(
         label="Download Excel output (Comprehensive Pack)",
         data=buffer,
@@ -1527,11 +1792,8 @@ def _ai_decision_making_page(result, inputs: ModelInputs, cfg: ModelConfig, div:
 
 
 def main() -> None:
-    st.title("Microbrewery Financial Model")
-    st.write(
-        "Run the sample microbrewery financial model, tweak key valuation "
-        "assumptions, and download the resulting statements."
-    )
+    _inject_app_theme()
+    _render_model_hero()
 
     tab_assumptions, tab_results, tab_key_analytics, tab_ai_decision = st.tabs([
         "Core Assumptions",
