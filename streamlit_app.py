@@ -2031,5 +2031,47 @@ def main() -> None:
         _assumption_editor("Equity injections", "equity", equity_df)
 
 
+# ---------------------------------------------------------------------------
+# Scenario state hooks — called by the parent NumQuants shell to save/restore
+# the full workspace state across sessions.
+# ---------------------------------------------------------------------------
+
+_STATE_KEYS = [
+    "assump_data_skus",
+    "assump_data_channels",
+    "assump_data_sales_plan_base",
+    "assump_sales_plan_frequency",
+    "assump_data_cost_pools",
+    "assump_data_other_income",
+    "assump_data_capex",
+    "assump_data_debt",
+    "assump_data_equity",
+    "assump_data_config",
+    "assump_data_dividend",
+]
+
+
+def get_state() -> dict:
+    """Return a snapshot of all user-editable assumption tables.
+
+    DataFrames are kept as-is; the parent app's serialisation layer converts
+    them to JSON-safe records before writing to the database.
+    """
+    import streamlit as _st
+    return {k: _st.session_state[k] for k in _STATE_KEYS if k in _st.session_state}
+
+
+def set_state(state: dict) -> None:
+    """Pre-populate session_state from a previously saved snapshot.
+
+    Must be called *before* main() so that widget initial values are picked up
+    on the first render of each assumption editor.
+    """
+    import streamlit as _st
+    for k, v in state.items():
+        if k in _STATE_KEYS:
+            _st.session_state[k] = v
+
+
 if __name__ == "__main__":
     main()
