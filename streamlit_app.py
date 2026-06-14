@@ -701,6 +701,7 @@ def _assumption_editor(title: str, key: str, df: pd.DataFrame) -> pd.DataFrame:
                 "Row selection",
                 options=row_options,
                 key=f"assump_row_select_{key}",
+                format_func=lambda row_idx: _row_selection_label(wdf, row_idx),
             )
             st.markdown("**Editable row form fields**")
             updated_row = {}
@@ -780,6 +781,90 @@ def _cast_value_for_dtype(column: pd.Series, value: object) -> object:
             return pd.NaT
         return pd.to_datetime(value, errors="coerce")
     return value
+
+
+def _format_row_label_value(value: object, col_name: str) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, (float, np.floating)):
+        if not np.isfinite(value):
+            return ""
+        text = str(int(value)) if float(value).is_integer() else f"{float(value):g}"
+    else:
+        text = str(value).strip()
+    if not text:
+        return ""
+    if col_name == "sku_id":
+        return f"SKU {text}"
+    return text
+
+
+def _row_selection_label(df: pd.DataFrame, row_idx: object, prefix: str = "Row") -> str:
+    if df is None or not isinstance(df, pd.DataFrame) or row_idx not in df.index:
+        return f"{prefix} {row_idx}"
+
+    row = df.loc[row_idx]
+    if isinstance(row, pd.DataFrame):
+        row = row.iloc[0]
+
+    preferred_cols = [
+        "name",
+        "role",
+        "stage",
+        "channel",
+        "supplier_category",
+        "other_income_name",
+        "case",
+        "scenario",
+        "variable",
+        "month",
+        "quarter",
+        "year",
+        "date",
+        "sku_name",
+        "sku_id",
+        "product_name",
+        "product",
+        "metric",
+    ]
+    parts: list[str] = []
+    seen: set[str] = set()
+
+    def add_part(col_name: object) -> None:
+        if col_name not in df.columns:
+            return
+        if isinstance(col_name, str) and col_name.startswith("Year "):
+            return
+        value = _format_row_label_value(row.get(col_name), str(col_name))
+        if not value:
+            return
+        normalized = value.lower()
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        parts.append(value)
+
+    for col_name in preferred_cols:
+        add_part(col_name)
+        if len(parts) >= 3:
+            break
+
+    if not parts:
+        for col_name in df.columns:
+            if len(parts) >= 3:
+                break
+            if isinstance(col_name, str) and col_name.startswith("Year "):
+                continue
+            if col_name != "sku_id" and pd.api.types.is_numeric_dtype(df[col_name]):
+                continue
+            add_part(col_name)
+
+    label = " | ".join(parts) if parts else f"{prefix} {row_idx}"
+    if isinstance(row_idx, (int, np.integer)):
+        return f"{label} [Row {int(row_idx) + 1}]"
+    return f"{label} [{prefix} {row_idx}]"
 
 
 def _year_columns_for_months(months: int) -> list[str]:
@@ -1006,7 +1091,12 @@ def _dynamic_table_editor(title: str, key: str, default_df: pd.DataFrame, label:
     if st.session_state[edit_key]:
         wdf = st.session_state[work_key]
         if not wdf.empty:
-            selected = st.selectbox(f"{label.title()} selection", options=list(wdf.index), key=select_key)
+            selected = st.selectbox(
+                f"{label.title()} selection",
+                options=list(wdf.index),
+                key=select_key,
+                format_func=lambda row_idx: _row_selection_label(wdf, row_idx, prefix=label.title()),
+            )
             updates = {}
             for col in wdf.columns:
                 v = wdf.loc[selected, col]
@@ -1538,7 +1628,12 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
     if st.session_state[var_edit_key]:
         wdf = st.session_state[var_work_key]
         if not wdf.empty:
-            selected_row = st.selectbox("Variable selector", options=list(wdf.index), key=var_select_key)
+            selected_row = st.selectbox(
+                "Variable selector",
+                options=list(wdf.index),
+                key=var_select_key,
+                format_func=lambda row_idx: _row_selection_label(wdf, row_idx, prefix="Variable"),
+            )
             st.markdown("**Editable variable fields**")
             var_name = st.text_input(
                 "variable",

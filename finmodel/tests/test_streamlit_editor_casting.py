@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from streamlit_app import _align_year_schedule_df, _apply_yearly_increment, _cast_value_for_dtype
+from streamlit_app import _align_year_schedule_df, _apply_yearly_increment, _cast_value_for_dtype, _row_selection_label
 
 
 def test_cast_value_for_dtype_preserves_bool_columns():
@@ -40,3 +40,15 @@ def test_align_year_schedule_df_extends_last_available_year_and_drops_extra_year
     assert aligned.loc[0, "Year 1"] == 1.0
     assert aligned.loc[0, "Year 2"] == 2.0
     assert aligned.loc[0, "Year 3"] == 9.0
+
+
+def test_row_selection_label_prefers_business_identifiers():
+    df = pd.DataFrame(
+        [
+            {"role": "Brewhouse Operators", "channel": "Retail", "Year 1": 5.0},
+            {"stage": "Raw Materials", "supplier_category": "Malt", "Year 1": 10.0},
+        ]
+    )
+
+    assert _row_selection_label(df, 0) == "Brewhouse Operators | Retail [Row 1]"
+    assert _row_selection_label(df, 1) == "Raw Materials | Malt [Row 2]"
