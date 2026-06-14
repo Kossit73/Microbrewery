@@ -34,7 +34,7 @@ Notes:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 from typing import Dict, Iterable, List, Literal, Optional, Tuple
 
@@ -115,6 +115,17 @@ class ModelConfig:
 
     # Cash
     initial_cash: float = 0.0
+
+    # Liquidity / revolver / covenant support
+    revolver_limit: float = 750_000.0
+    revolver_interest_annual: float = 0.085
+    revolver_target_cash: float = 250_000.0
+    min_dscr: float = 1.20
+    min_interest_coverage: float = 2.00
+    max_leverage_ratio: float = 4.50
+
+    # Capacity shortfall support
+    temporary_labor_premium_pct: float = 0.20
 
 
 @dataclass(frozen=True)
@@ -200,6 +211,12 @@ class ModelInputs:
     other_income_monthly: float | pd.Series = 0.0
     cost_pools: Optional[List[CostPoolInput]] = None
 
+    direct_labor_schedule: Optional[pd.DataFrame] = None
+    indirect_labor_schedule: Optional[pd.DataFrame] = None
+    inventory_schedule: Optional[pd.DataFrame] = None
+    receivables_schedule: Optional[pd.DataFrame] = None
+    payables_schedule: Optional[pd.DataFrame] = None
+
     capex_items: Optional[List[CapexItem]] = None
     debt_facilities: Optional[List[DebtFacility]] = None
     equity_injections: Optional[Dict[int, float]] = None
@@ -213,6 +230,7 @@ class ModelRunResult:
     debt_schedules: Dict[str, pd.DataFrame]
     valuation: Dict[str, float]
     opex_allocation_views: Dict[str, pd.DataFrame]
+    supporting_schedules: Dict[str, pd.DataFrame] = field(default_factory=dict)
 
 
 # =============================
@@ -308,6 +326,16 @@ class MicrobreweryFinancialModel:
             self.inputs.cost_pools = []
         if self.inputs.other_income_items is None:
             self.inputs.other_income_items = []
+        if self.inputs.direct_labor_schedule is None:
+            self.inputs.direct_labor_schedule = pd.DataFrame()
+        if self.inputs.indirect_labor_schedule is None:
+            self.inputs.indirect_labor_schedule = pd.DataFrame()
+        if self.inputs.inventory_schedule is None:
+            self.inputs.inventory_schedule = pd.DataFrame()
+        if self.inputs.receivables_schedule is None:
+            self.inputs.receivables_schedule = pd.DataFrame()
+        if self.inputs.payables_schedule is None:
+            self.inputs.payables_schedule = pd.DataFrame()
 
     def _other_income_series(self, idx: pd.DatetimeIndex) -> pd.Series:
         if self.inputs.other_income_items:
@@ -337,6 +365,283 @@ class MicrobreweryFinancialModel:
             s.name = name
             return s
         return pd.Series(float(x), index=idx, name=name)
+
+    def _model_year_count(self) -> int:
+        return max(int(np.ceil(float(self.cfg.months) / 12.0)), 1)
+
+    def _month_year_numbers(self, idx: pd.DatetimeIndex) -> np.ndarray:
+        return (np.arange(len(idx)) // 12) + 1
+
+    def _year_value(self, row: pd.Series, year_num: int, default: float = 0.0) -> float:
+        value = row.get(f"Year {year_num}", default)
+        if pd.isna(value):
+            return float(default)
+        return float(pd.to_numeric(value, errors="coerce"))
+
+    def _schedule_numeric(self, row: pd.Series, key: str, default: float = 0.0) -> float:
+        value = row.get(key, default)
+        if pd.isna(value):
+            return float(default)
+        return float(pd.to_numeric(value, errors="coerce"))
+
+    def _sku_units_monthly(self, idx: pd.DatetimeIndex, units_wide: pd.DataFrame) -> pd.DataFrame:
+        sku_ids = list(self.inputs.skus["sku_id"])
+        if units_wide.empty:
+            return pd.DataFrame(0.0, index=idx, columns=sku_ids)
+        sku_units = units_wide.T.groupby(level=0).sum().T.reindex(idx).fillna(0.0)
+        return sku_units.reindex(columns=sku_ids, fill_value=0.0)
+
+    def _sku_liters_monthly(self, idx: pd.DatetimeIndex, units_wide: pd.DataFrame) -> pd.DataFrame:
+        sku_units = self._sku_units_monthly(idx, units_wide)
+        liters = pd.DataFrame(0.0, index=idx, columns=sku_units.columns)
+        sku_lookup = self.inputs.skus.set_index("sku_id")
+        for sku_id in liters.columns:
+            liters_per = self._liters_per_unit_from_name(str(sku_lookup.loc[sku_id, "name"]))
+            liters[sku_id] = sku_units[sku_id] * liters_per
+        return liters
+
+    def _labor_schedule_monthly(
+        self,
+        idx: pd.DatetimeIndex,
+        units_wide: pd.DataFrame,
+        labor_df: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        sku_ids = list(self.inputs.skus["sku_id"])
+        empty_alloc = pd.DataFrame(0.0, index=idx, columns=sku_ids)
+        if labor_df is None or labor_df.empty:
+            empty_summary = pd.DataFrame(
+                {
+                    "labor_cost": pd.Series(0.0, index=idx),
+                    "required_liters": pd.Series(0.0, index=idx),
+                    "capacity_liters": pd.Series(0.0, index=idx),
+                    "capacity_shortfall_liters": pd.Series(0.0, index=idx),
+                    "temporary_labor_cost": pd.Series(0.0, index=idx),
+                }
+            )
+            return empty_alloc, empty_summary
+
+        sku_units = self._sku_units_monthly(idx, units_wide)
+        sku_liters = self._sku_liters_monthly(idx, units_wide)
+        year_nums = self._month_year_numbers(idx)
+
+        alloc = pd.DataFrame(0.0, index=idx, columns=sku_ids)
+        labor_cost = pd.Series(0.0, index=idx, name="labor_cost")
+        capacity_liters = pd.Series(0.0, index=idx, name="capacity_liters")
+        required_liters = sku_liters.sum(axis=1).rename("required_liters")
+
+        for _, row in labor_df.iterrows():
+            if pd.isna(row.get("role")):
+                continue
+            monthly_cost_year1 = self._schedule_numeric(row, "monthly_cost_per_fte", 0.0)
+            annual_raise_pct = self._schedule_numeric(row, "annual_raise_pct", 0.0)
+            benefits_pct = self._schedule_numeric(row, "benefits_pct", 0.0)
+            payroll_tax_pct = self._schedule_numeric(row, "payroll_tax_pct", 0.0)
+            overtime_pct = self._schedule_numeric(row, "overtime_pct", 0.0)
+            capacity_per_fte = self._schedule_numeric(row, "capacity_liters_per_fte_month", 0.0)
+            scope = str(row.get("scope", "global") or "global").strip().lower()
+            target_sku_id = pd.to_numeric(row.get("target_sku_id"), errors="coerce")
+            allocation_driver = str(row.get("allocation_driver", "liters") or "liters").strip().lower()
+
+            headcounts = np.array([self._year_value(row, int(y), 0.0) for y in year_nums], dtype=float)
+            salary_factors = (1.0 + annual_raise_pct) ** np.maximum(year_nums - 1, 0)
+            loaded_cost = monthly_cost_year1 * salary_factors * (
+                1.0 + benefits_pct + payroll_tax_pct + overtime_pct
+            )
+            role_cost = pd.Series(headcounts * loaded_cost, index=idx)
+            labor_cost = labor_cost.add(role_cost, fill_value=0.0)
+            capacity_liters = capacity_liters.add(headcounts * capacity_per_fte, fill_value=0.0)
+
+            basis = sku_liters if allocation_driver == "liters" else sku_units
+            basis = basis.copy()
+            if scope == "sku" and not pd.isna(target_sku_id):
+                target = int(target_sku_id)
+                basis = pd.DataFrame(0.0, index=idx, columns=sku_ids)
+                if target in basis.columns:
+                    basis[target] = (
+                        sku_liters[target] if allocation_driver == "liters" else sku_units[target]
+                    )
+            elif allocation_driver == "fixed":
+                basis = (sku_units > 0).astype(float)
+            denom = basis.sum(axis=1).replace(0.0, np.nan)
+            shares = basis.div(denom, axis=0).fillna(0.0)
+            alloc = alloc.add(shares.mul(role_cost, axis=0), fill_value=0.0)
+
+        capacity_shortfall = (required_liters - capacity_liters).clip(lower=0.0)
+        shortfall_ratio = np.divide(
+            capacity_shortfall.to_numpy(),
+            required_liters.to_numpy(),
+            out=np.zeros(len(idx), dtype=float),
+            where=required_liters.to_numpy() > 0.0,
+        )
+        temporary_labor_cost = labor_cost * shortfall_ratio * float(self.cfg.temporary_labor_premium_pct)
+        labor_cost = labor_cost.add(temporary_labor_cost, fill_value=0.0)
+        if labor_cost.sum() > 0.0:
+            denom = alloc.sum(axis=1).replace(0.0, np.nan)
+            shares = alloc.div(denom, axis=0).fillna(0.0)
+            alloc = alloc.add(shares.mul(temporary_labor_cost, axis=0), fill_value=0.0)
+
+        summary = pd.DataFrame(
+            {
+                "labor_cost": labor_cost,
+                "required_liters": required_liters,
+                "capacity_liters": capacity_liters,
+                "capacity_shortfall_liters": capacity_shortfall,
+                "temporary_labor_cost": temporary_labor_cost,
+            },
+            index=idx,
+        )
+        return alloc, summary
+
+    def _revenue_schedule_adjustments(
+        self,
+        idx: pd.DatetimeIndex,
+        revenue_wide: pd.DataFrame,
+    ) -> tuple[pd.Series, pd.DataFrame, pd.DataFrame]:
+        if revenue_wide.empty:
+            empty = pd.Series(0.0, index=idx)
+            return empty.rename("net_revenue"), pd.DataFrame(index=idx), pd.DataFrame(index=idx)
+
+        channel_revenue = revenue_wide.T.groupby(level=1).sum().T.reindex(idx).fillna(0.0)
+        schedule = self.inputs.receivables_schedule
+        if schedule is None or schedule.empty:
+            net_revenue = channel_revenue.sum(axis=1).rename("net_revenue")
+            breakdown = pd.DataFrame(
+                {
+                    "gross_revenue": net_revenue,
+                    "trade_spend": pd.Series(0.0, index=idx),
+                    "returns_allowances": pd.Series(0.0, index=idx),
+                    "bad_debt_expense": pd.Series(0.0, index=idx),
+                },
+                index=idx,
+            )
+            ar_details = pd.DataFrame({"receivables": net_revenue * (self.cfg.days_receivables / 365.0)}, index=idx)
+            return net_revenue, breakdown, ar_details
+
+        trade = pd.Series(0.0, index=idx)
+        returns = pd.Series(0.0, index=idx)
+        bad_debt = pd.Series(0.0, index=idx)
+        receivables = pd.Series(0.0, index=idx)
+        detail_cols: Dict[str, pd.Series] = {}
+        for _, row in schedule.iterrows():
+            channel = str(row.get("channel", "")).strip()
+            if not channel or channel not in channel_revenue.columns:
+                continue
+            gross = channel_revenue[channel]
+            trade_pct = self._schedule_numeric(row, "trade_spend_pct", 0.0)
+            returns_pct = self._schedule_numeric(row, "returns_pct", 0.0)
+            bad_pct = self._schedule_numeric(row, "bad_debt_pct", 0.0)
+            days = pd.Series(
+                [self._year_value(row, int(y), self.cfg.days_receivables) for y in self._month_year_numbers(idx)],
+                index=idx,
+            )
+            channel_trade = gross * trade_pct
+            channel_returns = gross * returns_pct
+            channel_net = gross - channel_trade - channel_returns
+            trade = trade.add(channel_trade, fill_value=0.0)
+            returns = returns.add(channel_returns, fill_value=0.0)
+            bad_debt = bad_debt.add(channel_net * bad_pct, fill_value=0.0)
+            channel_ar = channel_net * (days / 365.0)
+            receivables = receivables.add(channel_ar, fill_value=0.0)
+            detail_cols[f"receivables_{channel}"] = channel_ar
+
+        net_revenue = (channel_revenue.sum(axis=1) - trade - returns).rename("net_revenue")
+        breakdown = pd.DataFrame(
+            {
+                "gross_revenue": channel_revenue.sum(axis=1),
+                "trade_spend": trade,
+                "returns_allowances": returns,
+                "bad_debt_expense": bad_debt,
+            },
+            index=idx,
+        )
+        ar_details = pd.DataFrame(detail_cols, index=idx)
+        ar_details["receivables"] = receivables
+        return net_revenue, breakdown, ar_details
+
+    def _inventory_schedule_components(
+        self,
+        idx: pd.DatetimeIndex,
+        direct_costs_base: pd.Series,
+    ) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+        schedule = self.inputs.inventory_schedule
+        if schedule is None or schedule.empty:
+            inventory = direct_costs_base * (self.cfg.days_inventory / 365.0)
+            details = pd.DataFrame({"inventory": inventory}, index=idx)
+            return details, pd.Series(0.0, index=idx, name="inventory_writeoff"), pd.Series(
+                0.0, index=idx, name="inventory_reserve"
+            )
+
+        gross_inventory = pd.Series(0.0, index=idx)
+        reserve = pd.Series(0.0, index=idx)
+        writeoff = pd.Series(0.0, index=idx)
+        detail_cols: Dict[str, pd.Series] = {}
+        for _, row in schedule.iterrows():
+            stage = str(row.get("stage", "")).strip() or "inventory"
+            share = self._schedule_numeric(row, "cost_share_pct", 0.0)
+            reserve_pct = self._schedule_numeric(row, "reserve_pct", 0.0)
+            writeoff_pct = self._schedule_numeric(row, "writeoff_pct", 0.0)
+            days = pd.Series(
+                [self._year_value(row, int(y), self.cfg.days_inventory) for y in self._month_year_numbers(idx)],
+                index=idx,
+            )
+            component_base = direct_costs_base * share
+            component_gross = component_base * (days / 365.0)
+            component_reserve = component_gross * reserve_pct
+            component_writeoff = component_base * writeoff_pct
+            gross_inventory = gross_inventory.add(component_gross, fill_value=0.0)
+            reserve = reserve.add(component_reserve, fill_value=0.0)
+            writeoff = writeoff.add(component_writeoff, fill_value=0.0)
+            detail_cols[f"inventory_{stage}"] = component_gross - component_reserve
+
+        details = pd.DataFrame(detail_cols, index=idx)
+        details["inventory"] = gross_inventory - reserve
+        return details, writeoff.rename("inventory_writeoff"), reserve.rename("inventory_reserve")
+
+    def _payables_schedule_components(
+        self,
+        idx: pd.DatetimeIndex,
+        direct_costs_base: pd.Series,
+    ) -> tuple[pd.DataFrame, pd.Series]:
+        schedule = self.inputs.payables_schedule
+        if schedule is None or schedule.empty:
+            payables = direct_costs_base * (self.cfg.days_payables / 365.0)
+            return pd.DataFrame({"payables": payables}, index=idx), pd.Series(
+                0.0, index=idx, name="payable_discount_benefit"
+            )
+
+        payables = pd.Series(0.0, index=idx)
+        benefit = pd.Series(0.0, index=idx)
+        detail_cols: Dict[str, pd.Series] = {}
+        for _, row in schedule.iterrows():
+            category = str(row.get("supplier_category", "")).strip() or "payables"
+            share = self._schedule_numeric(row, "cost_share_pct", 0.0)
+            early_discount = self._schedule_numeric(row, "early_pay_discount_pct", 0.0)
+            capture_pct = self._schedule_numeric(row, "discount_capture_pct", 0.0)
+            days = pd.Series(
+                [self._year_value(row, int(y), self.cfg.days_payables) for y in self._month_year_numbers(idx)],
+                index=idx,
+            )
+            component_base = direct_costs_base * share
+            component_ap = component_base * (days / 365.0)
+            component_benefit = component_base * early_discount * capture_pct
+            payables = payables.add(component_ap, fill_value=0.0)
+            benefit = benefit.add(component_benefit, fill_value=0.0)
+            detail_cols[f"payables_{category}"] = component_ap
+
+        details = pd.DataFrame(detail_cols, index=idx)
+        details["payables"] = payables
+        return details, benefit.rename("payable_discount_benefit")
+
+    def _current_liability_split(
+        self,
+        idx: pd.DatetimeIndex,
+        debt_principal: pd.Series,
+        revolver_balance: pd.Series,
+    ) -> tuple[pd.Series, pd.Series]:
+        current_portion = debt_principal.rolling(window=12, min_periods=1).sum().clip(lower=0.0)
+        current_debt = current_portion.add(revolver_balance, fill_value=0.0).rename("current_debt")
+        long_term_debt = (revolver_balance * 0.0).add(0.0, fill_value=0.0)
+        return current_debt, long_term_debt
 
     # ---------- sales ----------
     def _expand_sales_plan_to_monthly(self, idx: pd.DatetimeIndex) -> pd.DataFrame:
@@ -481,7 +786,16 @@ class MicrobreweryFinancialModel:
         revenue_wide: pd.DataFrame,
         cost_type: Literal["direct", "indirect"],
     ) -> pd.DataFrame:
-        pools = [p for p in (self.inputs.cost_pools or []) if p.cost_type == cost_type]
+        excluded_names: set[str] = set()
+        if cost_type == "direct" and self.inputs.direct_labor_schedule is not None and not self.inputs.direct_labor_schedule.empty:
+            excluded_names.add("production direct labor")
+        if cost_type == "indirect" and self.inputs.indirect_labor_schedule is not None and not self.inputs.indirect_labor_schedule.empty:
+            excluded_names.add("indirect labor")
+        pools = [
+            p
+            for p in (self.inputs.cost_pools or [])
+            if p.cost_type == cost_type and str(p.name).strip().lower() not in excluded_names
+        ]
         data: Dict[str, pd.Series] = {}
         for pool in pools:
             driver = self._pool_driver_series(idx, units_wide, revenue_wide, pool)
@@ -524,11 +838,19 @@ class MicrobreweryFinancialModel:
         total_pool = pool_monthly.sum(axis=1).reindex(idx).fillna(0.0)
         return shares.mul(total_pool, axis=0)
 
-    def _derived_direct_cost_per_unit_by_sku(self, idx: pd.DatetimeIndex, units_wide: pd.DataFrame) -> pd.Series:
+    def _derived_direct_cost_per_unit_by_sku(
+        self,
+        idx: pd.DatetimeIndex,
+        units_wide: pd.DataFrame,
+        include_scheduled_labor: bool = True,
+    ) -> pd.Series:
         skus = self.inputs.skus.set_index("sku_id")
         revenue_proxy = self._estimated_revenue_wide_from_units(idx, units_wide)
         direct_pool_monthly = self._direct_cost_pool_monthly(idx, units_wide, revenue_proxy)
         allocated = self._allocate_monthly_pool_to_sku(idx, units_wide, direct_pool_monthly)
+        if include_scheduled_labor:
+            labor_alloc, _ = self._labor_schedule_monthly(idx, units_wide, self.inputs.direct_labor_schedule)
+            allocated = allocated.add(labor_alloc, fill_value=0.0)
 
         basis_m = int(np.clip(self.cfg.pricing_cost_basis_month, 0, len(idx) - 1))
         basis_date = idx[basis_m]
@@ -541,9 +863,10 @@ class MicrobreweryFinancialModel:
         overrides = pd.to_numeric(skus.get("direct_cost_per_unit_override"), errors="coerce")
         per_unit = per_unit.where(~overrides.notna(), overrides)
         per_unit = per_unit.fillna(0.0).rename("direct_cost_per_unit")
-        self.inputs.skus = self.inputs.skus.set_index("sku_id")
-        self.inputs.skus["direct_cost_per_unit"] = per_unit
-        self.inputs.skus = self.inputs.skus.reset_index()
+        if include_scheduled_labor:
+            self.inputs.skus = self.inputs.skus.set_index("sku_id")
+            self.inputs.skus["direct_cost_per_unit"] = per_unit
+            self.inputs.skus = self.inputs.skus.reset_index()
         return per_unit
 
     # ---------- pricing ----------
@@ -944,17 +1267,22 @@ class MicrobreweryFinancialModel:
             revenue_wide = pd.DataFrame(index=idx, columns=units_wide.columns)
         else:
             revenue_wide = units_wide.mul(prices_wide, fill_value=0.0)
-        revenue = revenue_wide.sum(axis=1).rename("revenue")
+        net_revenue, revenue_breakdown, receivables_details = self._revenue_schedule_adjustments(idx, revenue_wide)
+        gross_revenue = revenue_breakdown.get("gross_revenue", revenue_wide.sum(axis=1)).rename("gross_revenue")
 
         other_income = self._other_income_series(idx)
         other_income = (other_income * cost_idx).rename("other_income")  # default: inflate with costs
-        total_revenue = (revenue + other_income).rename("total_revenue")
+        total_revenue = (net_revenue + other_income).rename("total_revenue")
 
         # Direct costs
         skus = self.inputs.skus.set_index("sku_id")
-        derived_direct_cost_per_unit = self._derived_direct_cost_per_unit_by_sku(idx, units_wide)
+        derived_direct_cost_per_unit = self._derived_direct_cost_per_unit_by_sku(
+            idx,
+            units_wide,
+            include_scheduled_labor=False,
+        )
         if units_wide.empty:
-            direct_costs = pd.Series(0.0, index=idx, name="direct_costs")
+            direct_material_costs = pd.Series(0.0, index=idx, name="direct_material_costs")
         else:
             cost_cols = []
             cost_data = []
@@ -968,27 +1296,91 @@ class MicrobreweryFinancialModel:
                 index=idx,
                 columns=pd.MultiIndex.from_tuples(cost_cols, names=["sku_id", "channel"]),
             ).sort_index(axis=1)
-
             direct_costs_wide = units_wide.mul(costs_wide, fill_value=0.0)
-            direct_costs = direct_costs_wide.sum(axis=1).rename("direct_costs")
+            direct_material_costs = direct_costs_wide.sum(axis=1).rename("direct_material_costs")
 
-        gross_profit = (revenue - direct_costs).rename("gross_profit")
+        direct_labor_alloc, direct_labor_summary = self._labor_schedule_monthly(
+            idx,
+            units_wide,
+            self.inputs.direct_labor_schedule,
+        )
+        direct_labor_cost = direct_labor_summary["labor_cost"].rename("direct_labor_cost")
+        inventory_details, inventory_writeoff, inventory_reserve = self._inventory_schedule_components(
+            idx,
+            direct_material_costs,
+        )
+        payables_details, payable_discount_benefit = self._payables_schedule_components(
+            idx,
+            direct_material_costs,
+        )
+        direct_costs = (
+            direct_material_costs
+            + direct_labor_cost
+            + inventory_writeoff
+            - payable_discount_benefit
+        ).rename("direct_costs")
+        gross_profit = (net_revenue - direct_costs).rename("gross_profit")
 
-        # Indirect operating costs from explicit cost pools (no lump-sum monthly OPEX input).
+        # Indirect operating costs from explicit cost pools plus indirect labor and bad-debt expense.
         pool_monthly = self._indirect_cost_pool_monthly(idx, units_wide, revenue_wide)
-        opex = (pool_monthly.sum(axis=1) * cost_idx).rename("opex")
-
+        _, indirect_labor_summary = self._labor_schedule_monthly(
+            idx,
+            units_wide,
+            self.inputs.indirect_labor_schedule,
+        )
+        indirect_labor_cost = indirect_labor_summary["labor_cost"].rename("indirect_labor_cost")
+        bad_debt_expense = revenue_breakdown.get(
+            "bad_debt_expense",
+            pd.Series(0.0, index=idx),
+        ).rename("bad_debt_expense")
+        opex = (
+            (pool_monthly.sum(axis=1) * cost_idx)
+            + indirect_labor_cost
+            + bad_debt_expense
+        ).rename("opex")
         ebitda = (total_revenue - direct_costs - opex).rename("ebitda")
 
         # CAPEX + depreciation + net fixed assets
         capex = self._capex_series(idx)
         dep = self._depreciation_series(idx)
         net_fixed_assets = self._net_fixed_assets(capex, dep)
-
         ebit = (ebitda - dep).rename("ebit")
 
         # Working capital
-        nwc_comp, change_nwc = self._nwc(idx, revenue=revenue, direct_costs=direct_costs)
+        receivables = receivables_details.get(
+            "receivables",
+            pd.Series(0.0, index=idx),
+        ).rename("receivables")
+        inventory = inventory_details.get(
+            "inventory",
+            pd.Series(0.0, index=idx),
+        ).rename("inventory")
+        payables = payables_details.get(
+            "payables",
+            pd.Series(0.0, index=idx),
+        ).rename("payables")
+        other_current_assets = (net_revenue * float(self.cfg.other_current_assets_pct_revenue)).rename(
+            "other_current_assets"
+        )
+        other_current_liabilities = (
+            direct_material_costs * float(self.cfg.other_current_liabilities_pct_direct_costs)
+        ).rename("other_current_liabilities")
+        net_working_capital = (
+            receivables + inventory + other_current_assets - payables - other_current_liabilities
+        ).rename("net_working_capital")
+        change_nwc = net_working_capital.diff().fillna(net_working_capital.iloc[0]).rename("change_in_nwc")
+        nwc_comp = pd.DataFrame(
+            {
+                "receivables": receivables,
+                "inventory": inventory,
+                "inventory_reserve": inventory_reserve,
+                "other_current_assets": other_current_assets,
+                "payables": payables,
+                "other_current_liabilities": other_current_liabilities,
+                "net_working_capital": net_working_capital,
+            },
+            index=idx,
+        )
 
         # Debt schedules
         debt_schedules = self._debt_schedules(idx)
@@ -1003,11 +1395,6 @@ class MicrobreweryFinancialModel:
             debt_principal = pd.Series(0.0, index=idx, name="debt_principal_payment")
             debt_balance = pd.Series(0.0, index=idx, name="debt_ending_balance")
 
-        # Taxes
-        ebt = (ebit - debt_interest).rename("ebt")
-        taxes = (ebt.clip(lower=0.0) * float(self.cfg.tax_rate)).rename("taxes")
-        net_income = (ebt - taxes).rename("net_income")
-
         # Equity injections
         equity_inj = pd.Series(0.0, index=idx, name="equity_injection")
         for m, amt in (self.inputs.equity_injections or {}).items():
@@ -1015,30 +1402,76 @@ class MicrobreweryFinancialModel:
             if 0 <= m < len(idx):
                 equity_inj.iloc[m] += float(amt)
 
-        # Cash flow building blocks
-        cfo = (net_income + dep - change_nwc).rename("cash_flow_from_operations")
+        # Sequential taxes, revolver, cash, and dividends
+        revolver_rate_m = annual_to_monthly_rate(self.cfg.revolver_interest_annual)
+        pre_tax_income = pd.Series(0.0, index=idx, name="pre_tax_income")
+        taxes = pd.Series(0.0, index=idx, name="taxes")
+        net_income = pd.Series(0.0, index=idx, name="net_income")
+        revolver_interest = pd.Series(0.0, index=idx, name="revolver_interest_expense")
+        revolver_draw = pd.Series(0.0, index=idx, name="revolver_draw")
+        revolver_principal = pd.Series(0.0, index=idx, name="revolver_principal_payment")
+        revolver_balance = pd.Series(0.0, index=idx, name="revolver_ending_balance")
+        cfo = pd.Series(0.0, index=idx, name="cash_flow_from_operations")
         cfi = (-capex).rename("cash_flow_from_investing")
-        cff_pre_div = (equity_inj + debt_draw - debt_principal).rename("cash_flow_from_financing_pre_div")
-
-        # Sequential cash and dividends
+        cff = pd.Series(0.0, index=idx, name="cash_flow_from_financing")
         dividends = pd.Series(0.0, index=idx, name="dividends")
         cash = pd.Series(0.0, index=idx, name="cash")
         cash_prev = float(self.cfg.initial_cash)
+        revolver_prev = 0.0
 
         for t, _date in enumerate(idx):
-            cash_pre = cash_prev + float(cfo.iloc[t] + cfi.iloc[t] + cff_pre_div.iloc[t])
+            revolver_interest_t = revolver_prev * revolver_rate_m
+            revolver_interest.iloc[t] = revolver_interest_t
+            pre_tax_t = float(ebit.iloc[t] - debt_interest.iloc[t] - revolver_interest_t)
+            tax_t = max(pre_tax_t, 0.0) * float(self.cfg.tax_rate)
+            net_income_t = pre_tax_t - tax_t
+            pre_tax_income.iloc[t] = pre_tax_t
+            taxes.iloc[t] = tax_t
+            net_income.iloc[t] = net_income_t
+
+            cfo_t = net_income_t + float(dep.iloc[t]) - float(change_nwc.iloc[t])
+            cfo.iloc[t] = cfo_t
+            cash_pre = cash_prev + float(cfo_t + cfi.iloc[t] + equity_inj.iloc[t] + debt_draw.iloc[t] - debt_principal.iloc[t])
+
+            draw_t = 0.0
+            repay_t = 0.0
+            if cash_pre < float(self.cfg.revolver_target_cash):
+                draw_t = min(
+                    float(self.cfg.revolver_target_cash) - cash_pre,
+                    max(float(self.cfg.revolver_limit) - revolver_prev, 0.0),
+                )
+            elif cash_pre > float(self.cfg.revolver_target_cash) and revolver_prev > 0.0:
+                repay_t = min(cash_pre - float(self.cfg.revolver_target_cash), revolver_prev)
+            revolver_post = revolver_prev + draw_t - repay_t
+            cash_post_revolver = cash_pre + draw_t - repay_t
 
             div_t = 0.0
             if self.div.enabled and t >= int(self.div.start_month):
                 if self.div.model == "cash_sweep":
-                    div_t = max(cash_pre - float(self.div.minimum_cash_position), 0.0)
+                    target_floor = max(
+                        float(self.div.minimum_cash_position),
+                        float(self.cfg.revolver_target_cash),
+                    )
+                    div_t = max(cash_post_revolver - target_floor, 0.0)
                 else:
-                    div_t = float(self.div.payout_ratio) * max(float(net_income.iloc[t]), 0.0)
+                    div_t = float(self.div.payout_ratio) * max(net_income_t, 0.0)
 
-            cash_end = cash_pre - div_t
+            cash_end = cash_post_revolver - div_t
             dividends.iloc[t] = div_t
+            revolver_draw.iloc[t] = draw_t
+            revolver_principal.iloc[t] = repay_t
+            revolver_balance.iloc[t] = revolver_post
+            cff.iloc[t] = (
+                float(equity_inj.iloc[t])
+                + float(debt_draw.iloc[t])
+                + draw_t
+                - float(debt_principal.iloc[t])
+                - repay_t
+                - div_t
+            )
             cash.iloc[t] = cash_end
             cash_prev = cash_end
+            revolver_prev = revolver_post
 
         # FCFF and valuation
         nopat = (ebit * (1.0 - float(self.cfg.tax_rate))).rename("nopat")
@@ -1047,13 +1480,10 @@ class MicrobreweryFinancialModel:
         exit_m = self.cfg.exit_month if self.cfg.exit_month is not None else (len(idx) - 1)
         exit_m = int(np.clip(exit_m, 0, len(idx) - 1))
         terminal_value = max(float(ebitda.iloc[exit_m]), 0.0) * float(self.cfg.exit_ev_ebitda_multiple)
-
         wacc_m = annual_to_monthly_rate(self.cfg.wacc_annual)
         discount = (1.0 + wacc_m) ** np.arange(len(idx))
-
         enterprise_value = float((fcff.values / discount).sum() + terminal_value / discount[exit_m])
-
-        debt_exit = float(debt_balance.iloc[exit_m])
+        debt_exit = float((debt_balance + revolver_balance).iloc[exit_m])
         cash_exit = float(cash.iloc[exit_m])
         equity_value_exit = enterprise_value - debt_exit + cash_exit
 
@@ -1061,14 +1491,11 @@ class MicrobreweryFinancialModel:
         equity_cashflows = (-equity_inj).copy()
         equity_cashflows += dividends
         equity_cashflows.iloc[exit_m] += float(equity_value_exit)
-
         irr_m = irr(equity_cashflows.values, guess=0.02)
         irr_annual = (1.0 + irr_m) ** 12 - 1.0 if np.isfinite(irr_m) else np.nan
-
         invested = float(equity_inj.sum())
         returned = float(dividends.sum() + max(equity_value_exit, 0.0))
         moic = safe_div(returned, invested, default=np.nan)
-
         valuation = {
             "wacc_annual": float(self.cfg.wacc_annual),
             "wacc_monthly": float(wacc_m),
@@ -1081,37 +1508,176 @@ class MicrobreweryFinancialModel:
             "equity_moic": float(moic) if np.isfinite(moic) else np.nan,
         }
 
+        total_interest = (debt_interest + revolver_interest).rename("interest_expense_total")
+        total_debt_balance = (debt_balance + revolver_balance).rename("total_debt_ending_balance")
+        debt_service = (debt_principal + revolver_principal + total_interest).rename("debt_service")
+        annualized_ebitda = ebitda.rolling(window=12, min_periods=1).sum()
+        dscr = pd.Series(np.where(debt_service > 0, ebitda / debt_service, np.nan), index=idx, name="dscr")
+        interest_coverage = pd.Series(
+            np.where(total_interest > 0, ebitda / total_interest, np.nan),
+            index=idx,
+            name="interest_coverage",
+        )
+        leverage_ratio = pd.Series(
+            np.where(annualized_ebitda > 0, total_debt_balance / annualized_ebitda, np.nan),
+            index=idx,
+            name="leverage_ratio",
+        )
+        contributed_capital = equity_inj.cumsum().rename("contributed_capital")
+        retained_earnings = (net_income - dividends).cumsum().rename("retained_earnings")
+        current_assets = (cash + receivables + inventory + other_current_assets).rename("current_assets")
+        current_liabilities = (payables + other_current_liabilities + revolver_balance).rename("current_liabilities")
+        total_assets = (current_assets + net_fixed_assets).rename("total_assets")
+        total_liabilities = (current_liabilities + debt_balance).rename("total_liabilities")
+        equity = (total_assets - total_liabilities).rename("equity")
+        balance_sheet_gap = (equity - (contributed_capital + retained_earnings)).rename("balance_sheet_gap")
+        net_change_in_cash = cash.diff().fillna(cash.iloc[0] - float(self.cfg.initial_cash)).rename("net_change_in_cash")
+
         # Statements
         monthly = pd.DataFrame(
             {
-                "revenue": revenue,
+                "revenue": net_revenue,
+                "gross_revenue": gross_revenue,
+                "net_revenue": net_revenue,
+                "trade_spend": revenue_breakdown.get("trade_spend", pd.Series(0.0, index=idx)),
+                "returns_allowances": revenue_breakdown.get("returns_allowances", pd.Series(0.0, index=idx)),
                 "other_income": other_income,
                 "total_revenue": total_revenue,
+                "direct_material_costs": direct_material_costs,
+                "direct_labor_cost": direct_labor_cost,
+                "inventory_writeoff": inventory_writeoff,
+                "payable_discount_benefit": payable_discount_benefit,
                 "direct_costs": direct_costs,
                 "gross_profit": gross_profit,
+                "indirect_labor_cost": indirect_labor_cost,
+                "bad_debt_expense": bad_debt_expense,
                 "opex": opex,
                 "ebitda": ebitda,
                 "depreciation": dep,
                 "ebit": ebit,
-                "interest_expense": debt_interest,
-                "ebt": ebt,
+                "term_debt_interest_expense": debt_interest,
+                "revolver_interest_expense": revolver_interest,
+                "interest_expense": total_interest,
+                "interest_expense_total": total_interest,
+                "pre_tax_income": pre_tax_income,
                 "taxes": taxes,
                 "net_income": net_income,
                 "capex": capex,
                 "change_in_nwc": change_nwc,
                 "debt_draw": debt_draw,
                 "debt_principal_payment": debt_principal,
+                "revolver_draw": revolver_draw,
+                "revolver_principal_payment": revolver_principal,
                 "equity_injection": equity_inj,
                 "dividends": dividends,
+                "cash_flow_from_operations": cfo,
+                "cash_flow_from_investing": cfi,
+                "cash_flow_from_financing": cff,
+                "net_change_in_cash": net_change_in_cash,
                 "cash": cash,
                 "debt_ending_balance": debt_balance,
+                "revolver_ending_balance": revolver_balance,
+                "total_debt_ending_balance": total_debt_balance,
                 "net_fixed_assets": net_fixed_assets,
+                "current_assets": current_assets,
+                "total_assets": total_assets,
+                "current_liabilities": current_liabilities,
+                "total_liabilities": total_liabilities,
+                "contributed_capital": contributed_capital,
+                "retained_earnings": retained_earnings,
+                "equity": equity,
+                "balance_sheet_gap": balance_sheet_gap,
+                "required_liters": direct_labor_summary["required_liters"],
+                "capacity_liters": direct_labor_summary["capacity_liters"],
+                "capacity_shortfall_liters": direct_labor_summary["capacity_shortfall_liters"],
+                "temporary_labor_cost": direct_labor_summary["temporary_labor_cost"],
+                "debt_service": debt_service,
+                "dscr": dscr,
+                "interest_coverage": interest_coverage,
+                "leverage_ratio": leverage_ratio,
+                "dscr_breach_flag": (dscr < float(self.cfg.min_dscr)).astype(int),
+                "interest_coverage_breach_flag": (interest_coverage < float(self.cfg.min_interest_coverage)).astype(int),
+                "leverage_breach_flag": (leverage_ratio > float(self.cfg.max_leverage_ratio)).astype(int),
                 "fcff": fcff,
             },
             index=idx,
         ).join(nwc_comp)
 
-        annual = monthly.resample("YE").sum(numeric_only=True).rename_axis("year_end")
+        flow_cols = [
+            "revenue",
+            "gross_revenue",
+            "net_revenue",
+            "trade_spend",
+            "returns_allowances",
+            "other_income",
+            "total_revenue",
+            "direct_material_costs",
+            "direct_labor_cost",
+            "inventory_writeoff",
+            "payable_discount_benefit",
+            "direct_costs",
+            "gross_profit",
+            "indirect_labor_cost",
+            "bad_debt_expense",
+            "opex",
+            "ebitda",
+            "depreciation",
+            "ebit",
+            "term_debt_interest_expense",
+            "interest_expense",
+            "revolver_interest_expense",
+            "interest_expense_total",
+            "pre_tax_income",
+            "taxes",
+            "net_income",
+            "capex",
+            "change_in_nwc",
+            "debt_draw",
+            "debt_principal_payment",
+            "revolver_draw",
+            "revolver_principal_payment",
+            "equity_injection",
+            "dividends",
+            "cash_flow_from_operations",
+            "cash_flow_from_investing",
+            "cash_flow_from_financing",
+            "net_change_in_cash",
+            "debt_service",
+            "fcff",
+        ]
+        stock_cols = [
+            "receivables",
+            "inventory",
+            "inventory_reserve",
+            "other_current_assets",
+            "payables",
+            "other_current_liabilities",
+            "net_working_capital",
+            "cash",
+            "debt_ending_balance",
+            "revolver_ending_balance",
+            "total_debt_ending_balance",
+            "net_fixed_assets",
+            "current_assets",
+            "total_assets",
+            "current_liabilities",
+            "total_liabilities",
+            "contributed_capital",
+            "retained_earnings",
+            "equity",
+            "balance_sheet_gap",
+            "required_liters",
+            "capacity_liters",
+            "capacity_shortfall_liters",
+            "dscr",
+            "interest_coverage",
+            "leverage_ratio",
+            "dscr_breach_flag",
+            "interest_coverage_breach_flag",
+            "leverage_breach_flag",
+        ]
+        annual = monthly[flow_cols].resample("Y").sum(numeric_only=True).rename_axis("year_end")
+        annual = annual.join(monthly[stock_cols].resample("Y").last())
 
         opex_allocation_views = self._annual_opex_allocation_views(
             idx=idx,
@@ -1120,6 +1686,14 @@ class MicrobreweryFinancialModel:
             opex_series=opex,
         )
 
+        supporting_schedules = {
+            "receivables_detail": receivables_details,
+            "inventory_detail": inventory_details,
+            "payables_detail": payables_details,
+            "direct_labor_detail": direct_labor_summary,
+            "indirect_labor_detail": indirect_labor_summary,
+        }
+
         return ModelRunResult(
             monthly=monthly,
             annual=annual,
@@ -1127,6 +1701,7 @@ class MicrobreweryFinancialModel:
             debt_schedules=debt_schedules,
             valuation=valuation,
             opex_allocation_views=opex_allocation_views,
+            supporting_schedules=supporting_schedules,
         )
 
 
@@ -1171,15 +1746,41 @@ def write_comprehensive_excel_report(result: ModelRunResult, writer: pd.ExcelWri
     valuation_df = pd.DataFrame(result.valuation, index=["value"]).T
     valuation_df.index.name = "metric"
     valuation_df.to_excel(writer, sheet_name="00_Key_Results")
-    annual_key_cols = [c for c in ["total_revenue", "direct_costs", "gross_profit", "opex", "ebitda", "net_income", "cash", "debt_ending_balance", "fcff"] if c in result.annual.columns]
+    annual_key_cols = [
+        c
+        for c in [
+            "gross_revenue",
+            "net_revenue",
+            "total_revenue",
+            "direct_costs",
+            "gross_profit",
+            "opex",
+            "ebitda",
+            "net_income",
+            "cash",
+            "total_debt_ending_balance",
+            "fcff",
+        ]
+        if c in result.annual.columns
+    ]
     result.annual[annual_key_cols].to_excel(writer, sheet_name="00_Key_Results", startrow=valuation_df.shape[0] + 3)
 
     # 2b) Annual statements (requested views)
     perf_cols = [
+        "gross_revenue",
+        "trade_spend",
+        "returns_allowances",
+        "net_revenue",
         "total_revenue",
         "other_income",
+        "direct_material_costs",
+        "direct_labor_cost",
+        "inventory_writeoff",
+        "payable_discount_benefit",
         "direct_costs",
         "gross_profit",
+        "indirect_labor_cost",
+        "bad_debt_expense",
         "opex",
         "ebitda",
         "depreciation",
@@ -1196,6 +1797,7 @@ def write_comprehensive_excel_report(result: ModelRunResult, writer: pd.ExcelWri
         "cash",
         "receivables",
         "inventory",
+        "inventory_reserve",
         "other_current_assets",
         "current_assets",
         "net_fixed_assets",
@@ -1204,8 +1806,13 @@ def write_comprehensive_excel_report(result: ModelRunResult, writer: pd.ExcelWri
         "other_current_liabilities",
         "current_liabilities",
         "debt_ending_balance",
+        "revolver_ending_balance",
+        "total_debt_ending_balance",
         "total_liabilities",
+        "contributed_capital",
+        "retained_earnings",
         "equity",
+        "balance_sheet_gap",
     ]
     position_existing = [c for c in position_cols if c in result.annual.columns]
     result.annual[position_existing].to_excel(writer, sheet_name="Annual_Position_BS")
@@ -1217,23 +1824,61 @@ def write_comprehensive_excel_report(result: ModelRunResult, writer: pd.ExcelWri
         "cash_flow_from_investing",
         "debt_draw",
         "debt_principal_payment",
+        "revolver_draw",
+        "revolver_principal_payment",
         "equity_injection",
         "dividends",
         "cash_flow_from_financing",
         "net_change_in_cash",
+        "debt_service",
         "fcff",
     ]
     cashflow_existing = [c for c in cashflow_cols if c in result.annual.columns]
     result.annual[cashflow_existing].to_excel(writer, sheet_name="Annual_Cash_Flow")
 
     # 3) Schedules
-    wc_cols = [c for c in ["receivables", "inventory", "other_current_assets", "payables", "other_current_liabilities", "net_working_capital", "change_in_nwc"] if c in result.monthly.columns]
+    wc_cols = [
+        c
+        for c in [
+            "receivables",
+            "inventory",
+            "inventory_reserve",
+            "other_current_assets",
+            "payables",
+            "other_current_liabilities",
+            "net_working_capital",
+            "change_in_nwc",
+        ]
+        if c in result.monthly.columns
+    ]
     result.monthly[wc_cols].to_excel(writer, sheet_name="04_Working_Capital")
 
     capex_cols = [c for c in ["capex", "depreciation", "net_fixed_assets"] if c in result.monthly.columns]
     result.monthly[capex_cols].to_excel(writer, sheet_name="05_CAPEX_Depreciation")
 
-    financing_cols = [c for c in ["debt_draw", "debt_principal_payment", "interest_expense", "equity_injection", "dividends", "cash", "debt_ending_balance"] if c in result.monthly.columns]
+    financing_cols = [
+        c
+        for c in [
+            "debt_draw",
+            "debt_principal_payment",
+            "revolver_draw",
+            "revolver_principal_payment",
+            "term_debt_interest_expense",
+            "revolver_interest_expense",
+            "interest_expense",
+            "debt_service",
+            "equity_injection",
+            "dividends",
+            "cash",
+            "debt_ending_balance",
+            "revolver_ending_balance",
+            "total_debt_ending_balance",
+            "dscr",
+            "interest_coverage",
+            "leverage_ratio",
+        ]
+        if c in result.monthly.columns
+    ]
     result.monthly[financing_cols].to_excel(writer, sheet_name="06_Financing_Cash")
 
     # 4) Debt facility schedules
@@ -1266,12 +1911,20 @@ def write_comprehensive_excel_report(result: ModelRunResult, writer: pd.ExcelWri
     if "reconciliation_view" in views:
         views["reconciliation_view"].to_excel(writer, sheet_name=opex_sheet, startrow=row_ptr)
 
+    for sheet_name, df in (result.supporting_schedules or {}).items():
+        safe_sheet = f"13_{sheet_name[:28]}"
+        df.to_excel(writer, sheet_name=safe_sheet)
+
     # 6) Charts data + embedded charts
-    chart_cols = [c for c in ["total_revenue", "ebitda", "net_income", "cash", "debt_ending_balance", "fcff"] if c in result.annual.columns]
+    chart_cols = [
+        c
+        for c in ["total_revenue", "ebitda", "net_income", "cash", "total_debt_ending_balance", "fcff"]
+        if c in result.annual.columns
+    ]
     chart_df = result.annual[chart_cols].copy()
     chart_df.to_excel(writer, sheet_name="12_Charts_Data")
     chart_df.to_excel(writer, sheet_name="Graphs_and_Plots")
-    cash_debt_cols = [c for c in ["cash", "debt_ending_balance"] if c in result.annual.columns]
+    cash_debt_cols = [c for c in ["cash", "total_debt_ending_balance"] if c in result.annual.columns]
     result.annual[cash_debt_cols].to_excel(writer, sheet_name="Cash_vs_Debt_EndBal")
 
     # 6b) Key analytics sheet
@@ -1292,7 +1945,7 @@ def write_comprehensive_excel_report(result: ModelRunResult, writer: pd.ExcelWri
             },
             {
                 "metric": "cash_to_debt_last_month",
-                "value": float(latest_month.get("cash", np.nan)) / max(float(latest_month.get("debt_ending_balance", np.nan)), 1e-9),
+                "value": float(latest_month.get("cash", np.nan)) / max(float(latest_month.get("total_debt_ending_balance", np.nan)), 1e-9),
             },
             {"metric": "latest_fcff", "value": float(latest_annual.get("fcff", np.nan))},
         ]
@@ -1396,6 +2049,9 @@ def write_comprehensive_excel_report(result: ModelRunResult, writer: pd.ExcelWri
             "Cash_vs_Debt_EndBal": "Cash vs Debt Ending Balance",
             "Key_Analytics": "Key Analytics Dashboard",
         }
+        for sheet_name in wb.sheetnames:
+            if sheet_name.startswith("13_") and sheet_name not in sheet_titles:
+                sheet_titles[sheet_name] = sheet_name.replace("13_", "").replace("_", " ").title()
         for name, title in sheet_titles.items():
             if name in wb.sheetnames:
                 _style_sheet(wb[name], title)
@@ -1408,7 +2064,7 @@ def write_comprehensive_excel_report(result: ModelRunResult, writer: pd.ExcelWri
         _add_chart_below(wb["02_Annual_Financials"], "Annual Revenue / EBITDA / Net Income", ["total_revenue", "ebitda", "net_income"], "line")
         _add_chart_below(wb["04_Working_Capital"], "Working Capital Bridge", ["net_working_capital", "change_in_nwc"], "line")
         _add_chart_below(wb["05_CAPEX_Depreciation"], "CAPEX vs Depreciation", ["capex", "depreciation"], "bar")
-        _add_chart_below(wb["06_Financing_Cash"], "Cash vs Debt", ["cash", "debt_ending_balance"], "line")
+        _add_chart_below(wb["06_Financing_Cash"], "Cash vs Debt", ["cash", "total_debt_ending_balance"], "line")
         if "Annual_Performance_IS" in wb.sheetnames:
             _add_chart_below(wb["Annual_Performance_IS"], "Income Statement Trend", ["total_revenue", "gross_profit", "ebitda", "net_income"], "line")
         if "Annual_Position_BS" in wb.sheetnames:
@@ -1422,12 +2078,12 @@ def write_comprehensive_excel_report(result: ModelRunResult, writer: pd.ExcelWri
         if "11_OPEX_Reconciliation" in wb.sheetnames:
             _add_chart_below(wb["11_OPEX_Reconciliation"], "Reconciliation Gap by Year", ["reconciliation_gap"], "bar")
         if "Cash_vs_Debt_EndBal" in wb.sheetnames:
-            _add_chart_below(wb["Cash_vs_Debt_EndBal"], "Cash vs Debt Ending Balance", ["cash", "debt_ending_balance"], "line")
+            _add_chart_below(wb["Cash_vs_Debt_EndBal"], "Cash vs Debt Ending Balance", ["cash", "total_debt_ending_balance"], "line")
         if "Key_Analytics" in wb.sheetnames:
             _add_chart_below(wb["Key_Analytics"], "Key Analytics Snapshot", ["value"], "bar")
         if "Graphs_and_Plots" in wb.sheetnames:
             _add_chart_below(wb["Graphs_and_Plots"], "Revenue / EBITDA / Net Income", ["total_revenue", "ebitda", "net_income"], "line")
-            _add_chart_below(wb["Graphs_and_Plots"], "Cash / Debt / FCFF", ["cash", "debt_ending_balance", "fcff"], "line")
+            _add_chart_below(wb["Graphs_and_Plots"], "Cash / Debt / FCFF", ["cash", "total_debt_ending_balance", "fcff"], "line")
 
     except Exception:
         # If style/chart libs are unavailable, workbook remains complete with data.

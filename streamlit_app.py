@@ -347,6 +347,7 @@ def _build_sample_assumptions(
     div: DividendPolicy,
 ) -> ModelInputs:
     idx = pd.date_range(cfg.start_date, periods=cfg.months, freq="MS")
+    year_cols = _year_columns_for_months(cfg.months)
 
     skus = pd.DataFrame(
         [
@@ -407,9 +408,7 @@ def _build_sample_assumptions(
         CostPoolInput(name="Malt & Grain", cost_type="direct", behavior="variable", allocation_driver="liters", unit_variable_cost=0.22),
         CostPoolInput(name="Hops & Yeast", cost_type="direct", behavior="variable", allocation_driver="liters", unit_variable_cost=0.09),
         CostPoolInput(name="Packaging Materials", cost_type="direct", behavior="variable", allocation_driver="units", unit_variable_cost=0.14),
-        CostPoolInput(name="Production Direct Labor", cost_type="direct", behavior="step_fixed", allocation_driver="liters", fixed_monthly_cost=6_000.0, step_threshold=180_000.0, step_increment=850.0),
         CostPoolInput(name="Brew QA Consumables", cost_type="direct", behavior="variable", allocation_driver="liters", unit_variable_cost=0.015),
-        CostPoolInput(name="Indirect Labor", cost_type="indirect", behavior="step_fixed", allocation_driver="liters", fixed_monthly_cost=22_000.0, step_threshold=250_000.0, step_increment=2_000.0),
         CostPoolInput(name="Utilities", cost_type="indirect", behavior="variable", allocation_driver="liters", unit_variable_cost=0.035),
         CostPoolInput(name="Supplies", cost_type="indirect", behavior="variable", allocation_driver="units", unit_variable_cost=0.015),
         CostPoolInput(name="Marketing & Advertising", cost_type="indirect", behavior="blended", allocation_driver="channel_revenue", fixed_monthly_cost=8_500.0, unit_variable_cost=0.003),
@@ -468,18 +467,133 @@ def _build_sample_assumptions(
             term_months=36,
             repayment_type="linear",
         ),
-        DebtFacility(
-            name="Working Capital Revolver",
-            principal=300_000,
-            annual_interest_rate=0.045,
-            draw_month=24,
-            grace_months=0,
-            term_months=48,
-            repayment_type="interest_only_then_linear",
-        ),
     ]
 
     equity_injections = {0: 5_500_000.0, 12: 1_000_000.0, 36: 750_000.0}
+
+    def _year_row(values: list[float]) -> dict[str, float]:
+        padded = list(values) + ([values[-1]] * max(len(year_cols) - len(values), 0))
+        return {col: float(padded[i]) for i, col in enumerate(year_cols)}
+
+    direct_labor_schedule = pd.DataFrame(
+        [
+            {
+                "role": "Brewhouse Operators",
+                "allocation_driver": "liters",
+                "scope": "global",
+                "target_sku_id": np.nan,
+                "monthly_cost_per_fte": 3000.0,
+                "annual_raise_pct": 0.03,
+                "benefits_pct": 0.18,
+                "payroll_tax_pct": 0.08,
+                "overtime_pct": 0.05,
+                "capacity_liters_per_fte_month": 30_000.0,
+                **_year_row([5, 5, 5, 5, 5, 6, 6, 6, 6, 6]),
+            },
+            {
+                "role": "Packaging Technicians",
+                "allocation_driver": "liters",
+                "scope": "global",
+                "target_sku_id": np.nan,
+                "monthly_cost_per_fte": 2600.0,
+                "annual_raise_pct": 0.03,
+                "benefits_pct": 0.16,
+                "payroll_tax_pct": 0.08,
+                "overtime_pct": 0.04,
+                "capacity_liters_per_fte_month": 22_000.0,
+                **_year_row([3, 3, 3, 4, 4, 4, 4, 4, 5, 5]),
+            },
+            {
+                "role": "Quality & Cellar",
+                "allocation_driver": "liters",
+                "scope": "global",
+                "target_sku_id": np.nan,
+                "monthly_cost_per_fte": 2800.0,
+                "annual_raise_pct": 0.03,
+                "benefits_pct": 0.18,
+                "payroll_tax_pct": 0.08,
+                "overtime_pct": 0.03,
+                "capacity_liters_per_fte_month": 18_000.0,
+                **_year_row([1, 1, 1, 1, 1, 1, 2, 2, 2, 2]),
+            },
+        ]
+    )
+
+    indirect_labor_schedule = pd.DataFrame(
+        [
+            {
+                "role": "Sales & Distribution",
+                "allocation_driver": "fixed",
+                "scope": "global",
+                "target_sku_id": np.nan,
+                "monthly_cost_per_fte": 3200.0,
+                "annual_raise_pct": 0.03,
+                "benefits_pct": 0.18,
+                "payroll_tax_pct": 0.08,
+                "overtime_pct": 0.02,
+                "capacity_liters_per_fte_month": 0.0,
+                **_year_row([2, 2, 2, 2, 3, 3, 3, 3, 3, 4]),
+            },
+            {
+                "role": "Finance & Admin",
+                "allocation_driver": "fixed",
+                "scope": "global",
+                "target_sku_id": np.nan,
+                "monthly_cost_per_fte": 3500.0,
+                "annual_raise_pct": 0.03,
+                "benefits_pct": 0.18,
+                "payroll_tax_pct": 0.08,
+                "overtime_pct": 0.01,
+                "capacity_liters_per_fte_month": 0.0,
+                **_year_row([2, 2, 2, 2, 2, 2, 3, 3, 3, 3]),
+            },
+        ]
+    )
+
+    inventory_schedule = pd.DataFrame(
+        [
+            {
+                "stage": "Raw Materials",
+                "cost_share_pct": 0.45,
+                "writeoff_pct": 0.002,
+                "reserve_pct": 0.010,
+                **_year_row([22, 22, 22, 23, 23, 23, 24, 24, 24, 24]),
+            },
+            {
+                "stage": "WIP",
+                "cost_share_pct": 0.15,
+                "writeoff_pct": 0.001,
+                "reserve_pct": 0.005,
+                **_year_row([5, 5, 5, 5, 6, 6, 6, 6, 6, 6]),
+            },
+            {
+                "stage": "Finished Goods",
+                "cost_share_pct": 0.40,
+                "writeoff_pct": 0.003,
+                "reserve_pct": 0.015,
+                **_year_row([14, 14, 14, 15, 15, 15, 15, 15, 16, 16]),
+            },
+        ]
+    )
+
+    receivables_schedule = pd.DataFrame(
+        [
+            {"channel": "Wholesale", "trade_spend_pct": 0.045, "returns_pct": 0.010, "bad_debt_pct": 0.004, **_year_row([32, 32, 31, 31, 30, 30, 30, 29, 29, 28])},
+            {"channel": "Retail", "trade_spend_pct": 0.020, "returns_pct": 0.004, "bad_debt_pct": 0.001, **_year_row([12, 12, 12, 12, 11, 11, 11, 11, 10, 10])},
+            {"channel": "E-Commerce", "trade_spend_pct": 0.015, "returns_pct": 0.015, "bad_debt_pct": 0.002, **_year_row([6, 6, 6, 6, 5, 5, 5, 5, 5, 5])},
+            {"channel": "On-Premise", "trade_spend_pct": 0.010, "returns_pct": 0.003, "bad_debt_pct": 0.001, **_year_row([10, 10, 10, 9, 9, 9, 9, 9, 8, 8])},
+            {"channel": "Export", "trade_spend_pct": 0.030, "returns_pct": 0.006, "bad_debt_pct": 0.003, **_year_row([45, 45, 44, 44, 43, 42, 42, 41, 41, 40])},
+        ]
+    )
+
+    payables_schedule = pd.DataFrame(
+        [
+            {"supplier_category": "Malt & Grain", "cost_share_pct": 0.30, "early_pay_discount_pct": 0.004, "discount_capture_pct": 0.25, **_year_row([35, 35, 35, 34, 34, 34, 33, 33, 33, 32])},
+            {"supplier_category": "Hops & Yeast", "cost_share_pct": 0.12, "early_pay_discount_pct": 0.003, "discount_capture_pct": 0.20, **_year_row([28, 28, 28, 28, 27, 27, 27, 27, 26, 26])},
+            {"supplier_category": "Packaging", "cost_share_pct": 0.20, "early_pay_discount_pct": 0.005, "discount_capture_pct": 0.30, **_year_row([30, 30, 30, 29, 29, 29, 28, 28, 28, 28])},
+            {"supplier_category": "Utilities & Services", "cost_share_pct": 0.10, "early_pay_discount_pct": 0.001, "discount_capture_pct": 0.10, **_year_row([20, 20, 20, 20, 19, 19, 19, 19, 18, 18])},
+        ]
+    )
 
     return ModelInputs(
         skus=skus,
@@ -487,6 +601,11 @@ def _build_sample_assumptions(
         sales_plan=sales_plan,
         cost_pools=cost_pools,
         other_income_items=other_income_items,
+        direct_labor_schedule=direct_labor_schedule,
+        indirect_labor_schedule=indirect_labor_schedule,
+        inventory_schedule=inventory_schedule,
+        receivables_schedule=receivables_schedule,
+        payables_schedule=payables_schedule,
         capex_items=capex_items,
         debt_facilities=debt_facilities,
         equity_injections=equity_injections,
@@ -661,6 +780,54 @@ def _cast_value_for_dtype(column: pd.Series, value: object) -> object:
             return pd.NaT
         return pd.to_datetime(value, errors="coerce")
     return value
+
+
+def _year_columns_for_months(months: int) -> list[str]:
+    years = max(int(np.ceil(float(months) / 12.0)), 1)
+    return [f"Year {i}" for i in range(1, years + 1)]
+
+
+def _align_year_schedule_df(df: pd.DataFrame, template_df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame):
+        return template_df.copy()
+    out = df.copy()
+    template_cols = list(template_df.columns)
+    year_cols = [c for c in template_cols if isinstance(c, str) and c.startswith("Year ")]
+    existing_year_cols = [c for c in out.columns if isinstance(c, str) and c.startswith("Year ")]
+    last_year_series = None
+    if existing_year_cols:
+        last_year_series = pd.to_numeric(out[existing_year_cols[-1]], errors="coerce").fillna(0.0)
+    for col in year_cols:
+        if col not in out.columns:
+            out[col] = last_year_series if last_year_series is not None else 0.0
+    extra_year_cols = [c for c in out.columns if isinstance(c, str) and c.startswith("Year ") and c not in year_cols]
+    if extra_year_cols:
+        out = out.drop(columns=extra_year_cols, errors="ignore")
+    missing_non_year = [c for c in template_cols if c not in out.columns]
+    for col in missing_non_year:
+        out[col] = template_df[col] if col in template_df.columns else np.nan
+    ordered = [c for c in template_cols if c in out.columns]
+    extras = [c for c in out.columns if c not in ordered]
+    return out[ordered + extras]
+
+
+def _sync_assumption_table_state(key: str, default_df: pd.DataFrame) -> None:
+    data_key = f"assump_data_{key}"
+    saved_key = f"assump_saved_{key}"
+    work_key = f"assump_work_{key}"
+    edit_key = f"assump_edit_{key}"
+    inc_key = f"assump_inc_{key}"
+
+    for state_key in (data_key, saved_key, work_key):
+        current = st.session_state.get(state_key)
+        if isinstance(current, pd.DataFrame):
+            st.session_state[state_key] = _align_year_schedule_df(current, default_df)
+        else:
+            st.session_state[state_key] = default_df.copy()
+    if edit_key not in st.session_state:
+        st.session_state[edit_key] = False
+    if inc_key not in st.session_state:
+        st.session_state[inc_key] = 0.0
 
 
 def _expand_sales_plan_to_monthly(sales_df: pd.DataFrame, frequency: str) -> pd.DataFrame:
@@ -956,6 +1123,36 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
     else:
         equity_injections = base_inputs.equity_injections
 
+    direct_labor_schedule = st.session_state.get("assump_data_direct_labor")
+    if isinstance(direct_labor_schedule, pd.DataFrame):
+        direct_labor_schedule = _non_empty_rows(direct_labor_schedule).copy()
+    else:
+        direct_labor_schedule = base_inputs.direct_labor_schedule
+
+    indirect_labor_schedule = st.session_state.get("assump_data_indirect_labor")
+    if isinstance(indirect_labor_schedule, pd.DataFrame):
+        indirect_labor_schedule = _non_empty_rows(indirect_labor_schedule).copy()
+    else:
+        indirect_labor_schedule = base_inputs.indirect_labor_schedule
+
+    inventory_schedule = st.session_state.get("assump_data_inventory")
+    if isinstance(inventory_schedule, pd.DataFrame):
+        inventory_schedule = _non_empty_rows(inventory_schedule).copy()
+    else:
+        inventory_schedule = base_inputs.inventory_schedule
+
+    receivables_schedule = st.session_state.get("assump_data_receivables")
+    if isinstance(receivables_schedule, pd.DataFrame):
+        receivables_schedule = _non_empty_rows(receivables_schedule).copy()
+    else:
+        receivables_schedule = base_inputs.receivables_schedule
+
+    payables_schedule = st.session_state.get("assump_data_payables")
+    if isinstance(payables_schedule, pd.DataFrame):
+        payables_schedule = _non_empty_rows(payables_schedule).copy()
+    else:
+        payables_schedule = base_inputs.payables_schedule
+
     return ModelInputs(
         skus=skus,
         channels=channels,
@@ -963,6 +1160,11 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
         sales_plan_frequency=str(sales_plan_frequency),
         cost_pools=cost_pools,
         other_income_items=other_income_items,
+        direct_labor_schedule=direct_labor_schedule,
+        indirect_labor_schedule=indirect_labor_schedule,
+        inventory_schedule=inventory_schedule,
+        receivables_schedule=receivables_schedule,
+        payables_schedule=payables_schedule,
         capex_items=capex_items,
         debt_facilities=debt_facilities,
         equity_injections=equity_injections,
@@ -1031,6 +1233,16 @@ def _sales_plan_assumption_editor(base_sales_plan: pd.DataFrame, base_frequency:
 def _sync_model_timeline_state(cfg: ModelConfig, base_inputs: ModelInputs) -> None:
     timeline_sig = (str(cfg.start_date), int(cfg.months))
     previous_sig = st.session_state.get("assump_timeline_signature")
+    schedule_defaults = {
+        "direct_labor": base_inputs.direct_labor_schedule,
+        "indirect_labor": base_inputs.indirect_labor_schedule,
+        "inventory": base_inputs.inventory_schedule,
+        "receivables": base_inputs.receivables_schedule,
+        "payables": base_inputs.payables_schedule,
+    }
+    for key, default_df in schedule_defaults.items():
+        if isinstance(default_df, pd.DataFrame):
+            _sync_assumption_table_state(key, default_df)
     if previous_sig == timeline_sig:
         return
 
@@ -1069,10 +1281,20 @@ def _statement_section(result) -> None:
 
     st.markdown("**Annual Financial Performance Statement (Income Statement)**")
     perf_cols = [
+        "gross_revenue",
+        "trade_spend",
+        "returns_allowances",
+        "net_revenue",
         "total_revenue",
         "other_income",
+        "direct_material_costs",
+        "direct_labor_cost",
+        "inventory_writeoff",
+        "payable_discount_benefit",
         "direct_costs",
         "gross_profit",
+        "indirect_labor_cost",
+        "bad_debt_expense",
         "opex",
         "ebitda",
         "depreciation",
@@ -1093,6 +1315,7 @@ def _statement_section(result) -> None:
         "cash",
         "receivables",
         "inventory",
+        "inventory_reserve",
         "other_current_assets",
         "current_assets",
         "net_fixed_assets",
@@ -1101,8 +1324,13 @@ def _statement_section(result) -> None:
         "other_current_liabilities",
         "current_liabilities",
         "debt_ending_balance",
+        "revolver_ending_balance",
+        "total_debt_ending_balance",
         "total_liabilities",
+        "contributed_capital",
+        "retained_earnings",
         "equity",
+        "balance_sheet_gap",
     ]
     pos_existing = [c for c in position_cols if c in annual.columns]
     if pos_existing:
@@ -1118,10 +1346,13 @@ def _statement_section(result) -> None:
         "cash_flow_from_investing",
         "debt_draw",
         "debt_principal_payment",
+        "revolver_draw",
+        "revolver_principal_payment",
         "equity_injection",
         "dividends",
         "cash_flow_from_financing",
         "net_change_in_cash",
+        "debt_service",
         "fcff",
     ]
     cf_existing = [c for c in cf_cols if c in annual.columns]
@@ -1134,14 +1365,20 @@ def _statement_section(result) -> None:
     st.dataframe(
         result.monthly.tail(12)[
             [
-                "total_revenue",
-                "direct_costs",
-                "gross_profit",
-                "opex",
-                "ebitda",
-                "net_income",
-                "cash",
-                "debt_ending_balance",
+                c
+                for c in [
+                    "gross_revenue",
+                    "net_revenue",
+                    "total_revenue",
+                    "direct_costs",
+                    "gross_profit",
+                    "opex",
+                    "ebitda",
+                    "net_income",
+                    "cash",
+                    "total_debt_ending_balance",
+                ]
+                if c in result.monthly.columns
             ]
         ]
     )
@@ -1173,7 +1410,7 @@ def _charts_section(result) -> None:
     )
 
     st.markdown("**Cash vs. Debt Ending Balance**")
-    _plot_if_available("Cash vs. Debt Ending Balance", ["cash", "debt_ending_balance"])
+    _plot_if_available("Cash vs. Debt Ending Balance", ["cash", "total_debt_ending_balance"])
 
     st.markdown("**Operating Cash Flow vs. FCFF**")
     _plot_if_available(
@@ -1208,6 +1445,7 @@ def _schedules_section(result) -> None:
     wc_cols = [
         "receivables",
         "inventory",
+        "inventory_reserve",
         "other_current_assets",
         "payables",
         "other_current_liabilities",
@@ -1225,12 +1463,26 @@ def _schedules_section(result) -> None:
             [
                 "debt_draw",
                 "debt_principal_payment",
+                "revolver_draw",
+                "revolver_principal_payment",
+                "interest_expense",
+                "debt_service",
                 "equity_injection",
                 "dividends",
                 "cash",
+                "total_debt_ending_balance",
+                "dscr",
+                "interest_coverage",
+                "leverage_ratio",
             ]
         ]
     )
+
+    if getattr(result, "supporting_schedules", None):
+        st.markdown("**Labor and working-capital detail schedules**")
+        for label, df in result.supporting_schedules.items():
+            with st.expander(label.replace("_", " ").title()):
+                st.dataframe(df)
 
 
 def _key_analytics_section(result, inputs: ModelInputs) -> None:
@@ -1477,13 +1729,15 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
         label="threshold row",
     )
     min_dscr = float(pd.to_numeric(dscr_cfg.iloc[0].get("min_dscr_threshold", 1.20), errors="coerce")) if not dscr_cfg.empty else 1.2
-    if {"debt_principal_payment", "interest_expense", "ebitda"}.issubset(monthly.columns):
-        ds = monthly["debt_principal_payment"] + monthly["interest_expense"]
-        dscr = np.where(ds > 0, monthly["ebitda"] / ds, np.nan)
+    if "dscr" in monthly.columns:
+        dscr_df = pd.DataFrame({"DSCR": monthly["dscr"], "min_threshold": min_dscr}, index=monthly.index)
+        st.line_chart(dscr_df)
+    elif {"debt_service", "ebitda"}.issubset(monthly.columns):
+        dscr = np.where(monthly["debt_service"] > 0, monthly["ebitda"] / monthly["debt_service"], np.nan)
         dscr_df = pd.DataFrame({"DSCR": dscr, "min_threshold": min_dscr}, index=monthly.index)
         st.line_chart(dscr_df)
     else:
-        st.info("DSCR uses monthly debt principal, interest, and EBITDA columns when available.")
+        st.info("DSCR uses the model's debt service and EBITDA outputs when available.")
 
     # Predictive analytics
     st.markdown("### Predictive analytics")
@@ -1541,9 +1795,9 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
     min_cash_to_debt = float(pd.to_numeric(cov_cfg.iloc[0].get("min_cash_to_debt", 1.0), errors="coerce")) if not cov_cfg.empty else 1.0
     min_months_opex = float(pd.to_numeric(cov_cfg.iloc[0].get("min_months_opex", 3.0), errors="coerce")) if not cov_cfg.empty else 3.0
     cov = {}
-    if {"cash", "debt_ending_balance"}.issubset(monthly.columns):
+    if {"cash", "total_debt_ending_balance"}.issubset(monthly.columns):
         cov["cash_to_debt_ratio_last_month"] = float(
-            monthly["cash"].iloc[-1] / max(monthly["debt_ending_balance"].iloc[-1], 1e-6)
+            monthly["cash"].iloc[-1] / max(monthly["total_debt_ending_balance"].iloc[-1], 1e-6)
         )
     if {"cash", "opex"}.issubset(monthly.columns):
         cov["months_of_opex_covered_last_month"] = float(
@@ -1574,12 +1828,16 @@ def _internal_findings_snapshot(result, inputs: ModelInputs, cfg: ModelConfig, d
     latest_annual = annual.iloc[-1].to_dict() if len(annual) else {}
     latest_monthly = result.monthly.iloc[-1].to_dict() if len(result.monthly) else {}
     ratios = {}
-    if latest_annual.get("ebitda") not in [None, 0] and latest_monthly.get("debt_ending_balance") is not None:
-        ratios["debt_to_ebitda"] = float(latest_monthly.get("debt_ending_balance", 0.0)) / max(float(latest_annual.get("ebitda", 0.0)), 1e-9)
-    if latest_monthly.get("cash") is not None and latest_monthly.get("debt_ending_balance") not in [None, 0]:
-        ratios["cash_to_debt"] = float(latest_monthly.get("cash", 0.0)) / max(float(latest_monthly.get("debt_ending_balance", 0.0)), 1e-9)
-    if latest_annual.get("ebit") is not None and latest_annual.get("interest_expense") not in [None, 0]:
-        ratios["dscr"] = float(latest_annual.get("ebit", 0.0)) / max(float(latest_annual.get("interest_expense", 0.0)), 1e-9)
+    if latest_annual.get("ebitda") not in [None, 0] and latest_monthly.get("total_debt_ending_balance") is not None:
+        ratios["debt_to_ebitda"] = float(latest_monthly.get("total_debt_ending_balance", 0.0)) / max(float(latest_annual.get("ebitda", 0.0)), 1e-9)
+    if latest_monthly.get("cash") is not None and latest_monthly.get("total_debt_ending_balance") not in [None, 0]:
+        ratios["cash_to_debt"] = float(latest_monthly.get("cash", 0.0)) / max(float(latest_monthly.get("total_debt_ending_balance", 0.0)), 1e-9)
+    if latest_annual.get("dscr") is not None:
+        ratios["dscr"] = float(latest_annual.get("dscr", 0.0))
+    if latest_annual.get("interest_coverage") is not None:
+        ratios["interest_coverage"] = float(latest_annual.get("interest_coverage", 0.0))
+    if latest_annual.get("leverage_ratio") is not None:
+        ratios["leverage_ratio"] = float(latest_annual.get("leverage_ratio", 0.0))
     if latest_monthly.get("current_assets") is not None and latest_monthly.get("current_liabilities") not in [None, 0]:
         ratios["current_ratio"] = float(latest_monthly.get("current_assets", 0.0)) / max(float(latest_monthly.get("current_liabilities", 0.0)), 1e-9)
     return {
@@ -1605,7 +1863,7 @@ def _internal_findings_snapshot(result, inputs: ModelInputs, cfg: ModelConfig, d
         "financial_statements": {
             "latest_net_income": latest_annual.get("net_income"),
             "latest_cash": latest_monthly.get("cash"),
-            "latest_debt_balance": latest_monthly.get("debt_ending_balance"),
+            "latest_debt_balance": latest_monthly.get("total_debt_ending_balance"),
         },
         "advanced_analytics": {
             "valuation_summary": result.valuation,
@@ -1889,6 +2147,15 @@ def main() -> None:
             tax_rate=float(row.get("tax_rate", cfg.tax_rate)),
             wacc_annual=float(row.get("wacc_annual", cfg.wacc_annual)),
             exit_ev_ebitda_multiple=float(row.get("exit_ev_ebitda_multiple", cfg.exit_ev_ebitda_multiple)),
+            revolver_limit=float(row.get("revolver_limit", cfg.revolver_limit)),
+            revolver_interest_annual=float(row.get("revolver_interest_annual", cfg.revolver_interest_annual)),
+            revolver_target_cash=float(row.get("revolver_target_cash", cfg.revolver_target_cash)),
+            min_dscr=float(row.get("min_dscr", cfg.min_dscr)),
+            min_interest_coverage=float(row.get("min_interest_coverage", cfg.min_interest_coverage)),
+            max_leverage_ratio=float(row.get("max_leverage_ratio", cfg.max_leverage_ratio)),
+            temporary_labor_premium_pct=float(
+                row.get("temporary_labor_premium_pct", cfg.temporary_labor_premium_pct)
+            ),
         )
     dividend_table_state = st.session_state.get("assump_data_dividend")
     if isinstance(dividend_table_state, pd.DataFrame) and not dividend_table_state.empty:
@@ -1969,6 +2236,13 @@ def main() -> None:
                     "tax_rate": cfg.tax_rate,
                     "wacc_annual": cfg.wacc_annual,
                     "exit_ev_ebitda_multiple": cfg.exit_ev_ebitda_multiple,
+                    "revolver_limit": cfg.revolver_limit,
+                    "revolver_interest_annual": cfg.revolver_interest_annual,
+                    "revolver_target_cash": cfg.revolver_target_cash,
+                    "min_dscr": cfg.min_dscr,
+                    "min_interest_coverage": cfg.min_interest_coverage,
+                    "max_leverage_ratio": cfg.max_leverage_ratio,
+                    "temporary_labor_premium_pct": cfg.temporary_labor_premium_pct,
                 }
             ]
         )
@@ -2012,6 +2286,11 @@ def main() -> None:
                 for item in (inputs.other_income_items or [])
             ]
         )
+        direct_labor_df = inputs.direct_labor_schedule.copy() if isinstance(inputs.direct_labor_schedule, pd.DataFrame) else pd.DataFrame()
+        indirect_labor_df = inputs.indirect_labor_schedule.copy() if isinstance(inputs.indirect_labor_schedule, pd.DataFrame) else pd.DataFrame()
+        inventory_df = inputs.inventory_schedule.copy() if isinstance(inputs.inventory_schedule, pd.DataFrame) else pd.DataFrame()
+        receivables_df = inputs.receivables_schedule.copy() if isinstance(inputs.receivables_schedule, pd.DataFrame) else pd.DataFrame()
+        payables_df = inputs.payables_schedule.copy() if isinstance(inputs.payables_schedule, pd.DataFrame) else pd.DataFrame()
 
         if not st.session_state.get("assump_edit_config", False):
             st.session_state["assump_data_config"] = config_df.copy()
@@ -2025,6 +2304,16 @@ def main() -> None:
         _assumption_editor("Channels", "channels", inputs.channels)
         _sales_plan_assumption_editor(inputs.sales_plan, inputs.sales_plan_frequency, cfg)
         _assumption_editor("Cost pools", "cost_pools", cost_pool_df)
+        st.caption("Direct labor schedules drive payroll, capacity, direct COGS, and temporary labor cost when capacity is short.")
+        _assumption_editor("Direct labor schedule", "direct_labor", direct_labor_df)
+        st.caption("Indirect labor schedules flow to OPEX and covenant-sensitive cash burn.")
+        _assumption_editor("Indirect labor schedule", "indirect_labor", indirect_labor_df)
+        st.caption("Receivables schedule drives gross-to-net revenue, bad debt expense, and AR balances by channel.")
+        _assumption_editor("Receivables aging schedule", "receivables", receivables_df)
+        st.caption("Inventory schedule drives stage-based DIO, write-offs, reserves, and balance-sheet inventory.")
+        _assumption_editor("Inventory aging schedule", "inventory", inventory_df)
+        st.caption("Payables schedule drives supplier-term balances and procurement discount benefits.")
+        _assumption_editor("Payables aging schedule", "payables", payables_df)
         _assumption_editor("Other income items", "other_income", other_income_df)
         _assumption_editor("CAPEX schedule", "capex", capex_df)
         _assumption_editor("Debt facilities", "debt", debt_df)
@@ -2042,6 +2331,11 @@ _STATE_KEYS = [
     "assump_data_sales_plan_base",
     "assump_sales_plan_frequency",
     "assump_data_cost_pools",
+    "assump_data_direct_labor",
+    "assump_data_indirect_labor",
+    "assump_data_receivables",
+    "assump_data_inventory",
+    "assump_data_payables",
     "assump_data_other_income",
     "assump_data_capex",
     "assump_data_debt",

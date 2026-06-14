@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 
 import pandas as pd
+import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
@@ -398,5 +399,150 @@ def test_comprehensive_excel_report_contains_requested_sections():
         "Cash_vs_Debt_EndBal",
         "Driver_OPEX_Views",
         "Key_Analytics",
+        "13_direct_labor_detail",
+        "13_indirect_labor_detail",
+        "13_inventory_detail",
+        "13_payables_detail",
+        "13_receivables_detail",
     }
     assert expected.issubset(sheets)
+
+
+def test_all_in_one_schedule_driven_components_flow_through_outputs():
+    skus = pd.DataFrame(
+        [
+            {"sku_id": 1, "name": "Test SKU 500ml", "markup_pct": 0.50, "relative_opex_weight": 1.0},
+        ]
+    )
+    channels = pd.DataFrame([{"channel": "Retail", "price_factor": 1.0}])
+    sales = pd.DataFrame(
+        [{"date": f"2025-{month:02d}-01", "sku_id": 1, "channel": "Retail", "units": 100.0} for month in range(1, 13)]
+    )
+
+    model = MicrobreweryFinancialModel(
+        ModelConfig(
+            start_date="2025-01-01",
+            months=12,
+            pricing_cost_basis_month=0,
+            cost_inflation_annual=0.0,
+            price_inflation_annual=0.0,
+            tax_rate=0.0,
+            initial_cash=10_000.0,
+            revolver_limit=0.0,
+            revolver_target_cash=0.0,
+            other_current_assets_pct_revenue=0.0,
+            other_current_liabilities_pct_direct_costs=0.0,
+            temporary_labor_premium_pct=0.0,
+        ),
+        DividendPolicy(enabled=False),
+        ModelInputs(
+            skus=skus,
+            channels=channels,
+            sales_plan=sales,
+            cost_pools=[
+                CostPoolInput(
+                    name="Direct Variable Pool",
+                    cost_type="direct",
+                    behavior="variable",
+                    allocation_driver="units",
+                    unit_variable_cost=2.0,
+                ),
+            ],
+            direct_labor_schedule=pd.DataFrame(
+                [
+                    {
+                        "role": "Brewers",
+                        "allocation_driver": "units",
+                        "scope": "global",
+                        "target_sku_id": pd.NA,
+                        "monthly_cost_per_fte": 1_000.0,
+                        "annual_raise_pct": 0.0,
+                        "benefits_pct": 0.0,
+                        "payroll_tax_pct": 0.0,
+                        "overtime_pct": 0.0,
+                        "capacity_liters_per_fte_month": 100.0,
+                        "Year 1": 1.0,
+                    }
+                ]
+            ),
+            indirect_labor_schedule=pd.DataFrame(
+                [
+                    {
+                        "role": "Back Office",
+                        "allocation_driver": "fixed",
+                        "scope": "global",
+                        "target_sku_id": pd.NA,
+                        "monthly_cost_per_fte": 500.0,
+                        "annual_raise_pct": 0.0,
+                        "benefits_pct": 0.0,
+                        "payroll_tax_pct": 0.0,
+                        "overtime_pct": 0.0,
+                        "capacity_liters_per_fte_month": 0.0,
+                        "Year 1": 1.0,
+                    }
+                ]
+            ),
+            receivables_schedule=pd.DataFrame(
+                [
+                    {
+                        "channel": "Retail",
+                        "trade_spend_pct": 0.10,
+                        "returns_pct": 0.05,
+                        "bad_debt_pct": 0.02,
+                        "Year 1": 30.0,
+                    }
+                ]
+            ),
+            inventory_schedule=pd.DataFrame(
+                [
+                    {
+                        "stage": "FG",
+                        "cost_share_pct": 1.0,
+                        "writeoff_pct": 0.02,
+                        "reserve_pct": 0.10,
+                        "Year 1": 20.0,
+                    }
+                ]
+            ),
+            payables_schedule=pd.DataFrame(
+                [
+                    {
+                        "supplier_category": "Raw Materials",
+                        "cost_share_pct": 1.0,
+                        "early_pay_discount_pct": 0.02,
+                        "discount_capture_pct": 0.50,
+                        "Year 1": 25.0,
+                    }
+                ]
+            ),
+        ),
+    )
+
+    result = model.run()
+    month_one = result.monthly.iloc[0]
+    annual = result.annual.iloc[0]
+
+    assert month_one["direct_labor_cost"] == pytest.approx(1_000.0)
+    assert month_one["indirect_labor_cost"] == pytest.approx(500.0)
+    assert month_one["gross_revenue"] == pytest.approx(1_800.0)
+    assert month_one["net_revenue"] == pytest.approx(1_530.0)
+    assert month_one["bad_debt_expense"] == pytest.approx(30.6)
+    assert month_one["inventory_writeoff"] == pytest.approx(4.0)
+    assert month_one["payable_discount_benefit"] == pytest.approx(2.0)
+    assert month_one["direct_costs"] == pytest.approx(1_202.0)
+    assert month_one["receivables"] == pytest.approx(1_530.0 * 30.0 / 365.0)
+    assert month_one["inventory"] == pytest.approx((200.0 * 20.0 / 365.0) * 0.90)
+    assert month_one["inventory_reserve"] == pytest.approx((200.0 * 20.0 / 365.0) * 0.10)
+    assert month_one["payables"] == pytest.approx(200.0 * 25.0 / 365.0)
+    assert month_one["total_debt_ending_balance"] == pytest.approx(0.0)
+    assert annual["receivables"] == pytest.approx(month_one["receivables"])
+    assert annual["inventory"] == pytest.approx(month_one["inventory"])
+    assert annual["payables"] == pytest.approx(month_one["payables"])
+    assert annual["total_debt_ending_balance"] == pytest.approx(0.0)
+    assert {
+        "receivables_detail",
+        "inventory_detail",
+        "payables_detail",
+        "direct_labor_detail",
+        "indirect_labor_detail",
+    }.issubset(result.supporting_schedules.keys())
