@@ -1638,6 +1638,10 @@ def _valuation_section(result) -> None:
 def _statement_section(result) -> None:
     st.subheader("Statements")
     annual = result.annual.copy()
+    inventory_stage_cols = [
+        c for c in annual.columns
+        if c.startswith("inventory_") and c not in {"inventory", "inventory_reserve"}
+    ]
 
     st.markdown("**Annual Financial Performance Statement (Income Statement)**")
     perf_cols = [
@@ -1675,6 +1679,7 @@ def _statement_section(result) -> None:
         "cash",
         "receivables",
         "inventory",
+        *inventory_stage_cols,
         "inventory_reserve",
         "other_current_assets",
         "current_assets",
@@ -1750,6 +1755,10 @@ def _statement_section(result) -> None:
 def _charts_section(result) -> None:
     st.subheader("Graphs & plots")
     monthly = result.monthly.copy()
+    inventory_stage_cols = [
+        c for c in monthly.columns
+        if c.startswith("inventory_") and c not in {"inventory", "inventory_reserve"}
+    ]
 
     def _plot_if_available(label: str, cols: list[str]) -> None:
         existing = [c for c in cols if c in monthly.columns]
@@ -1777,6 +1786,12 @@ def _charts_section(result) -> None:
         "Operating Cash Flow vs. FCFF",
         ["cash_flow_from_operations", "fcff"],
     )
+    if inventory_stage_cols:
+        st.markdown("**Inventory composition by stage**")
+        _plot_if_available(
+            "Inventory composition by stage",
+            ["inventory", *inventory_stage_cols],
+        )
 
 
 def _download_section(result) -> None:
@@ -1791,6 +1806,10 @@ def _download_section(result) -> None:
 
 def _schedules_section(result) -> None:
     st.subheader("Detailed schedules and tables")
+    inventory_stage_cols = [
+        c for c in result.monthly.columns
+        if c.startswith("inventory_") and c not in {"inventory", "inventory_reserve"}
+    ]
 
     st.markdown("**Debt schedules (facility-level)**")
     for name, df in result.debt_schedules.items():
@@ -1805,6 +1824,7 @@ def _schedules_section(result) -> None:
     wc_cols = [
         "receivables",
         "inventory",
+        *inventory_stage_cols,
         "inventory_reserve",
         "other_current_assets",
         "payables",
@@ -1838,9 +1858,21 @@ def _schedules_section(result) -> None:
         ]
     )
 
+    inventory_detail = (result.supporting_schedules or {}).get("inventory_detail")
+    if isinstance(inventory_detail, pd.DataFrame) and not inventory_detail.empty:
+        st.markdown("**Inventory detail schedule**")
+        detail_stage_cols = [
+            c for c in inventory_detail.columns
+            if c.startswith("inventory_") and c not in {"inventory", "inventory_reserve"}
+        ]
+        detail_cols = detail_stage_cols + [c for c in ["inventory"] if c in inventory_detail.columns]
+        st.dataframe(inventory_detail[detail_cols] if detail_cols else inventory_detail)
+
     if getattr(result, "supporting_schedules", None):
         st.markdown("**Labor and working-capital detail schedules**")
         for label, df in result.supporting_schedules.items():
+            if label == "inventory_detail":
+                continue
             with st.expander(label.replace("_", " ").title()):
                 st.dataframe(df)
 

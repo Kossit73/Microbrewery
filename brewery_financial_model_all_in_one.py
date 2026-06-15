@@ -1487,6 +1487,10 @@ class MicrobreweryFinancialModel:
         other_current_liabilities = (
             direct_material_costs * float(self.cfg.other_current_liabilities_pct_direct_costs)
         ).rename("other_current_liabilities")
+        inventory_stage_cols = [
+            c for c in inventory_details.columns
+            if c.startswith("inventory_") and c not in {"inventory", "inventory_reserve"}
+        ]
         net_working_capital = (
             receivables + inventory + other_current_assets - payables - other_current_liabilities
         ).rename("net_working_capital")
@@ -1502,6 +1506,10 @@ class MicrobreweryFinancialModel:
                 "net_working_capital": net_working_capital,
             },
             index=idx,
+        ).join(
+            inventory_details.reindex(columns=inventory_stage_cols, fill_value=0.0)
+            if inventory_stage_cols
+            else pd.DataFrame(index=idx)
         )
 
         # Debt schedules
@@ -1787,6 +1795,7 @@ class MicrobreweryFinancialModel:
             "receivables",
             "inventory",
             "inventory_reserve",
+            *inventory_stage_cols,
             "other_current_assets",
             "payables",
             "other_current_liabilities",
