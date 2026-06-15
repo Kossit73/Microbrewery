@@ -37,6 +37,7 @@ from brewery_financial_model_all_in_one import (
     ModelInputs,
     OtherIncomeItem,
     phase_growth_series,
+    propagate_sales_plan_monthly,
     write_comprehensive_excel_report,
 )
 
@@ -1094,6 +1095,48 @@ def _fill_monthly_sales_plan_to_timeline(
     return merged[["date", "sku_id", "channel", "units"]].sort_values(["date", "sku_id", "channel"]).reset_index(drop=True)
 
 
+def _sales_plan_template_idx(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    return idx[: min(len(idx), 12)]
+
+
+def _rebase_monthly_sales_plan_to_idx(monthly_df: pd.DataFrame, target_idx: pd.DatetimeIndex) -> pd.DataFrame:
+    if monthly_df is None or monthly_df.empty or len(target_idx) == 0:
+        return pd.DataFrame(columns=["date", "sku_id", "channel", "units"])
+    out = monthly_df.copy()
+    out["date"] = pd.to_datetime(out.get("date"), errors="coerce")
+    out["units"] = pd.to_numeric(out.get("units", 0.0), errors="coerce").fillna(0.0)
+    out = out.dropna(subset=["date"])
+    if out.empty:
+        return pd.DataFrame(columns=["date", "sku_id", "channel", "units"])
+    source_dates = list(pd.Index(sorted(out["date"].drop_duplicates()))[: len(target_idx)])
+    if not source_dates:
+        return pd.DataFrame(columns=["date", "sku_id", "channel", "units"])
+    remap = {src: dst for src, dst in zip(source_dates, list(target_idx))}
+    out = out[out["date"].isin(remap)].copy()
+    out["date"] = out["date"].map(remap)
+    return (
+        out.groupby(["date", "sku_id", "channel"], dropna=False, as_index=False)["units"]
+        .sum()
+        .sort_values(["date", "sku_id", "channel"])
+        .reset_index(drop=True)
+    )
+
+
+def _sales_plan_editor_monthly_view(
+    sales_df: pd.DataFrame,
+    frequency: str,
+    idx: pd.DatetimeIndex,
+    propagation_mode: str,
+) -> pd.DataFrame:
+    monthly = _expand_sales_plan_to_monthly(sales_df, frequency)
+    if propagation_mode == "manual":
+        return monthly
+    template_idx = _sales_plan_template_idx(idx)
+    monthly = _rebase_monthly_sales_plan_to_idx(monthly, template_idx)
+    monthly = _fill_monthly_sales_plan_to_timeline(monthly, template_idx, monthly)
+    return monthly
+
+
 def _sales_plan_editor_view(sales_df: pd.DataFrame, frequency: str) -> pd.DataFrame:
     if sales_df is None or sales_df.empty:
         label = {"monthly": "month", "quarterly": "quarter", "yearly": "year"}[frequency]
@@ -1212,6 +1255,14 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
     channels = _non_empty_rows(st.session_state.get("assump_data_channels", base_inputs.channels)).copy()
     sales_plan = _non_empty_rows(st.session_state.get("assump_data_sales_plan_base", base_inputs.sales_plan)).copy()
     sales_plan_frequency = st.session_state.get("assump_sales_plan_frequency", base_inputs.sales_plan_frequency)
+    sales_plan_propagation_mode = st.session_state.get(
+        "assump_sales_plan_propagation_mode",
+        getattr(base_inputs, "sales_plan_propagation_mode", "manual"),
+    )
+    sales_plan_propagation_growth_annual = st.session_state.get(
+        "assump_sales_plan_propagation_growth_annual",
+        getattr(base_inputs, "sales_plan_propagation_growth_annual", 0.0),
+    )
 
     cp_src = st.session_state.get("assump_data_cost_pools")
     if isinstance(cp_src, pd.DataFrame):
@@ -1357,6 +1408,8 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
         channels=channels,
         sales_plan=sales_plan,
         sales_plan_frequency=str(sales_plan_frequency),
+        sales_plan_propagation_mode=str(sales_plan_propagation_mode),
+        sales_plan_propagation_growth_annual=float(sales_plan_propagation_growth_annual),
         cost_pools=cost_pools,
         other_income_items=other_income_items,
         direct_labor_schedule=direct_labor_schedule,
@@ -1374,40 +1427,97 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
     )
 
 
-def _sales_plan_assumption_editor(base_sales_plan: pd.DataFrame, base_frequency: str, cfg: ModelConfig) -> pd.DataFrame:
+def _sales_plan_assumption_editor(
+    base_sales_plan: pd.DataFrame,
+    base_frequency: str,
+    cfg: ModelConfig,
+    base_propagation_mode: str = "manual",
+    base_growth_annual: float = 0.0,
+) -> pd.DataFrame:
     canonical_key = "assump_data_sales_plan_base"
     frequency_options = {"Monthly": "monthly", "Quarterly": "quarterly", "Yearly": "yearly"}
     reverse_options = {v: k for k, v in frequency_options.items()}
+    propagation_options = {
+        "Manual by period": "manual",
+        "Repeat first year": "repeat_first_year",
+        "Grow first year": "grow_first_year",
+    }
+    reverse_propagation_options = {v: k for k, v in propagation_options.items()}
 
     if "assump_sales_plan_frequency" not in st.session_state:
         st.session_state["assump_sales_plan_frequency"] = base_frequency
+    if "assump_sales_plan_propagation_mode" not in st.session_state:
+        st.session_state["assump_sales_plan_propagation_mode"] = base_propagation_mode
+    if "assump_sales_plan_propagation_growth_annual" not in st.session_state:
+        st.session_state["assump_sales_plan_propagation_growth_annual"] = float(base_growth_annual)
     current_frequency = str(st.session_state["assump_sales_plan_frequency"])
     if current_frequency not in reverse_options:
         current_frequency = "monthly"
+    current_propagation_mode = str(st.session_state["assump_sales_plan_propagation_mode"])
+    if current_propagation_mode not in reverse_propagation_options:
+        current_propagation_mode = "manual"
 
-    selected_label = st.selectbox(
+    idx = pd.date_range(cfg.start_date, periods=cfg.months, freq="MS")
+    template_idx = _sales_plan_template_idx(idx)
+    control_col1, control_col2 = st.columns([1, 1])
+    selected_label = control_col1.selectbox(
         "Sales plan frequency",
         options=list(frequency_options.keys()),
         index=list(frequency_options.values()).index(current_frequency),
         key="assump_sales_plan_frequency_selector",
         help="Sales plan schedule granularity shown in the table and used by the model.",
     )
+    selected_propagation_label = control_col2.selectbox(
+        "Sales plan propagation",
+        options=list(propagation_options.keys()),
+        index=list(propagation_options.values()).index(current_propagation_mode),
+        key="assump_sales_plan_propagation_selector",
+        help="Use the first production year as a reusable demand template instead of entering every later period manually.",
+    )
     selected_frequency = frequency_options[selected_label]
+    selected_propagation_mode = propagation_options[selected_propagation_label]
+    selected_growth_annual = float(st.session_state.get("assump_sales_plan_propagation_growth_annual", base_growth_annual))
+    if selected_propagation_mode == "grow_first_year":
+        selected_growth_annual = st.number_input(
+            "Annual sales growth after Year 1",
+            value=selected_growth_annual,
+            step=0.01,
+            format="%.4f",
+            key="assump_sales_plan_propagation_growth_input",
+            help="Applied to the first-year sales template when propagating into later production years.",
+        )
+    st.session_state["assump_sales_plan_propagation_growth_annual"] = float(selected_growth_annual)
 
     previous_frequency = str(st.session_state.get("assump_prev_sales_plan_frequency", current_frequency))
+    previous_propagation_mode = str(st.session_state.get("assump_prev_sales_plan_propagation_mode", current_propagation_mode))
     if canonical_key not in st.session_state and "assump_data_sales_plan" in st.session_state:
         st.session_state[canonical_key] = st.session_state.get("assump_data_sales_plan")
     canonical_plan = _non_empty_rows(st.session_state.get(canonical_key, base_sales_plan)).copy()
     if canonical_plan is None:
         canonical_plan = base_sales_plan.copy()
 
-    idx = pd.date_range(cfg.start_date, periods=cfg.months, freq="MS")
     fallback_monthly = _expand_sales_plan_to_monthly(base_sales_plan, base_frequency)
+    fallback_monthly = propagate_sales_plan_monthly(
+        fallback_monthly,
+        idx,
+        mode=base_propagation_mode,
+        annual_growth_pct=float(base_growth_annual),
+    )
 
-    if selected_frequency != previous_frequency:
+    if selected_frequency != previous_frequency or selected_propagation_mode != previous_propagation_mode:
         monthly = _expand_sales_plan_to_monthly(canonical_plan, previous_frequency)
-        monthly = _fill_monthly_sales_plan_to_timeline(monthly, idx, fallback_monthly)
-        canonical_plan = _compress_monthly_sales_plan(monthly, selected_frequency)
+        if previous_propagation_mode == "manual":
+            monthly = _fill_monthly_sales_plan_to_timeline(monthly, idx, fallback_monthly)
+        else:
+            monthly = _rebase_monthly_sales_plan_to_idx(monthly, template_idx)
+            monthly = _fill_monthly_sales_plan_to_timeline(monthly, template_idx, fallback_monthly[fallback_monthly["date"].isin(template_idx)].copy())
+        if selected_propagation_mode == "manual":
+            canonical_plan = _compress_monthly_sales_plan(monthly, selected_frequency)
+        else:
+            canonical_plan = _compress_monthly_sales_plan(
+                _rebase_monthly_sales_plan_to_idx(monthly, template_idx),
+                selected_frequency,
+            )
         st.session_state[canonical_key] = canonical_plan.copy()
         st.session_state["assump_data_sales_plan"] = _sales_plan_editor_view(canonical_plan, selected_frequency)
         st.session_state["assump_saved_sales_plan"] = st.session_state["assump_data_sales_plan"].copy()
@@ -1416,11 +1526,33 @@ def _sales_plan_assumption_editor(base_sales_plan: pd.DataFrame, base_frequency:
 
     st.session_state["assump_sales_plan_frequency"] = selected_frequency
     st.session_state["assump_prev_sales_plan_frequency"] = selected_frequency
+    st.session_state["assump_sales_plan_propagation_mode"] = selected_propagation_mode
+    st.session_state["assump_prev_sales_plan_propagation_mode"] = selected_propagation_mode
 
-    monthly_for_view = _expand_sales_plan_to_monthly(canonical_plan, selected_frequency)
-    monthly_for_view = _fill_monthly_sales_plan_to_timeline(monthly_for_view, idx, fallback_monthly)
+    if selected_propagation_mode == "manual":
+        monthly_for_view = _sales_plan_editor_monthly_view(
+            canonical_plan,
+            selected_frequency,
+            idx,
+            selected_propagation_mode,
+        )
+        monthly_for_view = _fill_monthly_sales_plan_to_timeline(monthly_for_view, idx, fallback_monthly)
+    else:
+        monthly_for_view = _sales_plan_editor_monthly_view(
+            canonical_plan,
+            selected_frequency,
+            idx,
+            selected_propagation_mode,
+        )
     canonical_plan = _compress_monthly_sales_plan(monthly_for_view, selected_frequency)
     st.session_state[canonical_key] = canonical_plan.copy()
+
+    if selected_propagation_mode == "manual":
+        st.caption("Manual mode expects period-by-period sales entries across the full production horizon.")
+    elif selected_propagation_mode == "repeat_first_year":
+        st.caption("Enter only the first production year below. The model will repeat that demand pattern across the remaining years.")
+    else:
+        st.caption("Enter only the first production year below. The model will propagate that pattern across later years using the annual growth rate above.")
 
     view_df = _sales_plan_editor_view(canonical_plan, selected_frequency)
     if not st.session_state.get("assump_edit_sales_plan", False):
@@ -1456,7 +1588,14 @@ def _sync_model_timeline_state(cfg: ModelConfig, base_inputs: ModelInputs) -> No
     freq = str(st.session_state.get("assump_sales_plan_frequency", base_inputs.sales_plan_frequency))
     if freq not in {"monthly", "quarterly", "yearly"}:
         freq = "monthly"
+    propagation_mode = str(
+        st.session_state.get(
+            "assump_sales_plan_propagation_mode",
+            getattr(base_inputs, "sales_plan_propagation_mode", "manual"),
+        )
+    )
     idx = pd.date_range(cfg.start_date, periods=cfg.months, freq="MS")
+    template_idx = _sales_plan_template_idx(idx)
 
     canonical_key = "assump_data_sales_plan_base"
     current_sales = st.session_state.get(canonical_key, base_inputs.sales_plan)
@@ -1464,7 +1603,21 @@ def _sync_model_timeline_state(cfg: ModelConfig, base_inputs: ModelInputs) -> No
 
     monthly_current = _expand_sales_plan_to_monthly(current_sales, freq)
     fallback_monthly = _expand_sales_plan_to_monthly(base_inputs.sales_plan, base_inputs.sales_plan_frequency)
-    monthly_current = _fill_monthly_sales_plan_to_timeline(monthly_current, idx, fallback_monthly)
+    fallback_monthly = propagate_sales_plan_monthly(
+        fallback_monthly,
+        idx,
+        mode=getattr(base_inputs, "sales_plan_propagation_mode", "manual"),
+        annual_growth_pct=float(getattr(base_inputs, "sales_plan_propagation_growth_annual", 0.0)),
+    )
+    if propagation_mode == "manual":
+        monthly_current = _fill_monthly_sales_plan_to_timeline(monthly_current, idx, fallback_monthly)
+    else:
+        monthly_current = _rebase_monthly_sales_plan_to_idx(monthly_current, template_idx)
+        monthly_current = _fill_monthly_sales_plan_to_timeline(
+            monthly_current,
+            template_idx,
+            fallback_monthly[fallback_monthly["date"].isin(template_idx)].copy(),
+        )
 
     canonical_sales = _compress_monthly_sales_plan(monthly_current, freq)
     st.session_state[canonical_key] = canonical_sales.copy()
@@ -2518,7 +2671,13 @@ def main() -> None:
         st.caption("`direct_cost_per_unit` is derived from direct cost pools. Use `direct_cost_per_unit_override` only for explicit manual overrides.")
         _assumption_editor("SKUs", "skus", inputs.skus)
         _assumption_editor("Channels", "channels", inputs.channels)
-        _sales_plan_assumption_editor(inputs.sales_plan, inputs.sales_plan_frequency, cfg)
+        _sales_plan_assumption_editor(
+            inputs.sales_plan,
+            inputs.sales_plan_frequency,
+            cfg,
+            getattr(inputs, "sales_plan_propagation_mode", "manual"),
+            getattr(inputs, "sales_plan_propagation_growth_annual", 0.0),
+        )
         st.caption("SKU operations translate demand into packaged output, brew input, finished-goods targets, and batch counts.")
         _assumption_editor("SKU operations", "sku_operations", sku_operations_df)
         st.caption("Brewhouse schedule sets brew-start capacity from batch size, brew days, uptime, and yearly expansion counts.")
@@ -2554,6 +2713,8 @@ _STATE_KEYS = [
     "assump_data_channels",
     "assump_data_sales_plan_base",
     "assump_sales_plan_frequency",
+    "assump_sales_plan_propagation_mode",
+    "assump_sales_plan_propagation_growth_annual",
     "assump_data_sku_operations",
     "assump_data_brewhouse",
     "assump_data_cellar",

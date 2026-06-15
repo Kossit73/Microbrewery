@@ -50,6 +50,7 @@ from finmodel.opex_schemas import OpexCostPool, SKUCostContext
 # Utility functions
 # =============================
 RepaymentType = Literal["linear", "annuity", "interest_only_then_linear", "specified"]
+SalesPlanPropagationMode = Literal["manual", "repeat_first_year", "grow_first_year"]
 
 
 def annual_to_monthly_rate(annual_rate: float) -> float:
@@ -207,6 +208,8 @@ class ModelInputs:
     channels: pd.DataFrame
     sales_plan: pd.DataFrame
     sales_plan_frequency: Literal["monthly", "quarterly", "yearly"] = "monthly"
+    sales_plan_propagation_mode: SalesPlanPropagationMode = "manual"
+    sales_plan_propagation_growth_annual: float = 0.0
 
     other_income_items: Optional[List[OtherIncomeItem]] = None
     other_income_monthly: float | pd.Series = 0.0
@@ -236,6 +239,59 @@ class ModelRunResult:
     valuation: Dict[str, float]
     opex_allocation_views: Dict[str, pd.DataFrame]
     supporting_schedules: Dict[str, pd.DataFrame] = field(default_factory=dict)
+
+
+def propagate_sales_plan_monthly(
+    monthly_sales: pd.DataFrame,
+    idx: pd.DatetimeIndex,
+    mode: SalesPlanPropagationMode = "manual",
+    annual_growth_pct: float = 0.0,
+) -> pd.DataFrame:
+    if monthly_sales is None or monthly_sales.empty:
+        return pd.DataFrame(columns=["date", "sku_id", "channel", "units"])
+
+    out = monthly_sales.copy()
+    out["date"] = pd.to_datetime(out.get("date"), errors="coerce")
+    out["units"] = pd.to_numeric(out.get("units", 0.0), errors="coerce").fillna(0.0)
+    out = out.dropna(subset=["date"])
+    out = out[out["date"].isin(idx)].copy()
+    if out.empty or mode == "manual":
+        return out[["date", "sku_id", "channel", "units"]].sort_values(["date", "sku_id", "channel"]).reset_index(drop=True)
+
+    template_year = int(out["date"].dt.year.min())
+    template = out[out["date"].dt.year == template_year].copy()
+    if template.empty:
+        return out[["date", "sku_id", "channel", "units"]].sort_values(["date", "sku_id", "channel"]).reset_index(drop=True)
+
+    template["month_num"] = template["date"].dt.month
+    template = (
+        template.groupby(["sku_id", "channel", "month_num"], dropna=False, as_index=False)["units"]
+        .sum()
+        .sort_values(["sku_id", "channel", "month_num"])
+        .reset_index(drop=True)
+    )
+    template_lookup = template.set_index(["sku_id", "channel", "month_num"])["units"].to_dict()
+    combos = template[["sku_id", "channel"]].drop_duplicates().to_dict("records")
+
+    growth_rate = float(annual_growth_pct)
+    propagated_rows: List[Dict[str, object]] = []
+    for date in idx:
+        year_offset = int(date.year) - template_year
+        if mode == "grow_first_year":
+            growth_factor = (1.0 + growth_rate) ** max(year_offset, 0)
+        else:
+            growth_factor = 1.0
+        for combo in combos:
+            base_units = float(template_lookup.get((combo["sku_id"], combo["channel"], int(date.month)), 0.0))
+            propagated_rows.append(
+                {
+                    "date": date,
+                    "sku_id": combo["sku_id"],
+                    "channel": combo["channel"],
+                    "units": base_units * growth_factor,
+                }
+            )
+    return pd.DataFrame(propagated_rows, columns=["date", "sku_id", "channel", "units"])
 
 
 # =============================
@@ -315,6 +371,12 @@ class MicrobreweryFinancialModel:
             raise ValueError(f"sales_plan has non-numeric units for rows: {bad_sales}")
         if self.inputs.sales_plan_frequency not in {"monthly", "quarterly", "yearly"}:
             raise ValueError("sales_plan_frequency must be one of: monthly, quarterly, yearly")
+        if self.inputs.sales_plan_propagation_mode not in {"manual", "repeat_first_year", "grow_first_year"}:
+            raise ValueError("sales_plan_propagation_mode must be one of: manual, repeat_first_year, grow_first_year")
+        growth_pct = pd.to_numeric(self.inputs.sales_plan_propagation_growth_annual, errors="coerce")
+        if pd.isna(growth_pct):
+            raise ValueError("sales_plan_propagation_growth_annual must be numeric")
+        self.inputs.sales_plan_propagation_growth_annual = float(growth_pct)
 
         # Keep normalized copies
         self.inputs.skus = skus
@@ -663,26 +725,33 @@ class MicrobreweryFinancialModel:
         sales = sales.dropna(subset=["date"])
         freq = self.inputs.sales_plan_frequency
         if freq == "monthly":
-            return sales
+            monthly = sales
+        else:
+            rows: List[Dict[str, object]] = []
+            for _, r in sales.iterrows():
+                date = pd.to_datetime(r["date"], errors="coerce")
+                if pd.isna(date):
+                    continue
+                if freq == "quarterly":
+                    start = date.to_period("Q").start_time
+                    months = pd.date_range(start=start, periods=3, freq="MS")
+                else:
+                    start = date.to_period("Y").start_time
+                    months = pd.date_range(start=start, periods=12, freq="MS")
+                months = [m for m in months if m in set(idx)]
+                if not months:
+                    continue
+                portion = float(r["units"]) / len(months)
+                for m in months:
+                    rows.append({"date": m, "sku_id": r["sku_id"], "channel": r["channel"], "units": portion})
+            monthly = pd.DataFrame(rows, columns=["date", "sku_id", "channel", "units"])
 
-        rows: List[Dict[str, object]] = []
-        for _, r in sales.iterrows():
-            date = pd.to_datetime(r["date"], errors="coerce")
-            if pd.isna(date):
-                continue
-            if freq == "quarterly":
-                start = date.to_period("Q").start_time
-                months = pd.date_range(start=start, periods=3, freq="MS")
-            else:
-                start = date.to_period("Y").start_time
-                months = pd.date_range(start=start, periods=12, freq="MS")
-            months = [m for m in months if m in set(idx)]
-            if not months:
-                continue
-            portion = float(r["units"]) / len(months)
-            for m in months:
-                rows.append({"date": m, "sku_id": r["sku_id"], "channel": r["channel"], "units": portion})
-        return pd.DataFrame(rows, columns=["date", "sku_id", "channel", "units"])
+        return propagate_sales_plan_monthly(
+            monthly,
+            idx,
+            mode=self.inputs.sales_plan_propagation_mode,
+            annual_growth_pct=self.inputs.sales_plan_propagation_growth_annual,
+        )
 
     def _units_matrix(self, idx: pd.DatetimeIndex) -> pd.DataFrame:
         """
