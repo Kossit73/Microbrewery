@@ -546,3 +546,109 @@ def test_all_in_one_schedule_driven_components_flow_through_outputs():
         "direct_labor_detail",
         "indirect_labor_detail",
     }.issubset(result.supporting_schedules.keys())
+
+
+def test_all_in_one_operations_schedule_constrains_shipments():
+    skus = pd.DataFrame(
+        [
+            {
+                "sku_id": 1,
+                "name": "Core Lager 500ml",
+                "direct_cost_per_unit": 1.0,
+                "direct_cost_per_unit_override": 1.0,
+                "markup_pct": 0.0,
+                "relative_opex_weight": 1.0,
+            }
+        ]
+    )
+    channels = pd.DataFrame([{"channel": "Retail", "price_factor": 1.0}])
+    sales = pd.DataFrame([{"date": "2025-01-01", "sku_id": 1, "channel": "Retail", "units": 1_000.0}])
+
+    model = MicrobreweryFinancialModel(
+        ModelConfig(
+            start_date="2025-01-01",
+            months=1,
+            pricing_cost_basis_month=0,
+            cost_inflation_annual=0.0,
+            price_inflation_annual=0.0,
+            tax_rate=0.0,
+            initial_cash=0.0,
+            revolver_limit=0.0,
+            revolver_target_cash=0.0,
+        ),
+        DividendPolicy(enabled=False),
+        ModelInputs(
+            skus=skus,
+            channels=channels,
+            sales_plan=sales,
+            sku_operations=pd.DataFrame(
+                [
+                    {
+                        "sku_id": 1,
+                        "opening_fg_liters": 0.0,
+                        "brew_batch_liters": 250.0,
+                        "brewhouse_yield_pct": 1.0,
+                        "cellar_yield_pct": 1.0,
+                        "packaging_yield_pct": 1.0,
+                        "fermentation_days": 14.0,
+                        "conditioning_days": 7.0,
+                        "target_fg_days": 0.0,
+                    }
+                ]
+            ),
+            brewhouse_schedule=pd.DataFrame(
+                [
+                    {
+                        "resource_name": "Pilot Brewhouse",
+                        "liters_per_batch": 250.0,
+                        "batches_per_day": 1.0,
+                        "brew_days_per_month": 1.0,
+                        "utilization_pct": 1.0,
+                        "downtime_pct": 0.0,
+                        "changeover_loss_pct": 0.0,
+                        "Year 1": 1.0,
+                    }
+                ]
+            ),
+            cellar_schedule=pd.DataFrame(
+                [
+                    {
+                        "resource_name": "Pilot Cellar",
+                        "tank_count": 1.0,
+                        "liters_per_tank": 5_250.0,
+                        "utilization_pct": 1.0,
+                        "downtime_pct": 0.0,
+                        "Year 1": 1.0,
+                    }
+                ]
+            ),
+            packaging_schedule=pd.DataFrame(
+                [
+                    {
+                        "resource_name": "Pilot Line",
+                        "liters_per_hour": 250.0,
+                        "hours_per_day": 1.0,
+                        "run_days_per_month": 1.0,
+                        "utilization_pct": 1.0,
+                        "downtime_pct": 0.0,
+                        "changeover_loss_pct": 0.0,
+                        "Year 1": 1.0,
+                    }
+                ]
+            ),
+        ),
+    )
+
+    result = model.run()
+    month_one = result.monthly.iloc[0]
+    ops_summary = result.supporting_schedules["operations_summary"].iloc[0]
+    ops_sku = result.supporting_schedules["operations_by_sku"].iloc[0]
+
+    assert month_one["shipment_demand_liters"] == pytest.approx(500.0)
+    assert month_one["actual_shipped_liters"] == pytest.approx(250.0)
+    assert month_one["actual_packaged_liters"] == pytest.approx(250.0)
+    assert month_one["unmet_demand_liters"] == pytest.approx(250.0)
+    assert month_one["gross_revenue"] == pytest.approx(500.0)
+    assert ops_summary["bottleneck_resource"] in {"brewhouse", "packaging"}
+    assert ops_sku["batch_count"] == pytest.approx(1.0)
+    assert not result.supporting_schedules["operations_resources"].empty

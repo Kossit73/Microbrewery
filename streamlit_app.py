@@ -519,6 +519,87 @@ def _build_sample_assumptions(
         ]
     )
 
+    sku_operations = pd.DataFrame(
+        [
+            {
+                "sku_id": 1,
+                "opening_fg_liters": 1_500.0,
+                "brew_batch_liters": 2_500.0,
+                "brewhouse_yield_pct": 0.97,
+                "cellar_yield_pct": 0.98,
+                "packaging_yield_pct": 0.995,
+                "fermentation_days": 14.0,
+                "conditioning_days": 7.0,
+                "target_fg_days": 10.0,
+            },
+            {
+                "sku_id": 2,
+                "opening_fg_liters": 1_200.0,
+                "brew_batch_liters": 2_500.0,
+                "brewhouse_yield_pct": 0.97,
+                "cellar_yield_pct": 0.98,
+                "packaging_yield_pct": 0.995,
+                "fermentation_days": 12.0,
+                "conditioning_days": 7.0,
+                "target_fg_days": 9.0,
+            },
+            {
+                "sku_id": 3,
+                "opening_fg_liters": 800.0,
+                "brew_batch_liters": 2_500.0,
+                "brewhouse_yield_pct": 0.96,
+                "cellar_yield_pct": 0.975,
+                "packaging_yield_pct": 0.992,
+                "fermentation_days": 16.0,
+                "conditioning_days": 8.0,
+                "target_fg_days": 12.0,
+            },
+        ]
+    )
+
+    brewhouse_schedule = pd.DataFrame(
+        [
+            {
+                "resource_name": "Main Brewhouse",
+                "liters_per_batch": 2_500.0,
+                "batches_per_day": 3.0,
+                "brew_days_per_month": 22.0,
+                "utilization_pct": 0.83,
+                "downtime_pct": 0.06,
+                "changeover_loss_pct": 0.04,
+                **_year_row([1, 1, 1, 1, 1, 2, 2, 2, 2, 2]),
+            }
+        ]
+    )
+
+    cellar_schedule = pd.DataFrame(
+        [
+            {
+                "resource_name": "Unitank Cellar",
+                "tank_count": 8.0,
+                "liters_per_tank": 5_000.0,
+                "utilization_pct": 0.88,
+                "downtime_pct": 0.05,
+                **_year_row([1, 1, 1, 1, 1, 1.5, 1.5, 1.5, 1.5, 1.5]),
+            }
+        ]
+    )
+
+    packaging_schedule = pd.DataFrame(
+        [
+            {
+                "resource_name": "Bottling & Can Line",
+                "liters_per_hour": 1_350.0,
+                "hours_per_day": 9.0,
+                "run_days_per_month": 20.0,
+                "utilization_pct": 0.85,
+                "downtime_pct": 0.07,
+                "changeover_loss_pct": 0.03,
+                **_year_row([1, 1, 1, 1, 1, 1, 1.25, 1.25, 1.25, 1.25]),
+            }
+        ]
+    )
+
     indirect_labor_schedule = pd.DataFrame(
         [
             {
@@ -606,6 +687,10 @@ def _build_sample_assumptions(
         inventory_schedule=inventory_schedule,
         receivables_schedule=receivables_schedule,
         payables_schedule=payables_schedule,
+        sku_operations=sku_operations,
+        brewhouse_schedule=brewhouse_schedule,
+        cellar_schedule=cellar_schedule,
+        packaging_schedule=packaging_schedule,
         capex_items=capex_items,
         debt_facilities=debt_facilities,
         equity_injections=equity_injections,
@@ -1243,6 +1328,30 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
     else:
         payables_schedule = base_inputs.payables_schedule
 
+    sku_operations = st.session_state.get("assump_data_sku_operations")
+    if isinstance(sku_operations, pd.DataFrame):
+        sku_operations = _non_empty_rows(sku_operations).copy()
+    else:
+        sku_operations = base_inputs.sku_operations
+
+    brewhouse_schedule = st.session_state.get("assump_data_brewhouse")
+    if isinstance(brewhouse_schedule, pd.DataFrame):
+        brewhouse_schedule = _non_empty_rows(brewhouse_schedule).copy()
+    else:
+        brewhouse_schedule = base_inputs.brewhouse_schedule
+
+    cellar_schedule = st.session_state.get("assump_data_cellar")
+    if isinstance(cellar_schedule, pd.DataFrame):
+        cellar_schedule = _non_empty_rows(cellar_schedule).copy()
+    else:
+        cellar_schedule = base_inputs.cellar_schedule
+
+    packaging_schedule = st.session_state.get("assump_data_packaging")
+    if isinstance(packaging_schedule, pd.DataFrame):
+        packaging_schedule = _non_empty_rows(packaging_schedule).copy()
+    else:
+        packaging_schedule = base_inputs.packaging_schedule
+
     return ModelInputs(
         skus=skus,
         channels=channels,
@@ -1255,6 +1364,10 @@ def _build_inputs_from_state(base_inputs: ModelInputs) -> ModelInputs:
         inventory_schedule=inventory_schedule,
         receivables_schedule=receivables_schedule,
         payables_schedule=payables_schedule,
+        sku_operations=sku_operations,
+        brewhouse_schedule=brewhouse_schedule,
+        cellar_schedule=cellar_schedule,
+        packaging_schedule=packaging_schedule,
         capex_items=capex_items,
         debt_facilities=debt_facilities,
         equity_injections=equity_injections,
@@ -1329,6 +1442,10 @@ def _sync_model_timeline_state(cfg: ModelConfig, base_inputs: ModelInputs) -> No
         "inventory": base_inputs.inventory_schedule,
         "receivables": base_inputs.receivables_schedule,
         "payables": base_inputs.payables_schedule,
+        "sku_operations": base_inputs.sku_operations,
+        "brewhouse": base_inputs.brewhouse_schedule,
+        "cellar": base_inputs.cellar_schedule,
+        "packaging": base_inputs.packaging_schedule,
     }
     for key, default_df in schedule_defaults.items():
         if isinstance(default_df, pd.DataFrame):
@@ -2383,6 +2500,10 @@ def main() -> None:
         )
         direct_labor_df = inputs.direct_labor_schedule.copy() if isinstance(inputs.direct_labor_schedule, pd.DataFrame) else pd.DataFrame()
         indirect_labor_df = inputs.indirect_labor_schedule.copy() if isinstance(inputs.indirect_labor_schedule, pd.DataFrame) else pd.DataFrame()
+        sku_operations_df = inputs.sku_operations.copy() if isinstance(inputs.sku_operations, pd.DataFrame) else pd.DataFrame()
+        brewhouse_df = inputs.brewhouse_schedule.copy() if isinstance(inputs.brewhouse_schedule, pd.DataFrame) else pd.DataFrame()
+        cellar_df = inputs.cellar_schedule.copy() if isinstance(inputs.cellar_schedule, pd.DataFrame) else pd.DataFrame()
+        packaging_df = inputs.packaging_schedule.copy() if isinstance(inputs.packaging_schedule, pd.DataFrame) else pd.DataFrame()
         inventory_df = inputs.inventory_schedule.copy() if isinstance(inputs.inventory_schedule, pd.DataFrame) else pd.DataFrame()
         receivables_df = inputs.receivables_schedule.copy() if isinstance(inputs.receivables_schedule, pd.DataFrame) else pd.DataFrame()
         payables_df = inputs.payables_schedule.copy() if isinstance(inputs.payables_schedule, pd.DataFrame) else pd.DataFrame()
@@ -2398,6 +2519,14 @@ def main() -> None:
         _assumption_editor("SKUs", "skus", inputs.skus)
         _assumption_editor("Channels", "channels", inputs.channels)
         _sales_plan_assumption_editor(inputs.sales_plan, inputs.sales_plan_frequency, cfg)
+        st.caption("SKU operations translate demand into packaged output, brew input, finished-goods targets, and batch counts.")
+        _assumption_editor("SKU operations", "sku_operations", sku_operations_df)
+        st.caption("Brewhouse schedule sets brew-start capacity from batch size, brew days, uptime, and yearly expansion counts.")
+        _assumption_editor("Brewhouse schedule", "brewhouse", brewhouse_df)
+        st.caption("Cellar schedule constrains throughput through tank count, tank size, utilization, and downtime.")
+        _assumption_editor("Cellar schedule", "cellar", cellar_df)
+        st.caption("Packaging schedule constrains packaged liters through line rate, run days, uptime, and changeover loss.")
+        _assumption_editor("Packaging schedule", "packaging", packaging_df)
         _assumption_editor("Cost pools", "cost_pools", cost_pool_df)
         st.caption("Direct labor schedules drive payroll, capacity, direct COGS, and temporary labor cost when capacity is short.")
         _assumption_editor("Direct labor schedule", "direct_labor", direct_labor_df)
@@ -2425,6 +2554,10 @@ _STATE_KEYS = [
     "assump_data_channels",
     "assump_data_sales_plan_base",
     "assump_sales_plan_frequency",
+    "assump_data_sku_operations",
+    "assump_data_brewhouse",
+    "assump_data_cellar",
+    "assump_data_packaging",
     "assump_data_cost_pools",
     "assump_data_direct_labor",
     "assump_data_indirect_labor",

@@ -41,6 +41,7 @@ from typing import Dict, Iterable, List, Literal, Optional, Tuple
 import numpy as np
 import pandas as pd
 from finmodel.allocation import allocate_opex_by_drivers
+from finmodel.operations_schedule import plan_brewery_operations
 from finmodel.opex_defaults import build_default_opex_cost_pools
 from finmodel.opex_schemas import OpexCostPool, SKUCostContext
 
@@ -216,6 +217,10 @@ class ModelInputs:
     inventory_schedule: Optional[pd.DataFrame] = None
     receivables_schedule: Optional[pd.DataFrame] = None
     payables_schedule: Optional[pd.DataFrame] = None
+    sku_operations: Optional[pd.DataFrame] = None
+    brewhouse_schedule: Optional[pd.DataFrame] = None
+    cellar_schedule: Optional[pd.DataFrame] = None
+    packaging_schedule: Optional[pd.DataFrame] = None
 
     capex_items: Optional[List[CapexItem]] = None
     debt_facilities: Optional[List[DebtFacility]] = None
@@ -336,6 +341,14 @@ class MicrobreweryFinancialModel:
             self.inputs.receivables_schedule = pd.DataFrame()
         if self.inputs.payables_schedule is None:
             self.inputs.payables_schedule = pd.DataFrame()
+        if self.inputs.sku_operations is None:
+            self.inputs.sku_operations = pd.DataFrame()
+        if self.inputs.brewhouse_schedule is None:
+            self.inputs.brewhouse_schedule = pd.DataFrame()
+        if self.inputs.cellar_schedule is None:
+            self.inputs.cellar_schedule = pd.DataFrame()
+        if self.inputs.packaging_schedule is None:
+            self.inputs.packaging_schedule = pd.DataFrame()
 
     def _other_income_series(self, idx: pd.DatetimeIndex) -> pd.Series:
         if self.inputs.other_income_items:
@@ -697,6 +710,24 @@ class MicrobreweryFinancialModel:
             .fillna(0.0)
         )
         return wide.sort_index(axis=1)
+
+    def _scale_channel_units_to_sku_totals(
+        self,
+        demand_units_wide: pd.DataFrame,
+        actual_units_by_sku: pd.DataFrame,
+    ) -> pd.DataFrame:
+        if demand_units_wide.empty:
+            return demand_units_wide.copy()
+        out = demand_units_wide.copy().astype(float)
+        demand_sku = out.T.groupby(level=0).sum().T.reindex(out.index).fillna(0.0)
+        actual_sku = actual_units_by_sku.reindex(index=out.index, columns=demand_sku.columns, fill_value=0.0)
+        ratios = actual_sku.div(demand_sku.replace(0.0, np.nan)).fillna(0.0)
+        for sku_id in demand_sku.columns:
+            if sku_id not in out.columns.get_level_values(0):
+                continue
+            sku_slice = out.xs(sku_id, axis=1, level=0, drop_level=False)
+            out.loc[:, sku_slice.columns] = sku_slice.mul(ratios[sku_id], axis=0).to_numpy()
+        return out.sort_index(axis=1)
 
     def _estimated_revenue_wide_from_units(self, idx: pd.DatetimeIndex, units_wide: pd.DataFrame) -> pd.DataFrame:
         if units_wide.empty:
@@ -1255,11 +1286,32 @@ class MicrobreweryFinancialModel:
         # Inflation indices
         cost_idx = self._inflation_index(self.cfg.cost_inflation_annual, idx)
 
-        # Units, prices, revenue
-        units_wide = self._units_matrix(idx)
+        # Units, operations, prices, revenue
+        demand_units_wide = self._units_matrix(idx)
+        liters_per_unit = self.inputs.skus.set_index("sku_id")["name"].map(self._liters_per_unit_from_name)
+        operations_plan = plan_brewery_operations(
+            idx=idx,
+            demand_units_wide=demand_units_wide,
+            skus=self.inputs.skus,
+            liters_per_unit=liters_per_unit,
+            sku_operations=self.inputs.sku_operations,
+            brewhouse_schedule=self.inputs.brewhouse_schedule,
+            cellar_schedule=self.inputs.cellar_schedule,
+            packaging_schedule=self.inputs.packaging_schedule,
+        )
+        units_wide = self._scale_channel_units_to_sku_totals(
+            demand_units_wide,
+            operations_plan.shipment_units_by_sku,
+        )
+        production_units_wide = self._scale_channel_units_to_sku_totals(
+            demand_units_wide,
+            operations_plan.production_units_by_sku,
+        )
         prices_wide = self._prices_matrix(idx, units_wide)
         if isinstance(units_wide.columns, pd.MultiIndex):
             units_wide.columns = units_wide.columns.set_names(["sku_id", "channel"])
+        if isinstance(production_units_wide.columns, pd.MultiIndex):
+            production_units_wide.columns = production_units_wide.columns.set_names(["sku_id", "channel"])
         if isinstance(prices_wide.columns, pd.MultiIndex):
             prices_wide.columns = prices_wide.columns.set_names(["sku_id", "channel"])
 
@@ -1276,12 +1328,13 @@ class MicrobreweryFinancialModel:
 
         # Direct costs
         skus = self.inputs.skus.set_index("sku_id")
+        production_basis_wide = production_units_wide if not production_units_wide.empty else units_wide
         derived_direct_cost_per_unit = self._derived_direct_cost_per_unit_by_sku(
             idx,
-            units_wide,
+            production_basis_wide,
             include_scheduled_labor=False,
         )
-        if units_wide.empty:
+        if production_basis_wide.empty:
             direct_material_costs = pd.Series(0.0, index=idx, name="direct_material_costs")
         else:
             cost_cols = []
@@ -1296,12 +1349,12 @@ class MicrobreweryFinancialModel:
                 index=idx,
                 columns=pd.MultiIndex.from_tuples(cost_cols, names=["sku_id", "channel"]),
             ).sort_index(axis=1)
-            direct_costs_wide = units_wide.mul(costs_wide, fill_value=0.0)
+            direct_costs_wide = production_basis_wide.mul(costs_wide, fill_value=0.0)
             direct_material_costs = direct_costs_wide.sum(axis=1).rename("direct_material_costs")
 
         direct_labor_alloc, direct_labor_summary = self._labor_schedule_monthly(
             idx,
-            units_wide,
+            production_basis_wide,
             self.inputs.direct_labor_schedule,
         )
         direct_labor_cost = direct_labor_summary["labor_cost"].rename("direct_labor_cost")
@@ -1591,6 +1644,17 @@ class MicrobreweryFinancialModel:
                 "capacity_liters": direct_labor_summary["capacity_liters"],
                 "capacity_shortfall_liters": direct_labor_summary["capacity_shortfall_liters"],
                 "temporary_labor_cost": direct_labor_summary["temporary_labor_cost"],
+                "shipment_demand_liters": operations_plan.monthly_summary.get("demand_liters", pd.Series(0.0, index=idx)),
+                "production_target_packaged_liters": operations_plan.monthly_summary.get("required_packaged_liters", pd.Series(0.0, index=idx)),
+                "actual_packaged_liters": operations_plan.monthly_summary.get("actual_packaged_liters", pd.Series(0.0, index=idx)),
+                "actual_shipped_liters": operations_plan.monthly_summary.get("actual_shipped_liters", pd.Series(0.0, index=idx)),
+                "ops_ending_fg_liters": operations_plan.monthly_summary.get("ending_fg_liters", pd.Series(0.0, index=idx)),
+                "unmet_demand_liters": operations_plan.monthly_summary.get("unmet_demand_liters", pd.Series(0.0, index=idx)),
+                "brewhouse_capacity_liters": operations_plan.monthly_summary.get("brewhouse_capacity_liters", pd.Series(0.0, index=idx)),
+                "cellar_capacity_liters": operations_plan.monthly_summary.get("cellar_capacity_liters", pd.Series(0.0, index=idx)),
+                "packaging_capacity_liters": operations_plan.monthly_summary.get("packaging_capacity_liters", pd.Series(0.0, index=idx)),
+                "operations_capacity_scale": operations_plan.monthly_summary.get("capacity_scale", pd.Series(1.0, index=idx)),
+                "fg_target_gap_liters": operations_plan.monthly_summary.get("fg_target_gap_liters", pd.Series(0.0, index=idx)),
                 "debt_service": debt_service,
                 "dscr": dscr,
                 "interest_coverage": interest_coverage,
@@ -1644,6 +1708,11 @@ class MicrobreweryFinancialModel:
             "net_change_in_cash",
             "debt_service",
             "fcff",
+            "shipment_demand_liters",
+            "production_target_packaged_liters",
+            "actual_packaged_liters",
+            "actual_shipped_liters",
+            "unmet_demand_liters",
         ]
         stock_cols = [
             "receivables",
@@ -1669,6 +1738,12 @@ class MicrobreweryFinancialModel:
             "required_liters",
             "capacity_liters",
             "capacity_shortfall_liters",
+            "ops_ending_fg_liters",
+            "brewhouse_capacity_liters",
+            "cellar_capacity_liters",
+            "packaging_capacity_liters",
+            "operations_capacity_scale",
+            "fg_target_gap_liters",
             "dscr",
             "interest_coverage",
             "leverage_ratio",
@@ -1692,6 +1767,9 @@ class MicrobreweryFinancialModel:
             "payables_detail": payables_details,
             "direct_labor_detail": direct_labor_summary,
             "indirect_labor_detail": indirect_labor_summary,
+            "operations_summary": operations_plan.monthly_summary,
+            "operations_by_sku": operations_plan.sku_schedule,
+            "operations_resources": operations_plan.resource_schedule,
         }
 
         return ModelRunResult(
