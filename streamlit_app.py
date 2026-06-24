@@ -172,7 +172,7 @@ def _render_model_hero() -> None:
         f"""
         <section class="designer-hero">
             <p class="designer-kicker">Craft brewery planning suite</p>
-            <h1 class="designer-title">Microbrewery Financial Model</h1>
+            <h1 class="designer-title">Microbrewery</h1>
             <p class="designer-copy">
                 Review production, channels, pricing, debt, and valuation in one polished workspace,
                 then export a lender-friendly workbook instead of a raw data dump.
