@@ -9,12 +9,15 @@ full outputs.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from copy import deepcopy
+from dataclasses import dataclass, fields, is_dataclass, replace
+import hashlib
 import io
 import json
+import time
 import urllib.parse
 import urllib.request
-from typing import Tuple
+from typing import Any, Callable, Tuple
 
 import numpy as np
 import pandas as pd
@@ -39,6 +42,39 @@ from brewery_financial_model_all_in_one import (
     phase_growth_series,
     write_comprehensive_excel_report,
 )
+
+
+_BASE_RESULT_CACHE_KEY = "microbrewery_base_result_cache"
+_CURRENT_RESULT_KEY = "microbrewery_current_result_bundle"
+_CURRENT_RESULT_META_KEY = "microbrewery_current_result_meta"
+_ANALYSIS_CACHE_KEY = "microbrewery_analysis_cache"
+_ANALYSIS_STATE_KEY = "microbrewery_analysis_state"
+_EXPORT_CACHE_KEY = "microbrewery_export_cache"
+_EXPORT_STATE_KEY = "microbrewery_export_state"
+
+_DRAFT_SIGNATURE_VERSION = "microbrewery-draft-v1"
+_ANALYTICS_SIGNATURE_VERSION = "microbrewery-analytics-v1"
+_EXPORT_SIGNATURE_VERSION = "microbrewery-export-v1"
+
+
+@dataclass
+class ComputedResultBundle:
+    signature: str
+    cfg: ModelConfig
+    div: DividendPolicy
+    inputs: ModelInputs
+    result: ModelRunResult
+    computed_at: float
+    base_duration_seconds: float
+
+
+@dataclass
+class LazyArtifactBundle:
+    result_signature: str
+    config_signature: str
+    payload: object
+    computed_at: float
+    duration_seconds: float
 
 
 def _inject_app_theme() -> None:
@@ -304,6 +340,200 @@ def _build_professional_excel_output(result) -> bytes:
     final_buffer = io.BytesIO()
     workbook.save(final_buffer)
     return final_buffer.getvalue()
+
+
+def _get_session_store(key: str) -> dict:
+    store = st.session_state.get(key)
+    if not isinstance(store, dict):
+        store = {}
+        st.session_state[key] = store
+    return store
+
+
+def _prune_store(store: dict, max_items: int) -> None:
+    if len(store) <= max_items:
+        return
+    sorted_items = sorted(
+        store.items(),
+        key=lambda item: getattr(item[1], "computed_at", 0.0),
+    )
+    for stale_key, _ in sorted_items[:-max_items]:
+        store.pop(stale_key, None)
+
+
+def _normalize_for_signature(value: Any) -> Any:
+    if is_dataclass(value):
+        return {
+            field.name: _normalize_for_signature(getattr(value, field.name))
+            for field in fields(value)
+        }
+    if isinstance(value, pd.DataFrame):
+        return {
+            "columns": [_normalize_for_signature(col) for col in list(value.columns)],
+            "rows": [
+                [_normalize_for_signature(cell) for cell in row]
+                for row in value.itertuples(index=False, name=None)
+            ],
+        }
+    if isinstance(value, pd.Series):
+        return {
+            "name": _normalize_for_signature(value.name),
+            "index": [_normalize_for_signature(item) for item in list(value.index)],
+            "values": [_normalize_for_signature(item) for item in value.tolist()],
+        }
+    if isinstance(value, pd.Index):
+        return [_normalize_for_signature(item) for item in list(value)]
+    if isinstance(value, dict):
+        normalized_items = [
+            {
+                "key": _normalize_for_signature(key),
+                "value": _normalize_for_signature(val),
+            }
+            for key, val in value.items()
+        ]
+        return sorted(normalized_items, key=lambda item: json.dumps(item["key"], sort_keys=True))
+    if isinstance(value, (list, tuple)):
+        return [_normalize_for_signature(item) for item in value]
+    if isinstance(value, (pd.Timestamp, np.datetime64)):
+        return pd.Timestamp(value).isoformat()
+    if isinstance(value, np.generic):
+        return _normalize_for_signature(value.item())
+    if value is None or value is pd.NaT:
+        return None
+    if isinstance(value, float):
+        return None if not np.isfinite(value) else value
+    if isinstance(value, (bool, int, str)):
+        return value
+    if pd.isna(value):
+        return None
+    return str(value)
+
+
+def _signature_for_payload(version: str, payload: object) -> str:
+    normalized = {
+        "version": version,
+        "payload": _normalize_for_signature(payload),
+    }
+    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _build_draft_signature(cfg: ModelConfig, div: DividendPolicy, inputs: ModelInputs) -> str:
+    return _signature_for_payload(
+        _DRAFT_SIGNATURE_VERSION,
+        {"cfg": cfg, "div": div, "inputs": inputs},
+    )
+
+
+def _current_result_bundle() -> ComputedResultBundle | None:
+    bundle = st.session_state.get(_CURRENT_RESULT_KEY)
+    return bundle if isinstance(bundle, ComputedResultBundle) else None
+
+
+def _current_result_meta() -> dict[str, object]:
+    meta = st.session_state.get(_CURRENT_RESULT_META_KEY)
+    return meta if isinstance(meta, dict) else {}
+
+
+def _activate_result_bundle(bundle: ComputedResultBundle, *, cache_hit: bool) -> None:
+    st.session_state[_CURRENT_RESULT_KEY] = bundle
+    st.session_state[_CURRENT_RESULT_META_KEY] = {
+        "cache_hit": cache_hit,
+        "activated_at": time.time(),
+    }
+
+
+def _draft_is_dirty(draft_signature: str, bundle: ComputedResultBundle | None) -> bool:
+    return bundle is not None and bundle.signature != draft_signature
+
+
+def _get_or_create_result_bundle(
+    cfg: ModelConfig,
+    div: DividendPolicy,
+    inputs: ModelInputs,
+    signature: str,
+) -> tuple[ComputedResultBundle, bool]:
+    cache = _get_session_store(_BASE_RESULT_CACHE_KEY)
+    cached = cache.get(signature)
+    if isinstance(cached, ComputedResultBundle):
+        return cached, True
+
+    run_inputs = deepcopy(inputs)
+    started = time.perf_counter()
+    model = MicrobreweryFinancialModel(cfg, div, run_inputs)
+    result = model.run()
+    bundle = ComputedResultBundle(
+        signature=signature,
+        cfg=cfg,
+        div=div,
+        inputs=model.inputs,
+        result=result,
+        computed_at=time.time(),
+        base_duration_seconds=time.perf_counter() - started,
+    )
+    cache[signature] = bundle
+    _prune_store(cache, max_items=8)
+    return bundle, False
+
+
+def _lazy_artifact_is_stale(
+    artifact: LazyArtifactBundle | None,
+    result_signature: str,
+    config_signature: str,
+) -> bool:
+    return bool(
+        artifact
+        and (
+            artifact.result_signature != result_signature
+            or artifact.config_signature != config_signature
+        )
+    )
+
+
+def _resolve_lazy_artifact(
+    *,
+    artifact_name: str,
+    result_signature: str,
+    config_payload: object,
+    execute: bool,
+    compute_fn: Callable[[], object],
+    cache_store_key: str,
+    state_store_key: str,
+) -> tuple[LazyArtifactBundle | None, bool, bool]:
+    config_signature = _signature_for_payload(
+        _ANALYTICS_SIGNATURE_VERSION if cache_store_key == _ANALYSIS_CACHE_KEY else _EXPORT_SIGNATURE_VERSION,
+        {"artifact": artifact_name, "config": config_payload},
+    )
+    state_store = _get_session_store(state_store_key)
+    artifact = state_store.get(artifact_name)
+    artifact = artifact if isinstance(artifact, LazyArtifactBundle) else None
+    cache_hit = False
+
+    if execute:
+        cache_store = _get_session_store(cache_store_key)
+        cache_key = f"{artifact_name}:{result_signature}:{config_signature}"
+        cached = cache_store.get(cache_key)
+        if isinstance(cached, LazyArtifactBundle):
+            artifact = cached
+            cache_hit = True
+        else:
+            started = time.perf_counter()
+            artifact = LazyArtifactBundle(
+                result_signature=result_signature,
+                config_signature=config_signature,
+                payload=compute_fn(),
+                computed_at=time.time(),
+                duration_seconds=time.perf_counter() - started,
+            )
+            cache_store[cache_key] = artifact
+            _prune_store(cache_store, max_items=16)
+        state_store[artifact_name] = artifact
+
+    return artifact, _lazy_artifact_is_stale(artifact, result_signature, config_signature), cache_hit
+
+
+def _render_stale_banner(message: str) -> None:
+    st.warning(message)
 
 def _driver_based_opex_views_section(result: ModelRunResult) -> None:
     """
@@ -1509,8 +1739,31 @@ def _charts_section(result) -> None:
     )
 
 
-def _download_section(result) -> None:
-    buffer = _build_professional_excel_output(result)
+def _download_section(bundle: ComputedResultBundle) -> None:
+    run_export = st.button("Prepare Excel output", key="brewery_prepare_export")
+    export_artifact, export_stale, export_cache_hit = _resolve_lazy_artifact(
+        artifact_name="comprehensive_excel_output",
+        result_signature=bundle.signature,
+        config_payload={"format": "comprehensive_pack_v1"},
+        execute=run_export,
+        compute_fn=lambda: _build_professional_excel_output(bundle.result),
+        cache_store_key=_EXPORT_CACHE_KEY,
+        state_store_key=_EXPORT_STATE_KEY,
+    )
+    if export_artifact is None:
+        st.info("Prepare the workbook only when you need a download; dashboards stay available without rebuilding the file.")
+        return
+
+    if export_stale:
+        _render_stale_banner(
+            "The prepared Excel file below reflects the previous model run. Press Prepare Excel output to refresh it."
+        )
+    elif export_cache_hit:
+        st.caption("Excel output refreshed from cache.")
+    else:
+        st.caption(f"Excel output prepared in {export_artifact.duration_seconds:.2f}s.")
+
+    buffer = export_artifact.payload if isinstance(export_artifact.payload, bytes) else b""
     st.download_button(
         label="Download Excel output (Comprehensive Pack)",
         data=buffer,
@@ -1575,7 +1828,59 @@ def _schedules_section(result) -> None:
                 st.dataframe(df)
 
 
-def _key_analytics_section(result, inputs: ModelInputs) -> None:
+def _compute_monte_carlo_payload(base_ebitda: float, sims: int, sigma_pct: float) -> dict[str, object]:
+    if base_ebitda <= 0:
+        return {
+            "chart_df": pd.DataFrame(columns=["ebitda_sim"]),
+            "summary": None,
+            "message": "Monte Carlo simulation needs a positive EBITDA base before it can be generated.",
+        }
+    draws = np.random.normal(loc=base_ebitda, scale=base_ebitda * sigma_pct, size=sims)
+    mc_df = pd.DataFrame({"ebitda_sim": draws}).sort_values("ebitda_sim").reset_index(drop=True)
+    return {
+        "chart_df": mc_df,
+        "summary": {
+            "simulations": sims,
+            "mean": float(mc_df["ebitda_sim"].mean()),
+            "p05": float(mc_df["ebitda_sim"].quantile(0.05)),
+            "p50": float(mc_df["ebitda_sim"].quantile(0.50)),
+            "p95": float(mc_df["ebitda_sim"].quantile(0.95)),
+        },
+        "message": None,
+    }
+
+
+def _compute_scenario_planning_payload(
+    base_revenue: float,
+    base_ebitda: float,
+    scen_df: pd.DataFrame,
+) -> pd.DataFrame:
+    out = scen_df.copy()
+    out["revenue"] = base_revenue * pd.to_numeric(out["revenue_multiplier"], errors="coerce").fillna(1.0)
+    out["ebitda"] = base_ebitda * pd.to_numeric(out["ebitda_multiplier"], errors="coerce").fillna(1.0)
+    return out
+
+
+def _compute_predictive_payload(annual: pd.DataFrame, forecast_steps: int) -> dict[str, object]:
+    if "total_revenue" not in annual.columns or len(annual) < 3:
+        return {
+            "table": pd.DataFrame(),
+            "message": "Need at least 3 annual revenue points for trend-based prediction.",
+        }
+    y = annual["total_revenue"].values.astype(float)
+    x = np.arange(len(y))
+    coeff = np.polyfit(x, y, 1)
+    pred = coeff[0] * (x + forecast_steps) + coeff[1]
+    return {
+        "table": pd.DataFrame(
+            {"actual_revenue": y, f"prediction_step_{forecast_steps}": pred},
+            index=annual.index,
+        ),
+        "message": None,
+    }
+
+
+def _key_analytics_section(result, inputs: ModelInputs, result_signature: str) -> None:
     st.subheader("Key Analytics")
     annual = result.annual.copy()
     monthly = result.monthly.copy()
@@ -1709,21 +2014,43 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
     sims = int(np.clip(sims, 100, 5000))
     sigma_pct = (float(pd.to_numeric(mc_cfg.iloc[0].get("sigma_pct", 20.0), errors="coerce")) / 100.0) if not mc_cfg.empty else 0.2
     sigma_pct = max(sigma_pct, 0.0)
-    if base_ebitda > 0:
-        draws = np.random.normal(loc=base_ebitda, scale=base_ebitda * sigma_pct, size=sims)
-        mc_df = pd.DataFrame({"ebitda_sim": draws})
-        st.line_chart(mc_df.sort_values("ebitda_sim").reset_index(drop=True))
-        mc_mean = float(mc_df["ebitda_sim"].mean())
-        mc_p05 = float(mc_df["ebitda_sim"].quantile(0.05))
-        mc_p50 = float(mc_df["ebitda_sim"].quantile(0.50))
-        mc_p95 = float(mc_df["ebitda_sim"].quantile(0.95))
-        st.markdown(
-            (
-                f"Based on **{sims:,}** simulations, average EBITDA is **{mc_mean:,.2f}**. "
-                f"The distribution ranges from **{mc_p05:,.2f}** at the 5th percentile "
-                f"to **{mc_p95:,.2f}** at the 95th percentile, with a median of **{mc_p50:,.2f}**."
+    run_mc = st.button("Run Monte Carlo", key="ka_run_mc")
+    mc_artifact, mc_stale, mc_cache_hit = _resolve_lazy_artifact(
+        artifact_name="monte_carlo",
+        result_signature=result_signature,
+        config_payload={"simulations": sims, "sigma_pct": sigma_pct},
+        execute=run_mc,
+        compute_fn=lambda: _compute_monte_carlo_payload(base_ebitda, sims, sigma_pct),
+        cache_store_key=_ANALYSIS_CACHE_KEY,
+        state_store_key=_ANALYSIS_STATE_KEY,
+    )
+    if mc_artifact is None:
+        st.info("Configure the simulation, then press Run Monte Carlo to generate the distribution.")
+    else:
+        if mc_stale:
+            _render_stale_banner(
+                "Shown Monte Carlo output reflects a previous model run or prior analytics settings. Press Run Monte Carlo to refresh it."
             )
-        )
+        elif mc_cache_hit:
+            st.caption("Monte Carlo output refreshed from cache.")
+        else:
+            st.caption(f"Monte Carlo output prepared in {mc_artifact.duration_seconds:.2f}s.")
+        mc_payload = mc_artifact.payload if isinstance(mc_artifact.payload, dict) else {}
+        if mc_payload.get("message"):
+            st.info(str(mc_payload["message"]))
+        else:
+            mc_df = mc_payload.get("chart_df", pd.DataFrame())
+            summary = mc_payload.get("summary", {}) or {}
+            st.line_chart(mc_df)
+            st.markdown(
+                (
+                    f"Based on **{int(summary.get('simulations', sims)):,}** simulations, average EBITDA is "
+                    f"**{float(summary.get('mean', 0.0)):,.2f}**. The distribution ranges from "
+                    f"**{float(summary.get('p05', 0.0)):,.2f}** at the 5th percentile to "
+                    f"**{float(summary.get('p95', 0.0)):,.2f}** at the 95th percentile, with a median of "
+                    f"**{float(summary.get('p50', 0.0)):,.2f}**."
+                )
+            )
 
     # What-ifs analysis
     st.markdown("### What ifs analysis")
@@ -1788,10 +2115,30 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
         ]
     )
     scen_df = _dynamic_table_editor("Scenario planning variables", "ka_scenarios", scen_defaults, label="scenario")
-    scen_df["revenue"] = base_revenue * pd.to_numeric(scen_df["revenue_multiplier"], errors="coerce").fillna(1.0)
-    scen_df["ebitda"] = base_ebitda * pd.to_numeric(scen_df["ebitda_multiplier"], errors="coerce").fillna(1.0)
-    st.dataframe(scen_df)
-    st.line_chart(scen_df.set_index("scenario")[["revenue", "ebitda"]])
+    run_scenarios = st.button("Run Scenario Planning", key="ka_run_scenarios")
+    scen_artifact, scen_stale, scen_cache_hit = _resolve_lazy_artifact(
+        artifact_name="scenario_planning",
+        result_signature=result_signature,
+        config_payload={"base_revenue": base_revenue, "base_ebitda": base_ebitda, "scenarios": scen_df},
+        execute=run_scenarios,
+        compute_fn=lambda: _compute_scenario_planning_payload(base_revenue, base_ebitda, scen_df),
+        cache_store_key=_ANALYSIS_CACHE_KEY,
+        state_store_key=_ANALYSIS_STATE_KEY,
+    )
+    if scen_artifact is None:
+        st.info("Press Run Scenario Planning to generate the scenario table and trend view.")
+    else:
+        if scen_stale:
+            _render_stale_banner(
+                "Shown scenario planning output reflects a previous model run or prior analytics settings. Press Run Scenario Planning to refresh it."
+            )
+        elif scen_cache_hit:
+            st.caption("Scenario planning output refreshed from cache.")
+        else:
+            st.caption(f"Scenario planning output prepared in {scen_artifact.duration_seconds:.2f}s.")
+        scen_payload = scen_artifact.payload if isinstance(scen_artifact.payload, pd.DataFrame) else pd.DataFrame()
+        st.dataframe(scen_payload)
+        st.line_chart(scen_payload.set_index("scenario")[["revenue", "ebitda"]])
 
     # Goal seek
     st.markdown("### Goal seek")
@@ -1844,16 +2191,34 @@ def _key_analytics_section(result, inputs: ModelInputs) -> None:
     )
     forecast_steps = int(pd.to_numeric(pred_cfg.iloc[0].get("forecast_steps", 1), errors="coerce")) if not pred_cfg.empty else 1
     forecast_steps = max(forecast_steps, 1)
-    if "total_revenue" in annual.columns and len(annual) >= 3:
-        y = annual["total_revenue"].values.astype(float)
-        x = np.arange(len(y))
-        coeff = np.polyfit(x, y, 1)
-        pred = coeff[0] * (x + forecast_steps) + coeff[1]
-        pred_df = pd.DataFrame({"actual_revenue": y, f"prediction_step_{forecast_steps}": pred}, index=annual.index)
-        st.dataframe(pred_df)
-        st.line_chart(pred_df)
+    run_predictive = st.button("Run Predictive Analytics", key="ka_run_predictive")
+    pred_artifact, pred_stale, pred_cache_hit = _resolve_lazy_artifact(
+        artifact_name="predictive_analytics",
+        result_signature=result_signature,
+        config_payload={"forecast_steps": forecast_steps},
+        execute=run_predictive,
+        compute_fn=lambda: _compute_predictive_payload(annual, forecast_steps),
+        cache_store_key=_ANALYSIS_CACHE_KEY,
+        state_store_key=_ANALYSIS_STATE_KEY,
+    )
+    if pred_artifact is None:
+        st.info("Press Run Predictive Analytics to generate the trend projection.")
     else:
-        st.info("Need at least 3 annual revenue points for trend-based prediction.")
+        if pred_stale:
+            _render_stale_banner(
+                "Shown predictive analytics output reflects a previous model run or prior analytics settings. Press Run Predictive Analytics to refresh it."
+            )
+        elif pred_cache_hit:
+            st.caption("Predictive analytics output refreshed from cache.")
+        else:
+            st.caption(f"Predictive analytics output prepared in {pred_artifact.duration_seconds:.2f}s.")
+        pred_payload = pred_artifact.payload if isinstance(pred_artifact.payload, dict) else {}
+        if pred_payload.get("message"):
+            st.info(str(pred_payload["message"]))
+        else:
+            pred_df = pred_payload.get("table", pd.DataFrame())
+            st.dataframe(pred_df)
+            st.line_chart(pred_df)
 
     # Return diagnostics
     st.markdown("### Return diagnostics")
@@ -2148,6 +2513,7 @@ def main() -> None:
     _inject_app_theme()
     _render_model_hero()
 
+    run_controls = st.container()
     tab_assumptions, tab_results, tab_key_analytics, tab_ai_decision = st.tabs([
         "Core Assumptions",
         "Results",
@@ -2237,11 +2603,7 @@ def main() -> None:
         row = config_table_state.iloc[0]
         cfg = replace(
             cfg,
-            price_inflation_annual=float(row.get("price_inflation_annual", cfg.price_inflation_annual)),
-            cost_inflation_annual=float(row.get("cost_inflation_annual", cfg.cost_inflation_annual)),
             tax_rate=float(row.get("tax_rate", cfg.tax_rate)),
-            wacc_annual=float(row.get("wacc_annual", cfg.wacc_annual)),
-            exit_ev_ebitda_multiple=float(row.get("exit_ev_ebitda_multiple", cfg.exit_ev_ebitda_multiple)),
             revolver_limit=float(row.get("revolver_limit", cfg.revolver_limit)),
             revolver_interest_annual=float(row.get("revolver_interest_annual", cfg.revolver_interest_annual)),
             revolver_target_cash=float(row.get("revolver_target_cash", cfg.revolver_target_cash)),
@@ -2257,38 +2619,100 @@ def main() -> None:
         row = dividend_table_state.iloc[0]
         div = replace(
             div,
-            enabled=bool(row.get("enabled", div.enabled)),
+            enabled=_coerce_bool(row.get("enabled", div.enabled)),
             model=str(row.get("model", div.model)),
-            start_month=int(row.get("start_month", div.start_month)),
-            minimum_cash_position=float(row.get("minimum_cash_position", div.minimum_cash_position)),
             payout_ratio=float(row.get("payout_ratio", div.payout_ratio)),
         )
 
     base_inputs = _build_sample_assumptions(cfg, div)
     _sync_model_timeline_state(cfg, base_inputs)
     inputs = _build_inputs_from_state(base_inputs)
-    model = MicrobreweryFinancialModel(cfg, div, inputs)
-    result = model.run()
+    draft_signature = _build_draft_signature(cfg, div, inputs)
 
-    with tab_results:
-        _valuation_section(result)
-        _statement_section(result)
-        _charts_section(result)
-        _schedules_section(result)
-        _driver_based_opex_views_section(result)
-        _download_section(result)
-
-        st.caption(
-            "The sample assumptions mirror the CLI example in "
-            "`brewery_financial_model_all_in_one.py`. Adjust the sliders to "
-            "explore scenarios."
+    current_bundle = _current_result_bundle()
+    run_label = "Run Model" if current_bundle is None else "Recalculate"
+    with run_controls:
+        left_col, right_col = st.columns([3, 1])
+        status_slot = left_col.empty()
+        meta_slot = left_col.empty()
+        run_clicked = right_col.button(
+            run_label,
+            key="brewery_run_model",
+            type="primary",
+            use_container_width=True,
         )
 
+    if run_clicked:
+        with st.spinner("Running microbrewery model..."):
+            bundle, cache_hit = _get_or_create_result_bundle(cfg, div, inputs, draft_signature)
+        _activate_result_bundle(bundle, cache_hit=cache_hit)
+        current_bundle = bundle
+
+    draft_is_dirty = _draft_is_dirty(draft_signature, current_bundle)
+    if current_bundle is None:
+        status_slot.info("Draft inputs are ready. Press Run Model to generate the valuation, dashboards, analytics, and exports.")
+        meta_slot.empty()
+    elif draft_is_dirty:
+        status_slot.warning(
+            "Draft inputs changed. The results below still reflect the last completed run. Press Recalculate to refresh the model."
+        )
+        meta = _current_result_meta()
+        source = "cache" if meta.get("cache_hit") else "a fresh run"
+        meta_slot.caption(
+            f"Current results were loaded from {source}. The original base computation took {current_bundle.base_duration_seconds:.2f}s."
+        )
+    else:
+        status_slot.success("Results are current with the latest draft inputs.")
+        meta = _current_result_meta()
+        source = "cache" if meta.get("cache_hit") else "a fresh run"
+        meta_slot.caption(
+            f"Current results were loaded from {source}. The original base computation took {current_bundle.base_duration_seconds:.2f}s."
+        )
+
+    with tab_results:
+        if current_bundle is None:
+            st.info("Run Model from the draft controls above to generate the current valuation, statements, schedules, and downloads.")
+        else:
+            if draft_is_dirty:
+                _render_stale_banner(
+                    "These dashboards and downloads still reflect the last completed run. Press Recalculate when you want them refreshed for the latest draft."
+                )
+            _valuation_section(current_bundle.result)
+            _statement_section(current_bundle.result)
+            _charts_section(current_bundle.result)
+            _schedules_section(current_bundle.result)
+            _driver_based_opex_views_section(current_bundle.result)
+            _download_section(current_bundle)
+
+            st.caption(
+                "The sample assumptions mirror the CLI example in "
+                "`brewery_financial_model_all_in_one.py`. Adjust the draft inputs and press Recalculate when you want a new model run."
+            )
+
     with tab_key_analytics:
-        _key_analytics_section(result, inputs)
+        if current_bundle is None:
+            st.info("Run Model first, then generate analytics on demand from the stored result bundle.")
+        else:
+            if draft_is_dirty:
+                _render_stale_banner(
+                    "These analytics still reflect the last completed run. Press Recalculate to refresh the base model, then rerun any lazy analytics you want to update."
+                )
+            _key_analytics_section(current_bundle.result, current_bundle.inputs, current_bundle.signature)
 
     with tab_ai_decision:
-        _ai_decision_making_page(result, inputs, cfg, div)
+        if current_bundle is None:
+            st.info("Run Model first, then use AI Decision Making against the stored result bundle.")
+        else:
+            if draft_is_dirty:
+                _render_stale_banner(
+                    "AI decision-support answers still reflect the last completed run until you press Recalculate."
+                )
+            _ai_decision_making_page(
+                current_bundle.result,
+                current_bundle.inputs,
+                current_bundle.cfg,
+                current_bundle.div,
+            )
 
     with tab_assumptions:
         st.divider()
@@ -2392,6 +2816,7 @@ def main() -> None:
             st.session_state["assump_saved_config"] = config_df.copy()
             st.session_state["assump_work_config"] = config_df.copy()
 
+        st.caption("Core timing, valuation, inflation, and sweep controls are driven by the selectors above; the tables below extend the wider draft state.")
         _assumption_editor("Model config assumptions", "config", config_df)
         _assumption_editor("Dividend assumptions", "dividend", dividend_df)
         st.caption("`direct_cost_per_unit` is derived from direct cost pools. Use `direct_cost_per_unit_override` only for explicit manual overrides.")
