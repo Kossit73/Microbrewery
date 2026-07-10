@@ -9,12 +9,15 @@ full outputs.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from copy import deepcopy
+from dataclasses import dataclass, fields, is_dataclass, replace
+import hashlib
 import io
 import json
+import time
 import urllib.parse
 import urllib.request
-from typing import Tuple
+from typing import Any, Tuple
 
 import numpy as np
 import pandas as pd
@@ -40,6 +43,21 @@ from brewery_financial_model_all_in_one import (
     propagate_sales_plan_monthly,
     write_comprehensive_excel_report,
 )
+
+
+_CURRENT_RESULT_KEY = "microbrewery_current_result_bundle"
+_DRAFT_SIGNATURE_VERSION = "microbrewery-draft-v1"
+
+
+@dataclass
+class StoredModelRun:
+    signature: str
+    cfg: ModelConfig
+    div: DividendPolicy
+    inputs: ModelInputs
+    result: ModelRunResult
+    computed_at: float
+    duration_seconds: float
 
 
 def _inject_app_theme() -> None:
@@ -305,6 +323,93 @@ def _build_professional_excel_output(result) -> bytes:
     final_buffer = io.BytesIO()
     workbook.save(final_buffer)
     return final_buffer.getvalue()
+
+def _normalize_for_signature(value: Any) -> Any:
+    if is_dataclass(value):
+        return {
+            field.name: _normalize_for_signature(getattr(value, field.name))
+            for field in fields(value)
+        }
+    if isinstance(value, pd.DataFrame):
+        return {
+            "columns": [_normalize_for_signature(col) for col in list(value.columns)],
+            "rows": [
+                [_normalize_for_signature(cell) for cell in row]
+                for row in value.itertuples(index=False, name=None)
+            ],
+        }
+    if isinstance(value, pd.Series):
+        return {
+            "name": _normalize_for_signature(value.name),
+            "index": [_normalize_for_signature(item) for item in list(value.index)],
+            "values": [_normalize_for_signature(item) for item in value.tolist()],
+        }
+    if isinstance(value, pd.Index):
+        return [_normalize_for_signature(item) for item in list(value)]
+    if isinstance(value, dict):
+        normalized_items = [
+            {
+                "key": _normalize_for_signature(key),
+                "value": _normalize_for_signature(val),
+            }
+            for key, val in value.items()
+        ]
+        return sorted(
+            normalized_items,
+            key=lambda item: json.dumps(item["key"], sort_keys=True),
+        )
+    if isinstance(value, (list, tuple)):
+        return [_normalize_for_signature(item) for item in value]
+    if isinstance(value, (pd.Timestamp, np.datetime64)):
+        return pd.Timestamp(value).isoformat()
+    if isinstance(value, np.generic):
+        return _normalize_for_signature(value.item())
+    if value is None or value is pd.NaT:
+        return None
+    if isinstance(value, float):
+        return None if not np.isfinite(value) else value
+    if isinstance(value, (bool, int, str)):
+        return value
+    if pd.isna(value):
+        return None
+    return str(value)
+
+
+def _signature_for_payload(version: str, payload: object) -> str:
+    encoded = json.dumps(
+        {
+            "version": version,
+            "payload": _normalize_for_signature(payload),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _build_draft_signature(cfg: ModelConfig, div: DividendPolicy, inputs: ModelInputs) -> str:
+    return _signature_for_payload(
+        _DRAFT_SIGNATURE_VERSION,
+        {"cfg": cfg, "div": div, "inputs": inputs},
+    )
+
+
+def _current_result_bundle() -> StoredModelRun | None:
+    bundle = st.session_state.get(_CURRENT_RESULT_KEY)
+    return bundle if isinstance(bundle, StoredModelRun) else None
+
+
+def _activate_result_bundle(bundle: StoredModelRun) -> None:
+    st.session_state[_CURRENT_RESULT_KEY] = bundle
+
+
+def _draft_is_dirty(draft_signature: str, bundle: StoredModelRun | None) -> bool:
+    return bundle is not None and bundle.signature != draft_signature
+
+
+def _render_stale_banner(message: str) -> None:
+    st.warning(message)
+
 
 def _driver_based_opex_views_section(result: ModelRunResult) -> None:
     """
@@ -2450,6 +2555,7 @@ def main() -> None:
     _inject_app_theme()
     _render_model_hero()
 
+    run_controls = st.container()
     tab_assumptions, tab_results, tab_key_analytics, tab_ai_decision = st.tabs([
         "Core Assumptions",
         "Results",
@@ -2559,7 +2665,7 @@ def main() -> None:
         row = dividend_table_state.iloc[0]
         div = replace(
             div,
-            enabled=bool(row.get("enabled", div.enabled)),
+            enabled=_coerce_bool(row.get("enabled", div.enabled)),
             model=str(row.get("model", div.model)),
             start_month=int(row.get("start_month", div.start_month)),
             minimum_cash_position=float(row.get("minimum_cash_position", div.minimum_cash_position)),
@@ -2569,32 +2675,107 @@ def main() -> None:
     base_inputs = _build_sample_assumptions(cfg, div)
     _sync_model_timeline_state(cfg, base_inputs)
     inputs = _build_inputs_from_state(base_inputs)
-    model = MicrobreweryFinancialModel(cfg, div, inputs)
-    result = model.run()
+    draft_signature = _build_draft_signature(cfg, div, inputs)
 
-    with tab_results:
-        _valuation_section(result)
-        _statement_section(result)
-        _charts_section(result)
-        _schedules_section(result)
-        _driver_based_opex_views_section(result)
-        _download_section(result)
-
-        st.caption(
-            "The sample assumptions mirror the CLI example in "
-            "`brewery_financial_model_all_in_one.py`. Adjust the sliders to "
-            "explore scenarios."
+    current_bundle = _current_result_bundle()
+    run_label = "Run Model" if current_bundle is None else "Recalculate"
+    with run_controls:
+        left_col, right_col = st.columns([3, 1])
+        status_slot = left_col.empty()
+        meta_slot = left_col.empty()
+        run_clicked = right_col.button(
+            run_label,
+            key="brewery_run_model",
+            type="primary",
+            use_container_width=True,
         )
 
+    if run_clicked:
+        with st.spinner("Running microbrewery model..."):
+            started = time.perf_counter()
+            model = MicrobreweryFinancialModel(cfg, div, deepcopy(inputs))
+            result = model.run()
+            current_bundle = StoredModelRun(
+                signature=draft_signature,
+                cfg=cfg,
+                div=div,
+                inputs=model.inputs,
+                result=result,
+                computed_at=time.time(),
+                duration_seconds=time.perf_counter() - started,
+            )
+        _activate_result_bundle(current_bundle)
+
+    draft_is_dirty = _draft_is_dirty(draft_signature, current_bundle)
+    if current_bundle is None:
+        status_slot.info(
+            "Draft inputs are ready. Press Run Model to generate the valuation, dashboards, analytics, and exports."
+        )
+        meta_slot.empty()
+    elif draft_is_dirty:
+        status_slot.warning(
+            "Draft inputs changed. The results below still reflect the last completed run. Press Recalculate to refresh the model."
+        )
+        meta_slot.caption(
+            f"Current results reflect the last completed run, which took {current_bundle.duration_seconds:.2f}s."
+        )
+    else:
+        status_slot.success("Results are current with the latest draft inputs.")
+        meta_slot.caption(
+            f"Latest run completed in {current_bundle.duration_seconds:.2f}s."
+        )
+
+    with tab_results:
+        if current_bundle is None:
+            st.info(
+                "Run Model from the draft controls above to generate the current valuation, statements, schedules, and downloads."
+            )
+        else:
+            if draft_is_dirty:
+                _render_stale_banner(
+                    "These dashboards and downloads still reflect the last completed run. Press Recalculate when you want them refreshed for the latest draft."
+                )
+            _valuation_section(current_bundle.result)
+            _statement_section(current_bundle.result)
+            _charts_section(current_bundle.result)
+            _schedules_section(current_bundle.result)
+            _driver_based_opex_views_section(current_bundle.result)
+            _download_section(current_bundle.result)
+
+            st.caption(
+                "The sample assumptions mirror the CLI example in "
+                "`brewery_financial_model_all_in_one.py`. Adjust the draft inputs and press Recalculate when you want a new model run."
+            )
+
     with tab_key_analytics:
-        _key_analytics_section(result, inputs)
+        if current_bundle is None:
+            st.info("Run Model first, then review the analytics based on the stored result set.")
+        else:
+            if draft_is_dirty:
+                _render_stale_banner(
+                    "These analytics still reflect the last completed run. Press Recalculate to refresh the base model before reviewing updated analytics."
+                )
+            _key_analytics_section(current_bundle.result, current_bundle.inputs)
 
     with tab_ai_decision:
-        _ai_decision_making_page(result, inputs, cfg, div)
+        if current_bundle is None:
+            st.info("Run Model first, then use AI Decision Making against the stored result set.")
+        else:
+            if draft_is_dirty:
+                _render_stale_banner(
+                    "AI decision-support answers still reflect the last completed run until you press Recalculate."
+                )
+            _ai_decision_making_page(
+                current_bundle.result,
+                current_bundle.inputs,
+                current_bundle.cfg,
+                current_bundle.div,
+            )
 
     with tab_assumptions:
         st.divider()
         st.subheader("Detailed Assumption Tables")
+        st.caption("Changes in these tables update the draft only. Save the edits here, then press Recalculate above to refresh the model outputs.")
         capex_df = pd.DataFrame(
             [
                 {
@@ -2733,7 +2914,6 @@ def main() -> None:
         _assumption_editor("CAPEX schedule", "capex", capex_df)
         _assumption_editor("Debt facilities", "debt", debt_df)
         _assumption_editor("Equity injections", "equity", equity_df)
-
 
 # ---------------------------------------------------------------------------
 # Scenario state hooks — called by the parent NumQuants shell to save/restore
