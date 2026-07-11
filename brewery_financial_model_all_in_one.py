@@ -41,6 +41,7 @@ from typing import Dict, Iterable, List, Literal, Optional, Tuple
 import numpy as np
 import pandas as pd
 from finmodel.allocation import allocate_opex_by_drivers
+from finmodel.operations_schedule import plan_brewery_operations
 from finmodel.opex_defaults import build_default_opex_cost_pools
 from finmodel.opex_schemas import OpexCostPool, SKUCostContext
 
@@ -49,6 +50,7 @@ from finmodel.opex_schemas import OpexCostPool, SKUCostContext
 # Utility functions
 # =============================
 RepaymentType = Literal["linear", "annuity", "interest_only_then_linear", "specified"]
+SalesPlanPropagationMode = Literal["manual", "repeat_first_year", "grow_first_year"]
 
 
 def annual_to_monthly_rate(annual_rate: float) -> float:
@@ -206,6 +208,8 @@ class ModelInputs:
     channels: pd.DataFrame
     sales_plan: pd.DataFrame
     sales_plan_frequency: Literal["monthly", "quarterly", "yearly"] = "monthly"
+    sales_plan_propagation_mode: SalesPlanPropagationMode = "manual"
+    sales_plan_propagation_growth_annual: float = 0.0
 
     other_income_items: Optional[List[OtherIncomeItem]] = None
     other_income_monthly: float | pd.Series = 0.0
@@ -216,6 +220,10 @@ class ModelInputs:
     inventory_schedule: Optional[pd.DataFrame] = None
     receivables_schedule: Optional[pd.DataFrame] = None
     payables_schedule: Optional[pd.DataFrame] = None
+    sku_operations: Optional[pd.DataFrame] = None
+    brewhouse_schedule: Optional[pd.DataFrame] = None
+    cellar_schedule: Optional[pd.DataFrame] = None
+    packaging_schedule: Optional[pd.DataFrame] = None
 
     capex_items: Optional[List[CapexItem]] = None
     debt_facilities: Optional[List[DebtFacility]] = None
@@ -231,6 +239,59 @@ class ModelRunResult:
     valuation: Dict[str, float]
     opex_allocation_views: Dict[str, pd.DataFrame]
     supporting_schedules: Dict[str, pd.DataFrame] = field(default_factory=dict)
+
+
+def propagate_sales_plan_monthly(
+    monthly_sales: pd.DataFrame,
+    idx: pd.DatetimeIndex,
+    mode: SalesPlanPropagationMode = "manual",
+    annual_growth_pct: float = 0.0,
+) -> pd.DataFrame:
+    if monthly_sales is None or monthly_sales.empty:
+        return pd.DataFrame(columns=["date", "sku_id", "channel", "units"])
+
+    out = monthly_sales.copy()
+    out["date"] = pd.to_datetime(out.get("date"), errors="coerce")
+    out["units"] = pd.to_numeric(out.get("units", 0.0), errors="coerce").fillna(0.0)
+    out = out.dropna(subset=["date"])
+    out = out[out["date"].isin(idx)].copy()
+    if out.empty or mode == "manual":
+        return out[["date", "sku_id", "channel", "units"]].sort_values(["date", "sku_id", "channel"]).reset_index(drop=True)
+
+    template_year = int(out["date"].dt.year.min())
+    template = out[out["date"].dt.year == template_year].copy()
+    if template.empty:
+        return out[["date", "sku_id", "channel", "units"]].sort_values(["date", "sku_id", "channel"]).reset_index(drop=True)
+
+    template["month_num"] = template["date"].dt.month
+    template = (
+        template.groupby(["sku_id", "channel", "month_num"], dropna=False, as_index=False)["units"]
+        .sum()
+        .sort_values(["sku_id", "channel", "month_num"])
+        .reset_index(drop=True)
+    )
+    template_lookup = template.set_index(["sku_id", "channel", "month_num"])["units"].to_dict()
+    combos = template[["sku_id", "channel"]].drop_duplicates().to_dict("records")
+
+    growth_rate = float(annual_growth_pct)
+    propagated_rows: List[Dict[str, object]] = []
+    for date in idx:
+        year_offset = int(date.year) - template_year
+        if mode == "grow_first_year":
+            growth_factor = (1.0 + growth_rate) ** max(year_offset, 0)
+        else:
+            growth_factor = 1.0
+        for combo in combos:
+            base_units = float(template_lookup.get((combo["sku_id"], combo["channel"], int(date.month)), 0.0))
+            propagated_rows.append(
+                {
+                    "date": date,
+                    "sku_id": combo["sku_id"],
+                    "channel": combo["channel"],
+                    "units": base_units * growth_factor,
+                }
+            )
+    return pd.DataFrame(propagated_rows, columns=["date", "sku_id", "channel", "units"])
 
 
 # =============================
@@ -310,6 +371,12 @@ class MicrobreweryFinancialModel:
             raise ValueError(f"sales_plan has non-numeric units for rows: {bad_sales}")
         if self.inputs.sales_plan_frequency not in {"monthly", "quarterly", "yearly"}:
             raise ValueError("sales_plan_frequency must be one of: monthly, quarterly, yearly")
+        if self.inputs.sales_plan_propagation_mode not in {"manual", "repeat_first_year", "grow_first_year"}:
+            raise ValueError("sales_plan_propagation_mode must be one of: manual, repeat_first_year, grow_first_year")
+        growth_pct = pd.to_numeric(self.inputs.sales_plan_propagation_growth_annual, errors="coerce")
+        if pd.isna(growth_pct):
+            raise ValueError("sales_plan_propagation_growth_annual must be numeric")
+        self.inputs.sales_plan_propagation_growth_annual = float(growth_pct)
 
         # Keep normalized copies
         self.inputs.skus = skus
@@ -336,6 +403,14 @@ class MicrobreweryFinancialModel:
             self.inputs.receivables_schedule = pd.DataFrame()
         if self.inputs.payables_schedule is None:
             self.inputs.payables_schedule = pd.DataFrame()
+        if self.inputs.sku_operations is None:
+            self.inputs.sku_operations = pd.DataFrame()
+        if self.inputs.brewhouse_schedule is None:
+            self.inputs.brewhouse_schedule = pd.DataFrame()
+        if self.inputs.cellar_schedule is None:
+            self.inputs.cellar_schedule = pd.DataFrame()
+        if self.inputs.packaging_schedule is None:
+            self.inputs.packaging_schedule = pd.DataFrame()
 
     def _other_income_series(self, idx: pd.DatetimeIndex) -> pd.Series:
         if self.inputs.other_income_items:
@@ -650,26 +725,33 @@ class MicrobreweryFinancialModel:
         sales = sales.dropna(subset=["date"])
         freq = self.inputs.sales_plan_frequency
         if freq == "monthly":
-            return sales
+            monthly = sales
+        else:
+            rows: List[Dict[str, object]] = []
+            for _, r in sales.iterrows():
+                date = pd.to_datetime(r["date"], errors="coerce")
+                if pd.isna(date):
+                    continue
+                if freq == "quarterly":
+                    start = date.to_period("Q").start_time
+                    months = pd.date_range(start=start, periods=3, freq="MS")
+                else:
+                    start = date.to_period("Y").start_time
+                    months = pd.date_range(start=start, periods=12, freq="MS")
+                months = [m for m in months if m in set(idx)]
+                if not months:
+                    continue
+                portion = float(r["units"]) / len(months)
+                for m in months:
+                    rows.append({"date": m, "sku_id": r["sku_id"], "channel": r["channel"], "units": portion})
+            monthly = pd.DataFrame(rows, columns=["date", "sku_id", "channel", "units"])
 
-        rows: List[Dict[str, object]] = []
-        for _, r in sales.iterrows():
-            date = pd.to_datetime(r["date"], errors="coerce")
-            if pd.isna(date):
-                continue
-            if freq == "quarterly":
-                start = date.to_period("Q").start_time
-                months = pd.date_range(start=start, periods=3, freq="MS")
-            else:
-                start = date.to_period("Y").start_time
-                months = pd.date_range(start=start, periods=12, freq="MS")
-            months = [m for m in months if m in set(idx)]
-            if not months:
-                continue
-            portion = float(r["units"]) / len(months)
-            for m in months:
-                rows.append({"date": m, "sku_id": r["sku_id"], "channel": r["channel"], "units": portion})
-        return pd.DataFrame(rows, columns=["date", "sku_id", "channel", "units"])
+        return propagate_sales_plan_monthly(
+            monthly,
+            idx,
+            mode=self.inputs.sales_plan_propagation_mode,
+            annual_growth_pct=self.inputs.sales_plan_propagation_growth_annual,
+        )
 
     def _units_matrix(self, idx: pd.DatetimeIndex) -> pd.DataFrame:
         """
@@ -697,6 +779,24 @@ class MicrobreweryFinancialModel:
             .fillna(0.0)
         )
         return wide.sort_index(axis=1)
+
+    def _scale_channel_units_to_sku_totals(
+        self,
+        demand_units_wide: pd.DataFrame,
+        actual_units_by_sku: pd.DataFrame,
+    ) -> pd.DataFrame:
+        if demand_units_wide.empty:
+            return demand_units_wide.copy()
+        out = demand_units_wide.copy().astype(float)
+        demand_sku = out.T.groupby(level=0).sum().T.reindex(out.index).fillna(0.0)
+        actual_sku = actual_units_by_sku.reindex(index=out.index, columns=demand_sku.columns, fill_value=0.0)
+        ratios = actual_sku.div(demand_sku.replace(0.0, np.nan)).fillna(0.0)
+        for sku_id in demand_sku.columns:
+            if sku_id not in out.columns.get_level_values(0):
+                continue
+            sku_slice = out.xs(sku_id, axis=1, level=0, drop_level=False)
+            out.loc[:, sku_slice.columns] = sku_slice.mul(ratios[sku_id], axis=0).to_numpy()
+        return out.sort_index(axis=1)
 
     def _estimated_revenue_wide_from_units(self, idx: pd.DatetimeIndex, units_wide: pd.DataFrame) -> pd.DataFrame:
         if units_wide.empty:
@@ -1255,11 +1355,32 @@ class MicrobreweryFinancialModel:
         # Inflation indices
         cost_idx = self._inflation_index(self.cfg.cost_inflation_annual, idx)
 
-        # Units, prices, revenue
-        units_wide = self._units_matrix(idx)
+        # Units, operations, prices, revenue
+        demand_units_wide = self._units_matrix(idx)
+        liters_per_unit = self.inputs.skus.set_index("sku_id")["name"].map(self._liters_per_unit_from_name)
+        operations_plan = plan_brewery_operations(
+            idx=idx,
+            demand_units_wide=demand_units_wide,
+            skus=self.inputs.skus,
+            liters_per_unit=liters_per_unit,
+            sku_operations=self.inputs.sku_operations,
+            brewhouse_schedule=self.inputs.brewhouse_schedule,
+            cellar_schedule=self.inputs.cellar_schedule,
+            packaging_schedule=self.inputs.packaging_schedule,
+        )
+        units_wide = self._scale_channel_units_to_sku_totals(
+            demand_units_wide,
+            operations_plan.shipment_units_by_sku,
+        )
+        production_units_wide = self._scale_channel_units_to_sku_totals(
+            demand_units_wide,
+            operations_plan.production_units_by_sku,
+        )
         prices_wide = self._prices_matrix(idx, units_wide)
         if isinstance(units_wide.columns, pd.MultiIndex):
             units_wide.columns = units_wide.columns.set_names(["sku_id", "channel"])
+        if isinstance(production_units_wide.columns, pd.MultiIndex):
+            production_units_wide.columns = production_units_wide.columns.set_names(["sku_id", "channel"])
         if isinstance(prices_wide.columns, pd.MultiIndex):
             prices_wide.columns = prices_wide.columns.set_names(["sku_id", "channel"])
 
@@ -1276,12 +1397,13 @@ class MicrobreweryFinancialModel:
 
         # Direct costs
         skus = self.inputs.skus.set_index("sku_id")
+        production_basis_wide = production_units_wide if not production_units_wide.empty else units_wide
         derived_direct_cost_per_unit = self._derived_direct_cost_per_unit_by_sku(
             idx,
-            units_wide,
+            production_basis_wide,
             include_scheduled_labor=False,
         )
-        if units_wide.empty:
+        if production_basis_wide.empty:
             direct_material_costs = pd.Series(0.0, index=idx, name="direct_material_costs")
         else:
             cost_cols = []
@@ -1296,12 +1418,12 @@ class MicrobreweryFinancialModel:
                 index=idx,
                 columns=pd.MultiIndex.from_tuples(cost_cols, names=["sku_id", "channel"]),
             ).sort_index(axis=1)
-            direct_costs_wide = units_wide.mul(costs_wide, fill_value=0.0)
+            direct_costs_wide = production_basis_wide.mul(costs_wide, fill_value=0.0)
             direct_material_costs = direct_costs_wide.sum(axis=1).rename("direct_material_costs")
 
         direct_labor_alloc, direct_labor_summary = self._labor_schedule_monthly(
             idx,
-            units_wide,
+            production_basis_wide,
             self.inputs.direct_labor_schedule,
         )
         direct_labor_cost = direct_labor_summary["labor_cost"].rename("direct_labor_cost")
@@ -1365,6 +1487,10 @@ class MicrobreweryFinancialModel:
         other_current_liabilities = (
             direct_material_costs * float(self.cfg.other_current_liabilities_pct_direct_costs)
         ).rename("other_current_liabilities")
+        inventory_stage_cols = [
+            c for c in inventory_details.columns
+            if c.startswith("inventory_") and c not in {"inventory", "inventory_reserve"}
+        ]
         net_working_capital = (
             receivables + inventory + other_current_assets - payables - other_current_liabilities
         ).rename("net_working_capital")
@@ -1380,6 +1506,10 @@ class MicrobreweryFinancialModel:
                 "net_working_capital": net_working_capital,
             },
             index=idx,
+        ).join(
+            inventory_details.reindex(columns=inventory_stage_cols, fill_value=0.0)
+            if inventory_stage_cols
+            else pd.DataFrame(index=idx)
         )
 
         # Debt schedules
@@ -1591,6 +1721,17 @@ class MicrobreweryFinancialModel:
                 "capacity_liters": direct_labor_summary["capacity_liters"],
                 "capacity_shortfall_liters": direct_labor_summary["capacity_shortfall_liters"],
                 "temporary_labor_cost": direct_labor_summary["temporary_labor_cost"],
+                "shipment_demand_liters": operations_plan.monthly_summary.get("demand_liters", pd.Series(0.0, index=idx)),
+                "production_target_packaged_liters": operations_plan.monthly_summary.get("required_packaged_liters", pd.Series(0.0, index=idx)),
+                "actual_packaged_liters": operations_plan.monthly_summary.get("actual_packaged_liters", pd.Series(0.0, index=idx)),
+                "actual_shipped_liters": operations_plan.monthly_summary.get("actual_shipped_liters", pd.Series(0.0, index=idx)),
+                "ops_ending_fg_liters": operations_plan.monthly_summary.get("ending_fg_liters", pd.Series(0.0, index=idx)),
+                "unmet_demand_liters": operations_plan.monthly_summary.get("unmet_demand_liters", pd.Series(0.0, index=idx)),
+                "brewhouse_capacity_liters": operations_plan.monthly_summary.get("brewhouse_capacity_liters", pd.Series(0.0, index=idx)),
+                "cellar_capacity_liters": operations_plan.monthly_summary.get("cellar_capacity_liters", pd.Series(0.0, index=idx)),
+                "packaging_capacity_liters": operations_plan.monthly_summary.get("packaging_capacity_liters", pd.Series(0.0, index=idx)),
+                "operations_capacity_scale": operations_plan.monthly_summary.get("capacity_scale", pd.Series(1.0, index=idx)),
+                "fg_target_gap_liters": operations_plan.monthly_summary.get("fg_target_gap_liters", pd.Series(0.0, index=idx)),
                 "debt_service": debt_service,
                 "dscr": dscr,
                 "interest_coverage": interest_coverage,
@@ -1644,11 +1785,17 @@ class MicrobreweryFinancialModel:
             "net_change_in_cash",
             "debt_service",
             "fcff",
+            "shipment_demand_liters",
+            "production_target_packaged_liters",
+            "actual_packaged_liters",
+            "actual_shipped_liters",
+            "unmet_demand_liters",
         ]
         stock_cols = [
             "receivables",
             "inventory",
             "inventory_reserve",
+            *inventory_stage_cols,
             "other_current_assets",
             "payables",
             "other_current_liabilities",
@@ -1669,6 +1816,12 @@ class MicrobreweryFinancialModel:
             "required_liters",
             "capacity_liters",
             "capacity_shortfall_liters",
+            "ops_ending_fg_liters",
+            "brewhouse_capacity_liters",
+            "cellar_capacity_liters",
+            "packaging_capacity_liters",
+            "operations_capacity_scale",
+            "fg_target_gap_liters",
             "dscr",
             "interest_coverage",
             "leverage_ratio",
@@ -1692,6 +1845,9 @@ class MicrobreweryFinancialModel:
             "payables_detail": payables_details,
             "direct_labor_detail": direct_labor_summary,
             "indirect_labor_detail": indirect_labor_summary,
+            "operations_summary": operations_plan.monthly_summary,
+            "operations_by_sku": operations_plan.sku_schedule,
+            "operations_resources": operations_plan.resource_schedule,
         }
 
         return ModelRunResult(
