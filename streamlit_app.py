@@ -51,6 +51,9 @@ _ANALYSIS_CACHE_KEY = "microbrewery_analysis_cache"
 _ANALYSIS_STATE_KEY = "microbrewery_analysis_state"
 _EXPORT_CACHE_KEY = "microbrewery_export_cache"
 _EXPORT_STATE_KEY = "microbrewery_export_state"
+_RUNTIME_DRAFT_SIGNATURE_KEY = "microbrewery_draft_signature"
+_RUNTIME_LAST_RUN_SIGNATURE_KEY = "microbrewery_last_run_signature"
+_RUNTIME_RESULTS_STALE_KEY = "microbrewery_results_stale"
 
 _DRAFT_SIGNATURE_VERSION = "microbrewery-draft-v1"
 _ANALYTICS_SIGNATURE_VERSION = "microbrewery-analytics-v1"
@@ -445,6 +448,18 @@ def _activate_result_bundle(bundle: ComputedResultBundle, *, cache_hit: bool) ->
 
 def _draft_is_dirty(draft_signature: str, bundle: ComputedResultBundle | None) -> bool:
     return bundle is not None and bundle.signature != draft_signature
+
+
+def _sync_runtime_state(draft_signature: str, bundle: ComputedResultBundle | None) -> bool:
+    """Mirror the manual run-state contract into session_state for the shell."""
+    dirty = bundle is None or bundle.signature != draft_signature
+    st.session_state[_RUNTIME_DRAFT_SIGNATURE_KEY] = draft_signature
+    st.session_state[_RUNTIME_RESULTS_STALE_KEY] = dirty
+    if bundle is None:
+        st.session_state.pop(_RUNTIME_LAST_RUN_SIGNATURE_KEY, None)
+    else:
+        st.session_state[_RUNTIME_LAST_RUN_SIGNATURE_KEY] = bundle.signature
+    return dirty
 
 
 def _get_or_create_result_bundle(
@@ -2648,7 +2663,7 @@ def main() -> None:
         _activate_result_bundle(bundle, cache_hit=cache_hit)
         current_bundle = bundle
 
-    draft_is_dirty = _draft_is_dirty(draft_signature, current_bundle)
+    draft_is_dirty = _sync_runtime_state(draft_signature, current_bundle)
     if current_bundle is None:
         status_slot.info("Draft inputs are ready. Press Run Model to generate the valuation, dashboards, analytics, and exports.")
         meta_slot.empty()

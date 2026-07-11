@@ -1,16 +1,20 @@
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pandas as pd
 
 from brewery_financial_model_all_in_one import DividendPolicy, ModelConfig
 from streamlit_app import (
+    ComputedResultBundle,
     LazyArtifactBundle,
     _build_draft_signature,
     _build_sample_assumptions,
     _compute_monte_carlo_payload,
     _compute_predictive_payload,
     _lazy_artifact_is_stale,
+    _sync_runtime_state,
 )
+import streamlit_app
 
 
 def test_build_draft_signature_is_stable_for_equal_drafts_and_changes_with_inputs():
@@ -70,3 +74,33 @@ def test_compute_predictive_payload_projects_linear_revenue_trend():
     assert payload["message"] is None
     assert list(table.columns) == ["actual_revenue", "prediction_step_2"]
     assert table["prediction_step_2"].tolist() == [30.0, 40.0, 50.0]
+
+def test_sync_runtime_state_marks_missing_run_as_stale(monkeypatch):
+    monkeypatch.setattr(streamlit_app, "st", SimpleNamespace(session_state={}))
+
+    dirty = _sync_runtime_state("draft-v1", None)
+
+    assert dirty is True
+    assert streamlit_app.st.session_state["microbrewery_draft_signature"] == "draft-v1"
+    assert streamlit_app.st.session_state["microbrewery_results_stale"] is True
+    assert "microbrewery_last_run_signature" not in streamlit_app.st.session_state
+
+
+
+def test_sync_runtime_state_marks_matching_run_as_current(monkeypatch):
+    monkeypatch.setattr(streamlit_app, "st", SimpleNamespace(session_state={}))
+    bundle = ComputedResultBundle(
+        signature="draft-v1",
+        cfg=ModelConfig(),
+        div=DividendPolicy(),
+        inputs=_build_sample_assumptions(ModelConfig(), DividendPolicy()),
+        result=None,
+        computed_at=0.0,
+        base_duration_seconds=0.25,
+    )
+
+    dirty = _sync_runtime_state("draft-v1", bundle)
+
+    assert dirty is False
+    assert streamlit_app.st.session_state["microbrewery_last_run_signature"] == "draft-v1"
+    assert streamlit_app.st.session_state["microbrewery_results_stale"] is False
