@@ -59,6 +59,56 @@ _DRAFT_SIGNATURE_VERSION = "microbrewery-draft-v1"
 _ANALYTICS_SIGNATURE_VERSION = "microbrewery-analytics-v1"
 _EXPORT_SIGNATURE_VERSION = "microbrewery-export-v1"
 
+_START_YEAR_KEY = "assump_start_year"
+_END_YEAR_KEY = "assump_end_year"
+_WACC_KEY = "assump_wacc_annual"
+_EXIT_MULTIPLE_KEY = "assump_exit_ev_ebitda_multiple"
+_PRICE_INFLATION_KEY = "assump_price_inflation_annual"
+_COST_INFLATION_KEY = "assump_cost_inflation_annual"
+_DIVIDEND_START_KEY = "assump_dividend_start_month"
+_MIN_CASH_KEY = "assump_minimum_cash_for_sweep"
+
+_START_YEAR_OPTIONS = list(range(2025, 2036))
+_END_YEAR_MAX = 2040
+_WACC_OPTIONS = [round(x, 3) for x in np.arange(0.050, 0.205, 0.005)]
+_EXIT_MULTIPLE_OPTIONS = [round(x, 1) for x in np.arange(4.0, 12.5, 0.5)]
+_INFLATION_OPTIONS = [round(x, 4) for x in np.arange(0.0, 0.0501, 0.0025)]
+_MIN_CASH_OPTIONS = [
+    0.0,
+    250_000.0,
+    500_000.0,
+    1_000_000.0,
+    1_500_000.0,
+    2_000_000.0,
+    2_500_000.0,
+    3_000_000.0,
+]
+_SALES_PLAN_FREQUENCY_LABELS = {
+    "monthly": "Monthly",
+    "quarterly": "Quarterly",
+    "yearly": "Yearly",
+}
+_CORE_CONTROL_STATE_KEYS = [
+    _START_YEAR_KEY,
+    _END_YEAR_KEY,
+    _WACC_KEY,
+    _EXIT_MULTIPLE_KEY,
+    _PRICE_INFLATION_KEY,
+    _COST_INFLATION_KEY,
+    _DIVIDEND_START_KEY,
+    _MIN_CASH_KEY,
+]
+_RUNTIME_RESET_KEYS = [
+    _CURRENT_RESULT_KEY,
+    _CURRENT_RESULT_META_KEY,
+    _ANALYSIS_STATE_KEY,
+    _EXPORT_STATE_KEY,
+    _RUNTIME_DRAFT_SIGNATURE_KEY,
+    _RUNTIME_LAST_RUN_SIGNATURE_KEY,
+    _RUNTIME_RESULTS_STALE_KEY,
+    "assump_timeline_signature",
+]
+
 
 @dataclass
 class ComputedResultBundle:
@@ -460,6 +510,152 @@ def _sync_runtime_state(draft_signature: str, bundle: ComputedResultBundle | Non
     else:
         st.session_state[_RUNTIME_LAST_RUN_SIGNATURE_KEY] = bundle.signature
     return dirty
+
+
+def _copy_state_value(value: object) -> object:
+    if isinstance(value, pd.DataFrame):
+        return value.copy(deep=True)
+    return deepcopy(value)
+
+
+def _nearest_option(value: object, options: list[float | int], fallback: float | int) -> float | int:
+    if not options:
+        return fallback
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return fallback
+    return min(options, key=lambda option: abs(float(option) - float(numeric)))
+
+
+def _saved_config_row(state: dict[str, object]) -> pd.Series | None:
+    config_df = state.get("assump_data_config")
+    if isinstance(config_df, pd.DataFrame) and not config_df.empty:
+        return config_df.iloc[0]
+    return None
+
+
+def _saved_dividend_row(state: dict[str, object]) -> pd.Series | None:
+    dividend_df = state.get("assump_data_dividend")
+    if isinstance(dividend_df, pd.DataFrame) and not dividend_df.empty:
+        return dividend_df.iloc[0]
+    return None
+
+
+def _restore_core_control_state(state: dict[str, object]) -> None:
+    config_row = _saved_config_row(state)
+    start_year = _START_YEAR_OPTIONS[0]
+    end_year = min(start_year + 9, _END_YEAR_MAX)
+    wacc = _WACC_OPTIONS[14]
+    exit_multiple = _EXIT_MULTIPLE_OPTIONS[8]
+    price_inflation = _INFLATION_OPTIONS[6]
+    cost_inflation = _INFLATION_OPTIONS[6]
+
+    if config_row is not None:
+        start_date = pd.to_datetime(config_row.get("start_date"), errors="coerce")
+        months_value = pd.to_numeric(pd.Series([config_row.get("months")]), errors="coerce").iloc[0]
+        if pd.notna(start_date):
+            start_year = int(start_date.year)
+        if pd.notna(months_value):
+            span_years = max(int(np.ceil(float(months_value) / 12.0)), 1)
+            end_year = start_year + span_years - 1
+        wacc = float(_nearest_option(config_row.get("wacc_annual"), _WACC_OPTIONS, wacc))
+        exit_multiple = float(
+            _nearest_option(config_row.get("exit_ev_ebitda_multiple"), _EXIT_MULTIPLE_OPTIONS, exit_multiple)
+        )
+        price_inflation = float(
+            _nearest_option(config_row.get("price_inflation_annual"), _INFLATION_OPTIONS, price_inflation)
+        )
+        cost_inflation = float(
+            _nearest_option(config_row.get("cost_inflation_annual"), _INFLATION_OPTIONS, cost_inflation)
+        )
+
+    start_year = int(_nearest_option(state.get(_START_YEAR_KEY, start_year), _START_YEAR_OPTIONS, start_year))
+    end_year_options = list(range(start_year, _END_YEAR_MAX + 1))
+    end_year_fallback = min(max(end_year, start_year), _END_YEAR_MAX)
+    end_year = int(_nearest_option(state.get(_END_YEAR_KEY, end_year), end_year_options, end_year_fallback))
+
+    dividend_row = _saved_dividend_row(state)
+    dividend_start = 60
+    min_cash = _MIN_CASH_OPTIONS[4]
+    if dividend_row is not None:
+        dividend_start_value = pd.to_numeric(pd.Series([dividend_row.get("start_month")]), errors="coerce").iloc[0]
+        if pd.notna(dividend_start_value):
+            dividend_start = int(dividend_start_value)
+        min_cash = float(
+            _nearest_option(dividend_row.get("minimum_cash_position"), _MIN_CASH_OPTIONS, min_cash)
+        )
+
+    st.session_state[_START_YEAR_KEY] = start_year
+    st.session_state[_END_YEAR_KEY] = end_year
+    st.session_state[_WACC_KEY] = float(_nearest_option(state.get(_WACC_KEY, wacc), _WACC_OPTIONS, wacc))
+    st.session_state[_EXIT_MULTIPLE_KEY] = float(
+        _nearest_option(state.get(_EXIT_MULTIPLE_KEY, exit_multiple), _EXIT_MULTIPLE_OPTIONS, exit_multiple)
+    )
+    st.session_state[_PRICE_INFLATION_KEY] = float(
+        _nearest_option(state.get(_PRICE_INFLATION_KEY, price_inflation), _INFLATION_OPTIONS, price_inflation)
+    )
+    st.session_state[_COST_INFLATION_KEY] = float(
+        _nearest_option(state.get(_COST_INFLATION_KEY, cost_inflation), _INFLATION_OPTIONS, cost_inflation)
+    )
+    dividend_start_value = pd.to_numeric(
+        pd.Series([state.get(_DIVIDEND_START_KEY, dividend_start)]),
+        errors="coerce",
+    ).iloc[0]
+    if pd.isna(dividend_start_value):
+        dividend_start_value = dividend_start
+    st.session_state[_DIVIDEND_START_KEY] = max(int(dividend_start_value), 0)
+    st.session_state[_MIN_CASH_KEY] = float(
+        _nearest_option(state.get(_MIN_CASH_KEY, min_cash), _MIN_CASH_OPTIONS, min_cash)
+    )
+
+
+def _sync_loaded_editor_state() -> None:
+    for suffix in [
+        "skus",
+        "channels",
+        "cost_pools",
+        "direct_labor",
+        "indirect_labor",
+        "receivables",
+        "inventory",
+        "payables",
+        "other_income",
+        "capex",
+        "debt",
+        "equity",
+        "config",
+        "dividend",
+    ]:
+        data_key = f"assump_data_{suffix}"
+        saved_key = f"assump_saved_{suffix}"
+        work_key = f"assump_work_{suffix}"
+        edit_key = f"assump_edit_{suffix}"
+        inc_key = f"assump_inc_{suffix}"
+        current = st.session_state.get(data_key)
+        if isinstance(current, pd.DataFrame):
+            st.session_state[saved_key] = current.copy(deep=True)
+            st.session_state[work_key] = current.copy(deep=True)
+        else:
+            st.session_state.pop(saved_key, None)
+            st.session_state.pop(work_key, None)
+        st.session_state[edit_key] = False
+        st.session_state[inc_key] = 0.0
+
+
+def _reset_loaded_runtime_state() -> None:
+    for key in _RUNTIME_RESET_KEYS:
+        st.session_state.pop(key, None)
+    for key in (
+        "assump_data_sales_plan",
+        "assump_saved_sales_plan",
+        "assump_work_sales_plan",
+    ):
+        st.session_state.pop(key, None)
+    st.session_state["assump_edit_sales_plan"] = False
+    st.session_state["assump_inc_sales_plan"] = 0.0
+    for key in list(st.session_state.keys()):
+        if key.startswith("field_") or key.startswith("assump_row_select_") or key.startswith("input_inc_"):
+            st.session_state.pop(key, None)
 
 
 def _get_or_create_result_bundle(
@@ -2539,58 +2735,126 @@ def main() -> None:
     with tab_assumptions:
         st.subheader("Core assumptions")
         c1, c2 = st.columns(2)
+        if _START_YEAR_KEY not in st.session_state:
+            st.session_state[_START_YEAR_KEY] = _START_YEAR_OPTIONS[0]
+        st.session_state[_START_YEAR_KEY] = int(
+            _nearest_option(st.session_state[_START_YEAR_KEY], _START_YEAR_OPTIONS, _START_YEAR_OPTIONS[0])
+        )
         start_year = c1.selectbox(
             "Start year",
-            options=list(range(2025, 2036)),
-            index=0,
+            options=_START_YEAR_OPTIONS,
+            index=_START_YEAR_OPTIONS.index(int(st.session_state[_START_YEAR_KEY])),
+            key=_START_YEAR_KEY,
+        )
+        end_year_options = list(range(int(start_year), _END_YEAR_MAX + 1))
+        default_end_year = min(int(start_year) + 9, _END_YEAR_MAX)
+        if _END_YEAR_KEY not in st.session_state:
+            st.session_state[_END_YEAR_KEY] = default_end_year
+        st.session_state[_END_YEAR_KEY] = int(
+            _nearest_option(st.session_state[_END_YEAR_KEY], end_year_options, default_end_year)
         )
         end_year = c2.selectbox(
             "End year",
-            options=list(range(int(start_year), 2041)),
-            index=min(9, len(list(range(int(start_year), 2041))) - 1),
+            options=end_year_options,
+            index=end_year_options.index(int(st.session_state[_END_YEAR_KEY])),
+            key=_END_YEAR_KEY,
         )
         years = int(end_year) - int(start_year) + 1
         months = years * 12
         st.caption(f"Projection length: {years} years ({months} months)")
 
         c3, c4 = st.columns(2)
+        if _WACC_KEY not in st.session_state:
+            st.session_state[_WACC_KEY] = _WACC_OPTIONS[14]
+        st.session_state[_WACC_KEY] = float(
+            _nearest_option(st.session_state[_WACC_KEY], _WACC_OPTIONS, _WACC_OPTIONS[14])
+        )
         wacc = c3.selectbox(
             "WACC (annual)",
-            options=[round(x, 3) for x in np.arange(0.050, 0.205, 0.005)],
-            index=14,
+            options=_WACC_OPTIONS,
+            index=_WACC_OPTIONS.index(float(st.session_state[_WACC_KEY])),
             format_func=lambda x: f"{x:.3f}",
+            key=_WACC_KEY,
+        )
+        if _EXIT_MULTIPLE_KEY not in st.session_state:
+            st.session_state[_EXIT_MULTIPLE_KEY] = _EXIT_MULTIPLE_OPTIONS[8]
+        st.session_state[_EXIT_MULTIPLE_KEY] = float(
+            _nearest_option(
+                st.session_state[_EXIT_MULTIPLE_KEY],
+                _EXIT_MULTIPLE_OPTIONS,
+                _EXIT_MULTIPLE_OPTIONS[8],
+            )
         )
         exit_multiple = c4.selectbox(
             "Exit EV/EBITDA multiple",
-            options=[round(x, 1) for x in np.arange(4.0, 12.5, 0.5)],
-            index=8,
+            options=_EXIT_MULTIPLE_OPTIONS,
+            index=_EXIT_MULTIPLE_OPTIONS.index(float(st.session_state[_EXIT_MULTIPLE_KEY])),
             format_func=lambda x: f"{x:.1f}x",
+            key=_EXIT_MULTIPLE_KEY,
         )
         c5, c6 = st.columns(2)
+        if _PRICE_INFLATION_KEY not in st.session_state:
+            st.session_state[_PRICE_INFLATION_KEY] = _INFLATION_OPTIONS[6]
+        st.session_state[_PRICE_INFLATION_KEY] = float(
+            _nearest_option(
+                st.session_state[_PRICE_INFLATION_KEY],
+                _INFLATION_OPTIONS,
+                _INFLATION_OPTIONS[6],
+            )
+        )
         price_inflation = c5.selectbox(
             "Price inflation (annual)",
-            options=[round(x, 4) for x in np.arange(0.0, 0.0501, 0.0025)],
-            index=6,
+            options=_INFLATION_OPTIONS,
+            index=_INFLATION_OPTIONS.index(float(st.session_state[_PRICE_INFLATION_KEY])),
             format_func=lambda x: f"{x:.2%}",
+            key=_PRICE_INFLATION_KEY,
+        )
+        if _COST_INFLATION_KEY not in st.session_state:
+            st.session_state[_COST_INFLATION_KEY] = _INFLATION_OPTIONS[6]
+        st.session_state[_COST_INFLATION_KEY] = float(
+            _nearest_option(
+                st.session_state[_COST_INFLATION_KEY],
+                _INFLATION_OPTIONS,
+                _INFLATION_OPTIONS[6],
+            )
         )
         cost_inflation = c6.selectbox(
             "Cost inflation (annual)",
-            options=[round(x, 4) for x in np.arange(0.0, 0.0501, 0.0025)],
-            index=6,
+            options=_INFLATION_OPTIONS,
+            index=_INFLATION_OPTIONS.index(float(st.session_state[_COST_INFLATION_KEY])),
             format_func=lambda x: f"{x:.2%}",
+            key=_COST_INFLATION_KEY,
         )
 
         c7, c8 = st.columns(2)
+        dividend_options = list(range(0, int(months)))
+        default_dividend_start = min(60, int(months) - 1)
+        if _DIVIDEND_START_KEY not in st.session_state:
+            st.session_state[_DIVIDEND_START_KEY] = default_dividend_start
+        st.session_state[_DIVIDEND_START_KEY] = int(
+            _nearest_option(
+                st.session_state[_DIVIDEND_START_KEY],
+                dividend_options,
+                default_dividend_start,
+            )
+        )
         dividend_start = c7.selectbox(
             "Dividend start month",
-            options=list(range(0, int(months))),
-            index=min(60, int(months) - 1),
+            options=dividend_options,
+            index=dividend_options.index(int(st.session_state[_DIVIDEND_START_KEY])),
+            key=_DIVIDEND_START_KEY,
+        )
+        if _MIN_CASH_KEY not in st.session_state:
+            st.session_state[_MIN_CASH_KEY] = _MIN_CASH_OPTIONS[4]
+        st.session_state[_MIN_CASH_KEY] = float(
+            _nearest_option(st.session_state[_MIN_CASH_KEY], _MIN_CASH_OPTIONS, _MIN_CASH_OPTIONS[4])
         )
         min_cash = c8.selectbox(
             "Minimum cash for sweep",
-            options=[0.0, 250_000.0, 500_000.0, 1_000_000.0, 1_500_000.0, 2_000_000.0, 2_500_000.0, 3_000_000.0],
-            index=4,
+            options=_MIN_CASH_OPTIONS,
+            index=_MIN_CASH_OPTIONS.index(float(st.session_state[_MIN_CASH_KEY])),
             format_func=lambda x: f"${x:,.0f}",
+            key=_MIN_CASH_KEY,
         )
 
     cfg = ModelConfig(
@@ -2877,17 +3141,17 @@ _STATE_KEYS = [
     "assump_data_equity",
     "assump_data_config",
     "assump_data_dividend",
+    *_CORE_CONTROL_STATE_KEYS,
 ]
 
 
 def get_state() -> dict:
-    """Return a snapshot of all user-editable assumption tables.
+    """Return a snapshot of the saved-case assumptions and top-level controls.
 
     DataFrames are kept as-is; the parent app's serialisation layer converts
     them to JSON-safe records before writing to the database.
     """
-    import streamlit as _st
-    return {k: _st.session_state[k] for k in _STATE_KEYS if k in _st.session_state}
+    return {k: _copy_state_value(st.session_state[k]) for k in _STATE_KEYS if k in st.session_state}
 
 
 def set_state(state: dict) -> None:
@@ -2896,10 +3160,23 @@ def set_state(state: dict) -> None:
     Must be called *before* main() so that widget initial values are picked up
     on the first render of each assumption editor.
     """
-    import streamlit as _st
-    for k, v in state.items():
-        if k in _STATE_KEYS:
-            _st.session_state[k] = v
+    for key in _STATE_KEYS:
+        if key in state:
+            st.session_state[key] = _copy_state_value(state[key])
+        else:
+            st.session_state.pop(key, None)
+
+    _restore_core_control_state(state)
+    _sync_loaded_editor_state()
+
+    frequency = str(st.session_state.get("assump_sales_plan_frequency", "monthly"))
+    if frequency not in _SALES_PLAN_FREQUENCY_LABELS:
+        frequency = "monthly"
+    st.session_state["assump_sales_plan_frequency"] = frequency
+    st.session_state["assump_prev_sales_plan_frequency"] = frequency
+    st.session_state["assump_sales_plan_frequency_selector"] = _SALES_PLAN_FREQUENCY_LABELS[frequency]
+
+    _reset_loaded_runtime_state()
 
 
 if __name__ == "__main__":
