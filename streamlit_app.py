@@ -9,11 +9,14 @@ full outputs.
 
 from __future__ import annotations
 
+import base64
 from copy import deepcopy
 from dataclasses import dataclass, fields, is_dataclass, replace
+from functools import lru_cache
 import hashlib
 import io
 import json
+from pathlib import Path
 import time
 import urllib.parse
 import urllib.request
@@ -58,6 +61,7 @@ _RUNTIME_RESULTS_STALE_KEY = "microbrewery_results_stale"
 _DRAFT_SIGNATURE_VERSION = "microbrewery-draft-v1"
 _ANALYTICS_SIGNATURE_VERSION = "microbrewery-analytics-v1"
 _EXPORT_SIGNATURE_VERSION = "microbrewery-export-v1"
+_HERO_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "microbrewery.png"
 
 _START_YEAR_KEY = "assump_start_year"
 _END_YEAR_KEY = "assump_end_year"
@@ -156,9 +160,11 @@ def _inject_app_theme() -> None:
         }
         .designer-hero {
             position: relative;
+            display: grid;
+            grid-template-columns: minmax(0, 1.7fr) minmax(320px, 0.8fr);
             overflow: hidden;
             margin: 0 0 1.2rem 0;
-            padding: 1.7rem 1.8rem;
+            min-height: 19rem;
             border: 1px solid rgba(143, 61, 34, 0.14);
             border-radius: 28px;
             background:
@@ -166,14 +172,45 @@ def _inject_app_theme() -> None:
                 linear-gradient(135deg, rgba(143, 61, 34, 0.06), rgba(23, 76, 67, 0.08));
             box-shadow: 0 24px 48px rgba(15, 23, 42, 0.08);
         }
-        .designer-hero::after {
+        .designer-hero-content {
+            position: relative;
+            z-index: 2;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            padding: 1.7rem 1.8rem;
+        }
+        .designer-hero-content::after {
             content: "";
             position: absolute;
-            inset: auto -4rem -4rem auto;
-            width: 15rem;
-            height: 15rem;
+            z-index: -1;
+            inset: auto 1rem -7rem auto;
+            width: 16rem;
+            height: 16rem;
             border-radius: 999px;
             background: radial-gradient(circle, rgba(143, 61, 34, 0.14), transparent 72%);
+        }
+        .designer-hero-visual {
+            position: relative;
+            min-width: 0;
+            min-height: 19rem;
+            overflow: hidden;
+            background: #d8c3af;
+        }
+        .designer-hero-visual::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(90deg, rgba(255, 250, 247, 0.34), transparent 24%);
+            pointer-events: none;
+        }
+        .designer-hero-image {
+            display: block;
+            width: 100%;
+            height: 100%;
+            min-height: 19rem;
+            object-fit: cover;
+            object-position: 54% center;
         }
         .designer-kicker {
             margin: 0 0 0.45rem 0;
@@ -241,10 +278,39 @@ def _inject_app_theme() -> None:
             padding: 0.6rem 0.7rem;
             box-shadow: 0 12px 28px rgba(15, 23, 42, 0.05);
         }
+        @media (max-width: 900px) {
+            .designer-hero {
+                grid-template-columns: 1fr;
+            }
+            .designer-hero-visual,
+            .designer-hero-image {
+                min-height: 15rem;
+            }
+            .designer-hero-visual::after {
+                background: linear-gradient(180deg, rgba(255, 250, 247, 0.22), transparent 28%);
+            }
+        }
+        @media (max-width: 560px) {
+            .designer-hero-content {
+                padding: 1.4rem 1.25rem;
+            }
+            .designer-hero-visual,
+            .designer-hero-image {
+                min-height: 12rem;
+            }
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
+
+
+@lru_cache(maxsize=1)
+def _hero_image_data_uri() -> str:
+    """Return the bundled brewery photograph as an embeddable image URI."""
+
+    encoded = base64.b64encode(_HERO_IMAGE_PATH.read_bytes()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
 
 
 def _render_model_hero() -> None:
@@ -257,16 +323,26 @@ def _render_model_hero() -> None:
             "Driver-based OPEX",
         )
     )
+    image_data_uri = _hero_image_data_uri()
     st.markdown(
         f"""
         <section class="designer-hero">
-            <p class="designer-kicker">Craft brewery planning suite</p>
-            <h1 class="designer-title">Microbrewery Financial Model</h1>
-            <p class="designer-copy">
-                Review production, channels, pricing, debt, and valuation in one polished workspace,
-                then export a lender-friendly workbook instead of a raw data dump.
-            </p>
-            <div class="designer-badges">{badges}</div>
+            <div class="designer-hero-content">
+                <p class="designer-kicker">Craft brewery planning suite</p>
+                <h1 class="designer-title">Microbrewery Financial Model</h1>
+                <p class="designer-copy">
+                    Review production, channels, pricing, debt, and valuation in one polished workspace,
+                    then export a lender-friendly workbook instead of a raw data dump.
+                </p>
+                <div class="designer-badges">{badges}</div>
+            </div>
+            <div class="designer-hero-visual">
+                <img
+                    class="designer-hero-image"
+                    src="{image_data_uri}"
+                    alt="Microbrewery production floor with fermentation tanks"
+                />
+            </div>
         </section>
         """,
         unsafe_allow_html=True,
