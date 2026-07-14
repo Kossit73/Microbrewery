@@ -2800,15 +2800,19 @@ def main() -> None:
     _inject_app_theme()
     _render_model_hero()
 
+    page_labels = ["Core Assumptions", "Results", "Key Analytics", "AI Decision Making"]
+    active_page = st.radio(
+        "Workspace section",
+        page_labels,
+        horizontal=True,
+        key="microbrewery_active_workspace_section",
+        label_visibility="collapsed",
+    )
     run_controls = st.container()
-    tab_assumptions, tab_results, tab_key_analytics, tab_ai_decision = st.tabs([
-        "Core Assumptions",
-        "Results",
-        "Key Analytics",
-        "AI Decision Making",
-    ])
 
-    with tab_assumptions:
+    # These lightweight controls are evaluated on every rerun so the draft
+    # fingerprint remains accurate even while an output section is selected.
+    with st.expander("Core assumption controls", expanded=active_page == "Core Assumptions"):
         st.subheader("Core assumptions")
         c1, c2 = st.columns(2)
         if _START_YEAR_KEY not in st.session_state:
@@ -3024,7 +3028,7 @@ def main() -> None:
             f"Current results were loaded from {source}. The original base computation took {current_bundle.base_duration_seconds:.2f}s."
         )
 
-    with tab_results:
+    if active_page == "Results":
         if current_bundle is None:
             st.info("Run Model from the draft controls above to generate the current valuation, statements, schedules, and downloads.")
         else:
@@ -3044,7 +3048,7 @@ def main() -> None:
                 "`brewery_financial_model_all_in_one.py`. Adjust the draft inputs and press Recalculate when you want a new model run."
             )
 
-    with tab_key_analytics:
+    if active_page == "Key Analytics":
         if current_bundle is None:
             st.info("Run Model first, then generate analytics on demand from the stored result bundle.")
         else:
@@ -3054,7 +3058,7 @@ def main() -> None:
                 )
             _key_analytics_section(current_bundle.result, current_bundle.inputs, current_bundle.signature)
 
-    with tab_ai_decision:
+    if active_page == "AI Decision Making":
         if current_bundle is None:
             st.info("Run Model first, then use AI Decision Making against the stored result bundle.")
         else:
@@ -3069,7 +3073,7 @@ def main() -> None:
                 current_bundle.div,
             )
 
-    with tab_assumptions:
+    if active_page == "Core Assumptions":
         st.divider()
         st.subheader("Detailed Assumption Tables")
         capex_df = pd.DataFrame(
